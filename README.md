@@ -60,6 +60,11 @@ video, starts streaming it while it downloads, and looks up the title so the
 card gets a poster. Without an API key everything still works — artwork is
 generated from each title instead.
 
+A torrent can be addressed four ways and all four work: a **magnet URI**, an
+**http(s) `.torrent` URL**, a **local `.torrent` file**, or a bare
+**40-character info hash**. A magnet shows up as *Resolving magnet…* until its
+metadata arrives, and the API stays responsive while it does.
+
 The CLI is still there and shares the same engine:
 
 ```bash
@@ -76,8 +81,8 @@ The CLI is still there and shares the same engine:
 ## Verify it
 
 ```bash
-cargo test --workspace     # 144 tests: engine, ranges, matching, UI, catalog, search, backend
-bash scripts/e2e.sh        # 51 assertions: create, seed, stream, decode, verify bytes
+cargo test --workspace     # 147 tests: engine, ranges, matching, UI, catalog, search, backend
+bash scripts/e2e.sh        # 57 assertions: create, seed, stream, decode, magnet, verify bytes
 ```
 
 `scripts/e2e.sh` is the real proof. It generates a video, seeds it from one
@@ -93,6 +98,9 @@ fetch the data from the first. It asserts, among other things, that:
 * **the desktop app's own video surface renders that stream** (step 19): the
   same `PlayerController` the UI uses decodes frames and uploads them to egui as
   textures, with no window and no display server,
+* **a bare magnet resolves its metadata from the swarm and streams** (step 23):
+  steps 1-22 all use a `.torrent` file, so the other half of `AddSource` — parse
+  the URI, fetch metadata from a peer, then stream — is covered too,
 * `ffprobe` can demux the stream while it is still downloading,
 * the full download is byte-identical to the source.
 

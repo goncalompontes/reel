@@ -287,26 +287,13 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         download_limit_bps: args.download_limit,
     };
 
-    for source in &args.adds {
-        let parsed = match AddSource::detect(source) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "could not interpret torrent source");
-                continue;
-            }
-        };
-        match engine.add(parsed, add_opts.clone()).await {
-            Ok(outcome) => {
-                let name = outcome
-                    .torrent
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| outcome.torrent.info_hash.clone());
-                tracing::info!(id = outcome.torrent.id, %name, "added torrent");
-            }
-            Err(e) => tracing::error!(error = %e, "failed to add torrent"),
-        }
-    }
+    // Adds run *after* the API is up, and off the startup path. Resolving a
+    // magnet needs a reachable peer, and waiting for one here would leave the
+    // whole server unstarted — the app would look dead because a peer was slow.
+    // Seeding a `.torrent` we already have is instant; a magnet that has to
+    // find its metadata in the swarm now shows up in the API as "initializing"
+    // while it does.
+    let pending_adds = args.adds.clone();
 
     let listener = reel_http::bind(args.api_addr).await?;
     let local_addr = listener.local_addr()?;
@@ -341,6 +328,33 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             args.cors_origins.clone(),
         )
     };
+
+    for source in pending_adds {
+        let engine = engine.clone();
+        let add_opts = add_opts.clone();
+        // Spawned rather than joined: one unreachable magnet must not hold up
+        // the others, or the server.
+        tokio::spawn(async move {
+            let parsed = match AddSource::detect(&source) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    tracing::error!(error = %e, "could not interpret torrent source");
+                    return;
+                }
+            };
+            match engine.add(parsed, add_opts).await {
+                Ok(outcome) => {
+                    let name = outcome
+                        .torrent
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| outcome.torrent.info_hash.clone());
+                    tracing::info!(id = outcome.torrent.id, %name, "added torrent");
+                }
+                Err(e) => tracing::error!(source = %source, error = %e, "failed to add torrent"),
+            }
+        });
+    }
 
     reel_http::serve_router_with_shutdown(listener, router, reel_http::shutdown_signal())
         .await

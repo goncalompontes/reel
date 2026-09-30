@@ -342,6 +342,12 @@ impl EngineBackend {
         let mut to_start = Vec::new();
 
         for torrent in torrents {
+            // A magnet that has not found its metadata yet has no name, and
+            // searching for its info hash would be nonsense.
+            if torrent.name.as_deref().is_none_or(str::is_empty) {
+                continue;
+            }
+
             let key = torrent.info_hash.clone();
 
             if self
@@ -429,7 +435,7 @@ impl EngineBackend {
     }
 
     fn entry_for(&self, torrent: &TorrentView) -> LibraryItem {
-        let clean = clean_title(torrent.name.as_deref().unwrap_or(&torrent.info_hash));
+        let (display_title, year) = display_title_for(torrent);
 
         let metadata = self
             .catalog
@@ -452,12 +458,27 @@ impl EngineBackend {
             entry: CatalogEntry {
                 torrent_id: torrent.id,
                 info_hash: torrent.info_hash.clone(),
-                display_title: clean.title,
-                year: clean.year,
+                display_title,
+                year,
                 metadata,
                 watch,
             },
         }
+    }
+}
+
+/// What to call a torrent in the UI.
+///
+/// A magnet that has not resolved its metadata yet has no name; showing its
+/// info hash would be worse than admitting we are still fetching it. The same
+/// rule keeps enrichment from searching for a hex string.
+pub(crate) fn display_title_for(torrent: &TorrentView) -> (String, Option<u16>) {
+    match torrent.name.as_deref().filter(|name| !name.trim().is_empty()) {
+        Some(name) => {
+            let clean = clean_title(name);
+            (clean.title, clean.year)
+        }
+        None => ("Resolving magnet\u{2026}".to_string(), None),
     }
 }
 
@@ -965,9 +986,52 @@ impl Backend for FakeBackend {
     }
 }
 
+
+
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::testing::sample_library;
+
+    use super::*;
+
+    fn torrent_without_name() -> TorrentView {
+        let mut view = sample_library()[0].torrent.clone();
+        view.name = None;
+        view
+    }
+
+    #[test]
+    fn an_unresolved_magnet_is_not_called_by_its_hash() {
+        let torrent = torrent_without_name();
+        let (title, year) = display_title_for(&torrent);
+        assert_eq!(title, "Resolving magnet\u{2026}");
+        assert_eq!(year, None);
+        assert!(
+            !title.contains(&torrent.info_hash),
+            "the info hash should never be shown as a title"
+        );
+    }
+
+    #[test]
+    fn an_empty_name_is_treated_as_no_name() {
+        let mut torrent = torrent_without_name();
+        torrent.name = Some("   ".to_string());
+        assert_eq!(display_title_for(&torrent).0, "Resolving magnet\u{2026}");
+    }
+
+    #[test]
+    fn a_real_name_is_cleaned_as_usual() {
+        let mut torrent = torrent_without_name();
+        torrent.name = Some("The.Matrix.1999.1080p.BluRay.x264-GROUP".to_string());
+        let (title, year) = display_title_for(&torrent);
+        assert_eq!(title, "The Matrix");
+        assert_eq!(year, Some(1999));
+    }
 }

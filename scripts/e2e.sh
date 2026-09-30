@@ -48,6 +48,11 @@ echo "== 2. create torrent =="
 grep -E "wrote|info hash" "$ROOT/logs/create.log"
 [ -f "$ROOT/test.torrent" ] || { echo "no torrent file produced"; exit 1; }
 
+# The same content, addressed the other way. Everything below uses the .torrent
+# file; step 23 uses this magnet, which has to find its metadata in the swarm.
+INFO_HASH=$(grep -oE 'info hash +[0-9a-f]{40}' "$ROOT/logs/create.log" | awk '{print $3}')
+[ -n "$INFO_HASH" ] || { echo "could not read the info hash"; exit 1; }
+
 echo "== 3. start seeder (api 3041, peer port 51413, upload capped at 400 KiB/s) =="
 "$REEL" serve \
   --dir "$ROOT/seed" --api-addr 127.0.0.1:3041 --listen-port 51413 \
@@ -272,6 +277,60 @@ LS=$("$REEL" ls --api http://127.0.0.1:3042 2>&1)
 echo "$LS" | grep -q "test.mp4" && ok "reel ls shows the torrent" || bad "reel ls output unexpected: $LS"
 PLAY=$("$REEL" play "$ID" --api http://127.0.0.1:3042 --player "" 2>&1)
 check "reel play prints the stream url" "$PLAY" "$STREAM_URL"
+
+echo "== 23. a magnet resolves its metadata and streams =="
+# Steps 1-22 all use a .torrent file, so the magnet branch of AddSource - parse
+# the URI, fetch metadata from a peer, then stream - was untested. DHT and
+# trackers stay off and the seeder is given explicitly, so the only thing under
+# test is magnet resolution.
+mkdir -p "$ROOT/magnet"
+"$REEL" serve --dir "$ROOT/magnet" --api-addr 127.0.0.1:3043 --listen-port 51415 \
+  --no-dht --no-trackers --no-persist --peer 127.0.0.1:51413 \
+  --add "magnet:?xt=urn:btih:$INFO_HASH" > "$ROOT/logs/magnet.log" 2>&1 &
+MAGNET_PID=$!
+cleanup_magnet() { kill "$MAGNET_PID" 2>/dev/null || true; }
+trap 'cleanup_magnet; cleanup' EXIT
+
+# The API must be up regardless of whether the magnet has resolved yet.
+MAGNET_UP=""
+for _ in $(seq 1 40); do
+  if curl -sf -o /dev/null http://127.0.0.1:3043/api/health; then MAGNET_UP=yes; break; fi
+  sleep 0.5
+done
+[ -n "$MAGNET_UP" ] && ok "the API starts without waiting for the magnet" \
+  || bad "the API did not start"
+
+# A bare magnet has no file list until metadata arrives from a peer.
+MAGNET_LIST=""
+for _ in $(seq 1 120); do
+  MAGNET_LIST=$(curl -sf http://127.0.0.1:3043/api/torrents || true)
+  if [ -n "$MAGNET_LIST" ] && [ "$MAGNET_LIST" != "[]" ]; then
+    COUNT=$(echo "$MAGNET_LIST" | jq_ 'len(d[0]["files"])')
+    [ "${COUNT:-0}" -ge 1 ] && break
+  fi
+  sleep 0.5
+done
+
+MAGNET_ID=$(echo "$MAGNET_LIST" | jq_ 'd[0]["id"]')
+MAGNET_NAME=$(echo "$MAGNET_LIST" | jq_ 'd[0]["name"]')
+MAGNET_SIZE=$(echo "$MAGNET_LIST" | jq_ 'd[0]["stats"]["total_bytes"]')
+MAGNET_PRIMARY=$(echo "$MAGNET_LIST" | jq_ 'd[0].get("primary_file_id")')
+echo "  resolved: name=$MAGNET_NAME size=$MAGNET_SIZE primary_file=$MAGNET_PRIMARY"
+
+check "metadata resolved from the swarm" "$MAGNET_SIZE" "$SRC_SIZE"
+check "a playable file was found from the magnet" "$MAGNET_PRIMARY" "0"
+
+if [ "${MAGNET_SIZE:-0}" = "$SRC_SIZE" ]; then
+  curl -s -D "$ROOT/logs/magnet.headers" -r 0-65535 \
+    -o "$ROOT/magnet.bin" "http://127.0.0.1:3043/stream/$MAGNET_ID/0/$MAGNET_NAME"
+  M_STATUS=$(head -1 "$ROOT/logs/magnet.headers" | tr -d '\r' | awk '{print $2}')
+  M_RANGE=$(grep -i '^content-range:' "$ROOT/logs/magnet.headers" | tr -d '\r' | awk '{print $2" "$3}')
+  check "status" "$M_STATUS" "206"
+  check "content-range" "$M_RANGE" "bytes 0-65535/$SRC_SIZE"
+  cmp -s "$ROOT/magnet.bin" "$ROOT/expect1.bin" \
+    && ok "magnet-streamed bytes match the source" \
+    || bad "magnet-streamed bytes differ"
+fi
 
 echo
 echo "===== $PASS passed, $FAIL failed ====="
