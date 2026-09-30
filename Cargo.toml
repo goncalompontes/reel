@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/reel-core", "crates/reel-http", "crates/reel-player", "crates/reel-cli"]
+members = ["crates/reel-core", "crates/reel-http", "crates/reel-player", "crates/reel-cli", "crates/reel-desktop"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ rust-version = "1.86"
 [workspace.dependencies]
 reel-core = { path = "crates/reel-core" }
 reel-player = { path = "crates/reel-player" }
+reel-desktop = { path = "crates/reel-desktop" }
 reel-http = { path = "crates/reel-http" }
 
 anyhow = "1"

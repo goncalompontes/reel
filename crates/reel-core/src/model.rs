@@ -77,6 +77,18 @@ pub struct StatsView {
     pub peers: PeerView,
 }
 
+impl StatsView {
+    /// Whether the engine reports this torrent as paused.
+    pub fn is_paused(&self) -> bool {
+        self.state == "paused"
+    }
+
+    /// Whether the engine is actively transferring (or trying to).
+    pub fn is_live(&self) -> bool {
+        self.state == "live"
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TorrentView {
     pub id: usize,

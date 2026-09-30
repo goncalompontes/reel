@@ -1,15 +1,15 @@
 # reel
 
-Stream torrents over HTTP, with a Netflix-shaped catalog on top.
+A native desktop client for streaming torrents, with a Netflix-shaped catalog.
 
-`reel` is a native (Rust) torrent engine plus a range-request streaming server.
-It is the core of a desktop streaming client: it can start playing a file from a
-torrent after downloading a few pieces, and it exposes a JSON API that a GUI, a
-CLI, or a browser can drive.
+`reel` is a Rust workspace: a torrent engine, an HTTP streaming server, a
+libmpv-backed player, a CLI, and an **egui desktop app that renders with wgpu
+directly to the window — no webview, no browser**. Video is decoded by libmpv
+and uploaded as a texture, and playback starts after a few pieces rather than
+after the whole file.
 
-**Status: milestone 1 complete.** The engine and the streaming server work
-end-to-end and are covered by an integration test ([`scripts/e2e.sh`](scripts/e2e.sh)).
-The catalog UI, TMDB metadata and search backends are the next milestones.
+**Status: engine, streaming, player and desktop app all work end to end.**
+Catalog metadata (TMDB artwork, search backends) is the next milestone.
 
 ---
 
@@ -22,130 +22,131 @@ The catalog UI, TMDB metadata and search backends are the next milestones.
 | HTTP `Range` requests (seek while downloading) | done |
 | Media detection ("only download the video, skip the sample") | done |
 | JSON control plane + live SSE updates | done |
+| Native playback (libmpv, RGBA frames into an egui texture) | done |
+| Desktop app: library grid, hero banner, detail page, player, settings | done |
 | CLI (`serve`, `add`, `ls`, `play`, `rm`, `create`) | done |
 | Rate limits, pause/resume, delete with/without files | done |
 | Torrent creation + seeding your own content | done |
-| Netflix-style catalog UI, TMDB, search backends | not yet |
-| Desktop shell (Tauri) and native player surface | not yet |
+| TMDB metadata, real posters, search backends | not yet |
+| In-window subtitles, transcoding for odd codecs | not yet |
 
 ## Try it
 
 ```bash
 cargo build --release
 
-# 1. turn a file you own into a torrent
-./target/release/reel create ~/Videos/holiday.mp4
+# The desktop app: engine + streaming server + player, all in one process.
+./target/release/reel-desktop
 
-# 2. seed it (on this machine or another one)
+# No engine or network, just the sample library (good for a quick look):
+./target/release/reel-desktop --demo
+```
+
+Then paste a magnet link into **Add**. reel fetches the metadata, picks the
+video, and starts streaming it while it downloads.
+
+The CLI is still there and shares the same engine:
+
+```bash
+# Turn a file you own into a torrent, then seed it.
+./target/release/reel create ~/Videos/holiday.mp4
 ./target/release/reel serve --dir ~/Videos --overwrite --add ~/Videos/holiday.mp4.torrent
 
-# 3. stream it from a second instance, seeking while it downloads
-./target/release/reel serve --api-addr 127.0.0.1:3042 --dir ~/Downloads/reel \
-    --peer 127.0.0.1:51413 --add ~/Videos/holiday.mp4.torrent
-
-# 4. play it
+# Or just play something.
+./target/release/reel add 'magnet:?xt=urn:btih:...'
 ./target/release/reel ls
 ./target/release/reel play 0          # launches mpv on the stream URL
 ```
 
-Or with a magnet link and nothing local:
-
-```bash
-./target/release/reel serve --dir ~/Downloads/reel
-./target/release/reel add 'magnet:?xt=urn:btih:...'
-curl -s localhost:3030/api/torrents | jq '.[0].files[0].stream.url'
-# -> http://127.0.0.1:3030/stream/0/0/Movie.mkv
-mpv 'http://127.0.0.1:3030/stream/0/0/Movie.mkv'
-```
-
-While a stream is served, `reel serve` prints a small catalog page at
-`http://127.0.0.1:3030/` for quick sanity checks.
-
 ## Verify it
 
 ```bash
-cargo test --workspace     # unit tests (range parsing, media detection, ...)
-bash scripts/e2e.sh        # full integration test: creates, seeds, streams, verifies bytes
+cargo test --workspace     # 52 tests: range parsing, media/title detection, ABI, UI
+bash scripts/e2e.sh        # full stack: create, seed, stream, decode, verify bytes
 ```
 
-`scripts/e2e.sh` generates a video, seeds it from one instance with a throttled
-upload, streams ranges out of a second instance, and asserts — among other
-things — that:
+`scripts/e2e.sh` is the real proof. It generates a video, seeds it from one
+instance with a throttled upload, and streams out of a second instance that must
+fetch the data from the first. It asserts, among other things, that:
 
-* a 64 KiB range returns `206` with the exact source bytes, after only ~2 MiB of
-  a 7.5 MiB file had been downloaded (i.e. it really streams),
-* mid-file and suffix ranges work (so seeking works),
-* `ffprobe` can demux the stream over HTTP while the download is still running,
-* the full download is byte-identical to the original (sha256),
-* unsatisfiable ranges return `416` and unknown ids return `404`.
+* a 64 KiB range returns `206` with byte-exact content after only ~2 MiB of a
+  7.5 MiB file had been downloaded,
+* prefix, mid-file and suffix ranges are all exact, `416` on unsatisfiable,
+  `404`/`400` on bad input,
+* **libmpv decodes a real 1280×720 picture out of the live torrent stream**
+  (step 17) and can seek to 5 s inside it (step 18),
+* `ffprobe` can demux the stream while it is still downloading,
+* the full download is byte-identical to the source.
+
+The desktop app is verified separately, without a display server, by
+`crates/reel-desktop/tests/`:
+
+* `ui.rs` drives the real widget tree through AccessKit (`egui_kittest`) and
+  renders the library and detail pages to PNG snapshots in
+  `crates/reel-desktop/tests/snapshots/`,
+* `backend.rs` starts the real engine and streaming server and talks to it over
+  a real localhost socket,
+* `glyphs.rs` pins the icon font coverage, because egui's bundled fonts render
+  `←`, `↓` and `●` as empty boxes.
 
 ## Architecture
 
 ```
-crates/reel-core    engine + model   (no HTTP, no UI)
-crates/reel-http    axum API + range streaming
-crates/reel-cli     the `reel` binary
+crates/reel-core      engine, media/title detection, wire model   (no HTTP, no UI)
+crates/reel-http      axum API + range streaming + SSE
+crates/reel-player    libmpv playback, frames as RGBA             (no UI toolkit)
+crates/reel-cli       the `reel` binary: daemon + HTTP client
+crates/reel-desktop   the native app: egui UI over the above
 ```
 
-The split exists so the future desktop app can embed `reel-core` and
-`reel-http` in-process while reusing the exact same API the CLI talks to.
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Dependencies only ever point downwards:
 
-## HTTP API
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/api/health` | version, download dir |
-| `GET` | `/api/config` | effective engine configuration |
-| `GET` | `/api/torrents` | every torrent with files and stats |
-| `POST` | `/api/torrents` | add one (JSON, or raw `.torrent` bytes) |
-| `GET` | `/api/torrents/{id}` | one torrent |
-| `DELETE` | `/api/torrents/{id}?files=true` | forget (optionally delete files) |
-| `GET` | `/api/torrents/{id}/files` | file list with stream targets |
-| `PUT` | `/api/torrents/{id}/files` | choose which files to download |
-| `GET` | `/api/torrents/{id}/stats` | progress, speeds, peers, ETA |
-| `POST` | `/api/torrents/{id}/pause` / `/resume` | pause / resume |
-| `GET` | `/api/events` | SSE snapshot once per second |
-| `GET` | `/stream/{id}/{file_id}[/{name}]` | the bytes, with `Range` support |
-
-Adding a torrent:
-
-```bash
-curl -s localhost:3030/api/torrents -H 'content-type: application/json' -d '{
-  "source": "magnet:?xt=urn:btih:...",
-  "media_only": true,
-  "allow_overwrite": false,
-  "initial_peers": ["10.0.0.5:51413"],
-  "upload_limit_bps": 1048576
-}'
-
-# or upload a .torrent file
-curl -s --data-binary @movie.torrent -H 'content-type: application/x-bittorrent' \
-  'localhost:3030/api/torrents?media_only=true'
 ```
+reel-desktop ──> reel-player ──> libmpv (dlopen)
+      │
+      ├──────> reel-http ──> reel-core ──> librqbit
+      └──────> reel-core
+```
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the reasoning.
+
+## How the desktop app fits together
+
+* **Engine and streaming server run in-process**, on an ephemeral localhost
+  port chosen by the OS. The player is handed ordinary `http://127.0.0.1/stream/…`
+  URLs, so playback goes through exactly the same range-request path the CLI and
+  the integration tests exercise.
+* **The UI never touches mpv.** `reel-player` runs a worker thread that owns
+  libmpv end to end, renders frames into memory, and publishes them; the UI
+  uploads the latest one as a texture. That keeps mpv's threading rules and
+  teardown crashes away from the event loop.
+* **No video is ever handed to a browser.** eframe renders with wgpu (Vulkan on
+  this machine) into the OS window.
 
 ## Notes and caveats
 
-* **Security.** The API can add torrents and delete files, so bind it to
-  localhost (the default) and do not expose it to the internet. CORS is off by
-  default on purpose: a permissive local API is reachable by any web page you
-  visit. Use `--cors-origin http://localhost:5173` while developing a web UI.
-* **Codecs.** Streaming is byte-exact; it does not transcode. `mkv`/`hevc`
-  will play in mpv/VLC but not in a plain browser. A browser-based player will
-  need a transcoding step later.
-* **Faststart.** For instant playback, the container should have its index at
-  the front (`ffmpeg -movflags +faststart`). Without it the engine still works —
-  it just fetches the index from the end of the file first.
-* **Content.** This is a general-purpose BitTorrent client and HTTP server.
-  Use it for content you own or are licensed to distribute (your own media,
-  Creative Commons, public domain, Internet Archive, Linux ISOs). It ships with
-  no indexers or search backends, and none are hard-coded; if you add any, you
-  are responsible for what they return.
+* **Security.** The streaming API is bound to `127.0.0.1` and CORS is off by
+  default; the API can delete files, so do not expose it.
+* **Codecs.** Streaming is byte-exact, it does not transcode. libmpv plays
+  essentially anything, so `mkv`/HEVC are fine — but this is why an embedded
+  browser engine would not have been a substitute for a real player.
+* **Performance.** libmpv's software renderer costs ~1.2 ms per 1080p frame
+  (~2 ms with dense subtitles) against a 16.7 ms budget; 1080p60 plays in
+  realtime. The OpenGL render API is the upgrade path if 4K60 with subtitles
+  becomes the target.
+* **Faststart.** For instant playback the container should have its index at the
+  front (`ffmpeg -movflags +faststart`); otherwise the engine still works, it
+  just fetches the index from the end of the file first.
+* **Content.** This is a general-purpose BitTorrent client and HTTP server. Use
+  it for content you own or are licensed to distribute. It ships with no
+  indexers and none are hard-coded.
 
 ## Requirements
 
-Rust 1.86+ (uses edition 2024). Linux, macOS and Windows are supported by the
-stack; only Linux has been exercised so far.
+Rust 1.86+ (edition 2024). Linux, macOS and Windows are supported by the stack;
+Linux/Wayland is what has been exercised. `mpv`/libmpv is optional — without it
+the desktop app falls back to handing playback to an external `mpv` process, and
+the CLI still works.
 
 ## License
 

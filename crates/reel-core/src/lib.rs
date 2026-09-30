@@ -16,8 +16,10 @@
 pub mod config;
 pub mod create;
 pub mod engine;
+pub mod fmt;
 pub mod media;
 pub mod model;
+pub mod title;
 
 pub use config::EngineConfig;
 pub use create::{CreatedTorrent, create_torrent_file};

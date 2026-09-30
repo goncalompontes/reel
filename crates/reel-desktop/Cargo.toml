@@ -1,0 +1,40 @@
+[package]
+name = "reel-desktop"
+description = "Native desktop app for reel: catalog, library and player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "reel-desktop"
+path = "src/main.rs"
+
+[lib]
+name = "reel_desktop"
+path = "src/lib.rs"
+
+[dependencies]
+reel-core.workspace = true
+reel-http.workspace = true
+reel-player.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Native GPU rendering (wgpu) - no webview, no browser.
+eframe = { version = "0.36", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "wgpu",
+    "wayland",
+    "x11",
+] }
+egui = "0.36"
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }
