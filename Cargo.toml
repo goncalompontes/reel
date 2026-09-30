@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/reel-core", "crates/reel-http", "crates/reel-cli"]
+members = ["crates/reel-core", "crates/reel-http", "crates/reel-player", "crates/reel-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +10,7 @@ rust-version = "1.86"
 
 [workspace.dependencies]
 reel-core = { path = "crates/reel-core" }
+reel-player = { path = "crates/reel-player" }
 reel-http = { path = "crates/reel-http" }
 
 anyhow = "1"
@@ -28,6 +29,7 @@ tokio-stream = { version = "0.1", features = ["time"] }
 tower-http = { version = "0.7", features = ["cors", "trace"] }
 
 librqbit = "9.0.1"
+libloading = "0.8"
 
 clap = { version = "4", features = ["derive", "env"] }
 reqwest = { version = "0.13", features = ["json", "blocking"] }

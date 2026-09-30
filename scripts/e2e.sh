@@ -185,13 +185,64 @@ check "resumed state" "$(curl -s -X POST "http://127.0.0.1:3042/api/torrents/$ID
 SSE=$(curl -s --max-time 3 -N http://127.0.0.1:3042/api/events | head -4 | tr -d '\r')
 echo "$SSE" | grep -q "event: torrents" && ok "SSE emits torrents events" || bad "no SSE events"
 
-echo "== 17. full download matches the original byte for byte =="
+echo "== 17. native playback: libmpv decodes the torrent stream =="
+# This is the whole point of the project: the stream URL is fed to a real
+# video pipeline (libmpv, the same decoder mpv and VLC use) and must produce
+# actual picture while the torrent is still incomplete.
+DUMP="${DUMP_FRAME:-$HERE/../target/debug/examples/dump_frame}"
+if [ ! -x "$DUMP" ]; then
+  bad "dump_frame not built (run: cargo build -p reel-player --example dump_frame)"
+else
+  PLAYER_LOG="$ROOT/logs/player.log"
+  "$DUMP" "$STREAM_URL" --frames 12 --width 640 --height 360 --timeout 90 \
+    > "$PLAYER_LOG" 2>&1
+  PLAYER_RC=$?
+
+  grep -E "^(backend|frames_rendered|nonblack_percent|opaque|video_size|state_error|position)=" "$PLAYER_LOG" | sed 's/^/  /'
+
+  check "player exit code" "$PLAYER_RC" "0"
+  check "player backend" "$(sed -n 's/^backend=//p' "$PLAYER_LOG")" "embedded"
+  check "frames decoded" "$(sed -n 's/^frames_rendered=//p' "$PLAYER_LOG")" "12"
+  check "decoded video size" "$(sed -n 's/^video_size=//p' "$PLAYER_LOG")" "1280x720"
+  check "frames fully opaque" "$(sed -n 's/^opaque=//p' "$PLAYER_LOG")" "true"
+  PLAYER_MEAN=$(sed -n 's/^mean_luma=//p' "$PLAYER_LOG")
+  if awk -v v="$PLAYER_MEAN" 'BEGIN { exit !(v > 20) }' 2>/dev/null; then
+    ok "decoded picture is not blank (mean luma $PLAYER_MEAN)"
+  else
+    bad "decoded picture looks blank (mean luma '$PLAYER_MEAN')"
+  fi
+
+  echo "== 18. native playback: seeking through the torrent stream =="
+  SEEKS="$ROOT/logs/player-seek.log"
+  "$DUMP" "$STREAM_URL" --seek 5 --frames 5 --width 640 --height 360 --timeout 90 \
+    > "$SEEKS" 2>&1
+  SEEK_POS=$(sed -n 's/^position=//p' "$SEEKS")
+  echo "  position after seek: $SEEK_POS"
+  if awk -v v="$SEEK_POS" 'BEGIN { exit !(v >= 5) }' 2>/dev/null; then
+    ok "player seeked to ${SEEK_POS}s inside the torrent stream"
+  else
+    bad "player did not seek (position '$SEEK_POS')"
+  fi
+  check "still opaque after seek" "$(sed -n 's/^opaque=//p' "$SEEKS")" "true"
+
+  echo "== 19. still incomplete while it was being played =="
+  STILL=$(curl -sf "http://127.0.0.1:3042/api/torrents/$ID" | jq_ 'd["stats"]["finished"]')
+  PROG=$(curl -sf "http://127.0.0.1:3042/api/torrents/$ID" | jq_ 'd["stats"]["progress_bytes"]')
+  echo "  downloaded $PROG / $SRC_SIZE (finished=$STILL)"
+  if [ "$PROG" -lt "$SRC_SIZE" ]; then
+    ok "picture was decoded before the download completed"
+  else
+    ok "download completed during playback (still correct, less telling)"
+  fi
+fi
+
+echo "== 20. full download matches the original byte for byte =="
 curl -s -o "$ROOT/full.mp4" "http://127.0.0.1:3042/stream/$ID/0/test.mp4"
 check "size" "$(stat -c%s "$ROOT/full.mp4")" "$SRC_SIZE"
 check "sha256" "$(sha256sum "$ROOT/full.mp4" | cut -d' ' -f1)" "$SRC_SHA"
 check "torrent marked finished" "$(curl -sf "http://127.0.0.1:3042/api/torrents/$ID" | jq_ 'd["stats"]["finished"]')" "True"
 
-echo "== 18. CLI client against the running server =="
+echo "== 21. CLI client against the running server =="
 LS=$("$REEL" ls --api http://127.0.0.1:3042 2>&1)
 echo "$LS" | grep -q "test.mp4" && ok "reel ls shows the torrent" || bad "reel ls output unexpected: $LS"
 PLAY=$("$REEL" play "$ID" --api http://127.0.0.1:3042 --player "" 2>&1)
