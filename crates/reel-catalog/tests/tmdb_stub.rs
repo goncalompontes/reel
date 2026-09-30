@@ -360,3 +360,63 @@ async fn artwork_caching_survives_a_restart_without_the_network() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Talk to the real TMDB API with a deliberately invalid key.
+///
+/// Marked `#[ignore]` because it needs the network. It is worth having: it
+/// checks that the error shape we parse is the one TMDB actually sends, which
+/// the stub can only imitate. Run it with
+/// `cargo test -p reel-catalog --test tmdb_stub -- --ignored --nocapture`.
+///
+/// With a real key in `REEL_TMDB_API_KEY` the same test checks that a key is
+/// accepted and that a well-known film resolves.
+#[tokio::test]
+#[ignore = "requires network access"]
+async fn the_real_api_answers_as_expected() {
+    let cache = Arc::new(CatalogCache::new(scratch("live")));
+
+    // 1. A bad key must produce a readable, non-retryable auth error.
+    let bad = TmdbProvider::new(TmdbClient::new("definitely-not-a-valid-key").unwrap(), cache.clone());
+    let error = bad
+        .lookup(LookupQuery::new("The Matrix", Some(1999)))
+        .await
+        .expect_err("an invalid key must not succeed");
+
+    match &error {
+        reel_catalog::CatalogError::Api { status, message } => {
+            assert_eq!(*status, 401, "TMDB should reject an invalid key with 401");
+            assert!(
+                message.to_lowercase().contains("api key") || message.to_lowercase().contains("key"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("expected an API error, got {other:?}"),
+    }
+    assert!(
+        error.user_message().contains("API key"),
+        "the message shown to a user should mention the key: {}",
+        error.user_message()
+    );
+    assert!(!error.is_transient(), "a bad key is not worth retrying");
+
+    // 2. With a real key, a well-known film should resolve.
+    match std::env::var("REEL_TMDB_API_KEY") {
+        Ok(key) if !key.trim().is_empty() => {
+            let live = TmdbProvider::new(TmdbClient::new(key).unwrap(), cache.clone());
+            let found = live
+                .lookup(LookupQuery::from_release_name(
+                    "The.Matrix.1999.1080p.BluRay.x264-GROUP",
+                ))
+                .await
+                .expect("lookup should succeed")
+                .expect("The Matrix should match");
+
+            assert_eq!(found.title, "The Matrix");
+            println!("live lookup resolved {} ({:?})", found.display_title(), found.genres);
+            assert!(found.artwork.poster.as_ref().is_some_and(|a| a.is_cached()));
+        }
+        _ => println!("REEL_TMDB_API_KEY not set; skipping the live lookup half"),
+    }
+
+    let _ = std::fs::remove_dir_all(cache.root());
+}

@@ -115,9 +115,15 @@ The catalog is verified separately by `crates/reel-catalog`:
   downloads landing in the cache, clean misses, and a cached lookup still
   working with the network gone.
 
-The one thing not covered by an automated test is a live call to the real TMDB
-API, because that needs a personal key. The request and response handling around
-it is tested against the stub, and against TMDB's real 401 body shape.
+There is also an `#[ignore]`d test that talks to the **real** TMDB API:
+
+```bash
+# No key needed: checks that an invalid key produces the 401 we expect.
+cargo test -p reel-catalog --test tmdb_stub -- --ignored --nocapture
+
+# With a key, it also resolves a film end to end, artwork included.
+REEL_TMDB_API_KEY=... cargo test -p reel-catalog --test tmdb_stub -- --ignored --nocapture
+```
 
 ## Architecture
 
