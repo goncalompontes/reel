@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/reel-core", "crates/reel-http", "crates/reel-player", "crates/reel-cli", "crates/reel-desktop"]
+members = ["crates/reel-core", "crates/reel-http", "crates/reel-player", "crates/reel-catalog", "crates/reel-cli", "crates/reel-desktop"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,7 @@ reel-core = { path = "crates/reel-core" }
 reel-player = { path = "crates/reel-player" }
 reel-desktop = { path = "crates/reel-desktop" }
 reel-http = { path = "crates/reel-http" }
+reel-catalog = { path = "crates/reel-catalog" }
 
 anyhow = "1"
 thiserror = "2"
@@ -31,9 +32,10 @@ tower-http = { version = "0.7", features = ["cors", "trace"] }
 
 librqbit = "9.0.1"
 libloading = "0.8"
+egui_extras = { version = "0.36", features = ["image", "file"] }
 
 clap = { version = "4", features = ["derive", "env"] }
-reqwest = { version = "0.13", features = ["json", "blocking"] }
+reqwest = { version = "0.13", features = ["json", "blocking", "query"] }
 
 [profile.release]
 lto = "thin"
