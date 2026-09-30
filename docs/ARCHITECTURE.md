@@ -19,8 +19,9 @@
 crates/reel-core     engine, media/title detection, wire model. No HTTP, no UI.
 crates/reel-http     axum router, range parsing, SSE. Depends on reel-core only.
 crates/reel-player   libmpv playback as RGBA frames. No UI toolkit.
+crates/reel-catalog  metadata, artwork cache, watch history. No UI, no engine.
 crates/reel-cli      the `reel` binary: daemon + HTTP client.
-crates/reel-desktop  the egui/wgpu app. Depends on the three above.
+crates/reel-desktop  the egui/wgpu app. Depends on the four above.
 scripts/e2e.sh       integration test that proves the streaming path.
 ```
 
@@ -30,6 +31,7 @@ Dependency direction is strictly one-way:
 reel-desktop ──> reel-player ──> libmpv (dlopen)
       │
       ├───────> reel-http ──> reel-core ──> librqbit
+      ├───────> reel-catalog ──> reel-core (release-name cleaning only)
       └───────> reel-core
 reel-cli ─────> reel-http ──> reel-core
 ```
@@ -171,6 +173,54 @@ Playback is deliberately kept out of every other layer.
   fast enough (~1.2 ms per 1080p frame). Sharing a texture through the GL render
   API instead would buy 4K headroom at the cost of context interop.
 
+## reel-catalog
+
+Turns a torrent into something that looks like a catalogue entry. It is a
+library: no UI, no engine, and no network unless you ask it for something.
+
+### Choosing the right entry
+
+`matching.rs` is the part of a catalogue that fails most visibly. Searching for
+*The Matrix* returns *The Matrix Reloaded*; a remake means the title alone is not
+enough; release names carry tags that swamp the title.
+
+The approach:
+
+* normalise both sides — lowercase, ASCII-fold accents, punctuation to spaces,
+  drop articles, never normalise away to nothing;
+* compare with the better of a token-level and a character-bigram Sørensen–Dice
+  coefficient, so both word reordering and small typos are handled;
+* combine that with a year agreement, where one year apart scores well (festival
+  versus general release) without outranking an exact match;
+* accept only above a threshold, on both the total and the title similarity, so
+  the failure mode is "no match" rather than "confidently wrong match".
+
+Release names are cleaned first, using the same cleaner the interface uses, so
+the two agree on what a title is.
+
+### Providers and the search seam
+
+`MetadataProvider` is the seam for metadata. `TmdbProvider` is the real one,
+`NullProvider` is what you get with no API key, and `StaticProvider` backs the
+tests and `--demo`. The UI never knows which is in use.
+
+`SearchBackend` is the seam for *discovery*, and nothing in the tree implements
+it. That is a deliberate policy rather than an omission: where results come from
+is the operator's decision and their responsibility.
+
+### Caching and history
+
+`cache.rs` stores metadata JSON and artwork on disk. Provider ids are sanitised
+before being used as file names, and a hostile id must not be able to write
+outside the cache directory — there is a test that tries. Writes go through a
+temporary file and a rename, so a crash cannot leave a half-written file that
+later parses as corrupt. A corrupt entry is deleted and treated as a miss.
+
+`history.rs` keys watch positions by info hash rather than torrent id, because
+ids are session-local and a restart would otherwise lose every position. A
+missing or corrupt file yields an empty history: losing watch positions must
+never stop the app from starting.
+
 ## reel-desktop
 
 * **All engine access goes through a `Backend` trait.** `EngineBackend` runs the
@@ -183,29 +233,36 @@ Playback is deliberately kept out of every other layer.
 * **Text is real widgets, not painted glyphs.** Titles were originally drawn with
   `Painter::text`, which made them invisible to accessibility tools — and the
   first version of the tests could not find them. They are `Label`s now.
-* **Posters are generated, not faked.** Until the metadata layer exists, each
-  title maps to a stable hue derived from a hash, drawn behind its initials.
-  This is honest about the absence of real artwork while keeping the grid
-  readable.
+* **Posters come from the catalog, generated art is the fallback.** With a
+  provider configured, cards show real artwork decoded by `egui_extras`' image
+  loader from the catalog cache. Without one, each title maps to a stable hue
+  derived from a hash, drawn behind its initials: honest about the absence of
+  artwork while keeping the grid readable.
+* **Artwork is cropped, not stretched.** Providers publish 2:3 posters and 16:9
+  backdrops, and a hero banner is much wider than either, so the image is fitted
+  by cropping centrally (`cover_uv`, unit-tested). Filling the rect directly
+  would visibly distort a real backdrop.
+* **The catalog cache is where posters render from.** Metadata and images are
+  fetched once, written to disk, and referenced as `file://` URIs, so a restart
+  costs no API calls and no image downloads.
 
-## Where the catalog goes next
+## Where this goes next
 
-The engine deliberately knows nothing about discovery. Planned layering:
+Everything in the original plan is now built. What is left is either optional or
+needs a decision from whoever runs the app.
 
-```
-reel-core        engine (done)
-reel-http        API (done)
-reel-player      native playback (done)
-reel-desktop     native UI (done)
-reel-catalog     TMDB metadata + poster cache + search-backend trait   <- next
-```
-
-`reel-catalog` maps a `TorrentView` (or a magnet) to a catalog entry: title,
-year, real artwork, synopsis, rows, and a "continue watching" list. Search
-backends sit behind a trait so the project ships no indexers of its own and any
-source is pluggable.
-
-Playback can then grow in-window subtitles (mpv renders them into the frame
-today, which costs a little CPU) and a transcoding step for clients that cannot
-take the original bytes.
+* **A search backend.** `SearchBackend` has no implementations by design. A
+  backend plus a results page is the natural next feature, and the trait is
+  already shaped for it: `SearchAggregator` merges several, sorts by seeders,
+  drops hits with no magnet, and reports per-backend failures instead of hiding
+  them. There is a fake backend in the tests to build against.
+* **In-window subtitles.** mpv renders subtitles into the frame today, which
+  works but costs CPU on the software renderer. Reading the subtitle track and
+  drawing it in egui would be cheaper and more controllable.
+* **A stronger metadata story.** Episode and season handling, because the
+  matching code is film-shaped today; and an NFO reader so a curated local
+  library does not need an API at all.
+* **Transcoding**, for clients that cannot take the original bytes — the same
+  reason an embedded browser engine would not have been a substitute for a real
+  player.
 

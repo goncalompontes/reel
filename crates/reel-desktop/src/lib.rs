@@ -12,12 +12,16 @@ pub mod theme;
 pub mod ui;
 
 pub use backend::{
-    Backend, BackendCapabilities, BackendEvent, EngineBackend, FakeBackend, PlayerCapability,
+    Backend, BackendCapabilities, BackendEvent, CatalogOptions, CatalogStatus, EngineBackend,
+    FakeBackend, LibraryItem, PlayerCapability,
 };
 pub use player::{PlaybackInfo, PlaybackStats, PlayerController};
-pub use ui::{App, Screen};
+pub use ui::{App, RowLayout, Screen};
 
-/// Apply the app's theme to an egui context.
-pub fn apply_theme(ctx: &egui::Context) {
+/// Install the dark theme and the image loaders, once, at startup.
+pub fn install(ctx: &egui::Context) {
     theme::apply(ctx);
+    // Decodes and caches poster images, including `file://` paths from the
+    // catalog cache, off the UI thread.
+    egui_extras::install_image_loaders(ctx);
 }

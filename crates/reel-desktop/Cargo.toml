@@ -37,6 +37,9 @@ eframe = { version = "0.36", default-features = false, features = [
 ] }
 egui = "0.36"
 egui_extras.workspace = true
+# Poster decoding. `image` is a default-features-off dependency of egui_extras,
+# so the formats have to be turned on here. TMDB serves JPEG; PNG for fixtures.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [dev-dependencies]
 egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }

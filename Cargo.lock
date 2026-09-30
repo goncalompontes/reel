@@ -2517,6 +2517,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -4567,6 +4569,7 @@ dependencies = [
  "egui",
  "egui_extras",
  "egui_kittest",
+ "image",
  "reel-catalog",
  "reel-core",
  "reel-http",

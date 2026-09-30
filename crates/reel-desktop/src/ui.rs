@@ -1,18 +1,18 @@
-//! The application: navigation, the catalogue grid, the detail page, the add
+//! The application: navigation, the catalog rows, the detail page, the add
 //! form, settings, and the player screen.
 //!
-//! Rendering is pure egui — immediate mode, GPU-rendered, no webview. All
-//! engine access goes through [`Backend`], so the same UI runs against a real
-//! engine or an in-memory fake in tests.
+//! Rendering is pure egui — immediate mode, GPU-rendered, no webview. All state
+//! comes from [`Backend`], so the same UI runs against a real engine or an
+//! in-memory fake in tests.
 
 use std::time::{Duration, Instant};
 
-use egui::{Color32, CornerRadius, Sense, Vec2};
-use reel_core::model::TorrentView;
-use reel_core::title::clean_title;
-use reel_core::{fmt, media};
+use egui::{Color32, CornerRadius, Rect, Sense, Vec2};
+use reel_catalog::{ArtworkKind, RowKind};
+use reel_core::fmt;
+use reel_core::media;
 
-use crate::backend::{Backend, BackendEvent, PlayerCapability};
+use crate::backend::{Backend, BackendEvent, LibraryItem, PlayerCapability};
 use crate::player::{PlaybackInfo, PlaybackStats, PlayerController};
 use crate::theme;
 
@@ -26,11 +26,21 @@ pub enum Screen {
     Settings,
 }
 
+/// A catalog row, resolved to torrent ids so rendering never rebuilds it.
+#[derive(Debug, Clone)]
+pub struct RowLayout {
+    pub kind: RowKind,
+    pub title: String,
+    pub ids: Vec<usize>,
+}
+
 pub struct App {
     backend: Box<dyn Backend>,
     screen: Screen,
-    /// Cached torrent list, refreshed periodically while browsing.
-    library: Vec<TorrentView>,
+    /// Cached library, refreshed periodically while browsing.
+    library: Vec<LibraryItem>,
+    /// Row layout, rebuilt with the library rather than every frame.
+    rows: Vec<RowLayout>,
     last_refresh: Instant,
     toast: Option<Toast>,
     add_source: String,
@@ -43,6 +53,10 @@ pub struct App {
     /// The egui context for the current frame, so UI actions triggered deep in
     /// the widget tree can still start playback.
     pending_ctx: Option<egui::Context>,
+    /// Last watch position handed to the backend, so we do not write on every
+    /// frame.
+    watch_last_recorded: f64,
+    watch_recording_for: Option<String>,
 }
 
 struct Toast {
@@ -53,6 +67,10 @@ struct Toast {
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const TOAST_LIFETIME: Duration = Duration::from_secs(6);
+/// How many entries each catalog row shows.
+const ROW_LIMIT: usize = 30;
+/// Record watch progress at most every this many seconds of playback.
+const WATCH_RECORD_INTERVAL: f64 = 5.0;
 
 impl App {
     pub fn new(backend: Box<dyn Backend>) -> Self {
@@ -60,6 +78,7 @@ impl App {
             backend,
             screen: Screen::Library,
             library: Vec::new(),
+            rows: Vec::new(),
             last_refresh: Instant::now() - REFRESH_INTERVAL,
             toast: None,
             add_source: String::new(),
@@ -69,6 +88,8 @@ impl App {
             player_origin: None,
             show_delete_confirm: None,
             pending_ctx: None,
+            watch_last_recorded: 0.0,
+            watch_recording_for: None,
         };
         app.refresh();
         app
@@ -79,9 +100,14 @@ impl App {
         &self.screen
     }
 
-    /// Number of torrents in the cached library. Exposed for tests.
+    /// Number of entries in the cached library. Exposed for tests.
     pub fn library_len(&self) -> usize {
         self.library.len()
+    }
+
+    /// Row headings currently laid out. Exposed for tests.
+    pub fn row_titles(&self) -> Vec<String> {
+        self.rows.iter().map(|row| row.title.clone()).collect()
     }
 
     pub fn navigate(&mut self, screen: Screen) {
@@ -103,22 +129,28 @@ impl App {
         self.add_source.clear();
     }
 
+    pub fn item(&self, id: usize) -> Option<LibraryItem> {
+        self.library.iter().find(|item| item.torrent.id == id).cloned()
+    }
+
+    /// Start playing a file, resuming from where it was left off.
     pub fn play_file(&mut self, ctx: &egui::Context, torrent_id: usize, file_id: usize) {
-        let Some(view) = self.backend.view(torrent_id) else {
+        let Some(item) = self.item(torrent_id) else {
             self.warn("That torrent is no longer in the library");
             return;
         };
-        let Some(file) = view.files.iter().find(|f| f.id == file_id) else {
+        let Some(file) = item.torrent.files.iter().find(|f| f.id == file_id) else {
             self.warn("That file is no longer in the torrent");
             return;
         };
 
-        let clean = clean_title(view.name.as_deref().unwrap_or(&view.info_hash));
         let info = PlaybackInfo {
             torrent_id,
-            title: clean.display(),
+            info_hash: item.entry.info_hash.clone(),
+            title: item.heading(),
             file_name: file.name.clone(),
             fallback_duration: None,
+            start_at: item.resume_position(),
         };
 
         let url = file
@@ -129,6 +161,8 @@ impl App {
 
         let capability = self.backend.capabilities().player.clone();
         self.player_origin = Some(torrent_id);
+        self.watch_last_recorded = item.resume_position().unwrap_or(0.0);
+        self.watch_recording_for = Some(item.entry.info_hash.clone());
 
         match self.player.open(ctx, &capability, &url, info) {
             Ok(()) => {
@@ -146,13 +180,25 @@ impl App {
     }
 
     fn refresh(&mut self) {
-        self.library = self.backend.torrents();
+        self.library = self.backend.library();
+
+        let entries: Vec<reel_catalog::CatalogEntry> =
+            self.library.iter().map(|item| item.entry.clone()).collect();
+        self.rows = reel_catalog::build_rows(&entries, ROW_LIMIT)
+            .into_iter()
+            .map(|row| RowLayout {
+                kind: row.kind,
+                title: row.title,
+                ids: row.entries.iter().map(|entry| entry.torrent_id).collect(),
+            })
+            .collect();
+
         self.last_refresh = Instant::now();
     }
 
     fn maybe_refresh(&mut self) {
-        // The player does not need the library list, and the detail page wants
-        // fresh numbers, so both refresh on the same cadence.
+        // The player needs fresh engine stats for its overlay, and the library
+        // needs new metadata as it arrives, so both refresh on one cadence.
         if self.screen != Screen::Settings && self.last_refresh.elapsed() >= REFRESH_INTERVAL {
             self.refresh();
         }
@@ -162,10 +208,18 @@ impl App {
         for event in self.backend.take_events() {
             match event {
                 BackendEvent::Info(message) => {
-                    self.toast = Some(Toast { message, error: false, shown: Instant::now() });
+                    self.toast = Some(Toast {
+                        message,
+                        error: false,
+                        shown: Instant::now(),
+                    });
                 }
                 BackendEvent::Error(message) => {
-                    self.toast = Some(Toast { message, error: true, shown: Instant::now() });
+                    self.toast = Some(Toast {
+                        message,
+                        error: true,
+                        shown: Instant::now(),
+                    });
                 }
                 BackendEvent::Added { id, title } => {
                     self.toast = Some(Toast {
@@ -176,49 +230,66 @@ impl App {
                     self.refresh();
                     self.screen = Screen::Detail(id);
                 }
+                BackendEvent::Metadata { .. } | BackendEvent::WatchUpdated => {
+                    self.refresh();
+                }
             }
             ctx.request_repaint();
         }
     }
 
     fn set_toast(&mut self, message: impl Into<String>, error: bool) {
-        self.toast = Some(Toast { message: message.into(), error, shown: Instant::now() });
+        self.toast = Some(Toast {
+            message: message.into(),
+            error,
+            shown: Instant::now(),
+        });
     }
 
     fn warn(&mut self, message: impl Into<String>) {
         self.set_toast(message, true);
     }
 
-    pub fn view(&self, id: usize) -> Option<TorrentView> {
-        self.library.iter().find(|v| v.id == id).cloned()
-    }
-
-    fn selected(&self) -> Option<TorrentView> {
+    fn selected(&self) -> Option<LibraryItem> {
         match self.screen {
-            Screen::Detail(id) => self.view(id),
+            Screen::Detail(id) => self.item(id),
             _ => None,
         }
     }
 
     /// Stats for the player overlay, taken from the engine rather than mpv.
     fn playback_stats(&self, torrent_id: usize) -> PlaybackStats {
-        let Some(view) = self.view(torrent_id) else {
+        let Some(item) = self.item(torrent_id) else {
             return PlaybackStats::default();
         };
-        let file_percent = match view.primary_file_id.and_then(|id| view.files.get(id)) {
-            Some(file) if file.length > 0 => {
-                // Report the whole-torrent percentage: the engine's per-file
-                // progress is not exposed, and for a media-only add the two are
-                // effectively the same.
-                view.stats.percent
-            }
-            _ => view.stats.percent,
-        };
         PlaybackStats {
-            download_bps: view.stats.download_bps,
-            peers: view.stats.peers.live,
-            file_percent,
+            download_bps: item.torrent.stats.download_bps,
+            peers: item.torrent.stats.peers.live,
+            file_percent: item.torrent.stats.percent,
         }
+    }
+
+    /// Persist how far playback has got, but not on every frame.
+    fn record_watch_progress(&mut self) {
+        let Some(info_hash) = self.watch_recording_for.clone() else {
+            return;
+        };
+        let info = self.player.current().cloned();
+        let state = self.player.state();
+        if !state.loaded || state.position < 1.0 {
+            return;
+        }
+        if (state.position - self.watch_last_recorded).abs() < WATCH_RECORD_INTERVAL {
+            return;
+        }
+        self.watch_last_recorded = state.position;
+        self.backend.record_watch(
+            &info_hash,
+            info.as_ref().map(|i| i.file_name.clone()),
+            info.as_ref().map(|i| i.title.clone()),
+            state.position,
+            state.duration,
+        );
     }
 }
 
@@ -248,7 +319,7 @@ impl eframe::App for App {
             .frame(
                 egui::Frame::NONE
                     .fill(theme::BG)
-                    .inner_margin(egui::Margin::symmetric(20, 16)),
+                    .inner_margin(egui::Margin::symmetric(20, 14)),
             )
             .show(ui, |ui| match self.screen.clone() {
                 Screen::Library => self.library_screen(ui),
@@ -305,22 +376,19 @@ impl App {
                     );
                 }
 
-                // Aggregate transfer rate across every torrent.
-                let (down, peers): (u64, u32) = self
-                    .library
-                    .iter()
-                    .fold((0, 0), |(d, p), v| {
-                        (d + v.stats.download_bps, p + v.stats.peers.live)
-                    });
+                let (down, peers): (u64, u32) = self.library.iter().fold((0, 0), |(d, p), item| {
+                    (
+                        d + item.torrent.stats.download_bps,
+                        p + item.torrent.stats.peers.live,
+                    )
+                });
                 if down > 0 {
                     ui.label(
                         egui::RichText::new(format!("{} \u{2b07}", fmt::human_rate(down)))
                             .color(theme::TEXT_DIM),
                     );
                 }
-                ui.label(
-                    egui::RichText::new(format!("{} peers", peers)).color(theme::TEXT_DIM),
-                );
+                ui.label(egui::RichText::new(format!("{peers} peers")).color(theme::TEXT_DIM));
             });
         });
     }
@@ -352,7 +420,7 @@ impl App {
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(color, "•");
+                    ui.colored_label(color, "\u{2022}");
                     ui.label(message);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("dismiss").clicked() {
@@ -372,8 +440,8 @@ impl App {
             return;
         };
         let title = self
-            .view(id)
-            .map(|v| clean_title(v.name.as_deref().unwrap_or(&v.info_hash)).display())
+            .item(id)
+            .map(|item| item.heading())
             .unwrap_or_else(|| format!("torrent {id}"));
 
         let mut close = false;
@@ -388,8 +456,8 @@ impl App {
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(
-                        "Removing only forgets the torrent. Deleting also removes the \
-                         downloaded files from disk.",
+                        "Removing only forgets the torrent and any saved position. Deleting \
+                         also removes the downloaded files from disk.",
                     )
                     .color(theme::TEXT_DIM),
                 );
@@ -425,54 +493,287 @@ impl App {
     }
 }
 
+// ---------------------------------------------------------------- artwork
+
+impl App {
+    /// Paint a poster or backdrop, falling back to generated artwork.
+    ///
+    /// The fallback is deliberate, not a placeholder: without an API key there
+    /// are no real posters, and a stable colour per title keeps the grid
+    /// readable and obviously intentional.
+    fn paint_art(ui: &egui::Ui, rect: Rect, item: &LibraryItem, kind: ArtworkKind, radius: CornerRadius) {
+        let reference = match kind {
+            ArtworkKind::Poster => item.entry.poster(),
+            ArtworkKind::Backdrop => item.entry.backdrop(),
+        };
+
+        if let Some(uri) = reference.and_then(|artwork| artwork.local_uri()) {
+            ui.painter().rect_filled(rect, radius, theme::SURFACE_RAISED);
+            // Crop rather than squash. Providers publish posters at 2:3 and
+            // backdrops at 16:9, and a hero banner is far wider than either, so
+            // filling the rect directly would visibly distort the image.
+            let uv = cover_uv(source_aspect(kind), rect.width() / rect.height().max(1.0));
+            egui::Image::new(uri)
+                .uv(uv)
+                .corner_radius(radius)
+                .paint_at(ui, rect);
+            return;
+        }
+
+        let seed = item.entry.title();
+        let base = match kind {
+            ArtworkKind::Poster => theme::poster_color(&seed),
+            ArtworkKind::Backdrop => theme::poster_shade(&seed),
+        };
+        let painter = ui.painter();
+        painter.rect_filled(rect, radius, base);
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            reel_core::title::initials(&seed),
+            egui::FontId::proportional(rect.height() * 0.22),
+            Color32::from_white_alpha(38),
+        );
+    }
+
+    /// A poster tile: artwork, title, progress, and a resume bar.
+    fn card(&mut self, ui: &mut egui::Ui, item: &LibraryItem, width: f32, height: f32) -> CardHit {
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+        let painter = ui.painter().clone();
+
+        Self::paint_art(ui, rect, item, ArtworkKind::Poster, theme::CARD_RADIUS);
+
+        // A scrim behind the text so it stays readable over bright artwork.
+        let mut scrim = rect;
+        scrim.set_top(rect.bottom() - 62.0);
+        painter.rect_filled(scrim, theme::CARD_RADIUS, Color32::from_black_alpha(190));
+
+        ui.put(
+            Rect::from_min_size(
+                egui::pos2(rect.left() + 8.0, rect.bottom() - 56.0),
+                Vec2::new(rect.width() - 16.0, 20.0),
+            ),
+            egui::Label::new(
+                egui::RichText::new(reel_core::title::truncate(&item.entry.title(), 22))
+                    .size(13.5)
+                    .color(Color32::WHITE),
+            )
+            .selectable(false),
+        );
+
+        // Second line: the year, or a resume hint once there is one.
+        let subtitle = match item.resume_position() {
+            Some(position) => format!("\u{25b6} resume from {}", fmt::human_duration(position)),
+            None => match item.entry.year() {
+                Some(year) => year.to_string(),
+                None => reel_core::title::truncate(item.info_hash(), 10),
+            },
+        };
+        ui.put(
+            Rect::from_min_size(
+                egui::pos2(rect.left() + 8.0, rect.bottom() - 36.0),
+                Vec2::new(rect.width() - 16.0, 16.0),
+            ),
+            egui::Label::new(
+                egui::RichText::new(subtitle)
+                    .size(10.5)
+                    .color(if item.resume_position().is_some() {
+                        theme::ACCENT
+                    } else {
+                        theme::TEXT_DIM
+                    }),
+            )
+            .selectable(false),
+        );
+
+        // Download progress along the bottom edge.
+        if item.torrent.stats.percent < 99.5 {
+            let bar = Rect::from_min_size(
+                egui::pos2(rect.left(), rect.bottom() - 4.0),
+                Vec2::new(rect.width(), 4.0),
+            );
+            let mut filled = bar;
+            filled.set_right(bar.left() + bar.width() * (item.torrent.stats.percent as f32 / 100.0));
+            painter.rect_filled(bar, CornerRadius::ZERO, Color32::from_black_alpha(150));
+            painter.rect_filled(filled, CornerRadius::ZERO, theme::OK);
+        }
+
+        painter.circle_filled(
+            egui::pos2(rect.right() - 14.0, rect.top() + 14.0),
+            5.0,
+            theme::state_color(&item.torrent.stats.state),
+        );
+
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            painter.rect_stroke(
+                rect,
+                theme::CARD_RADIUS,
+                egui::Stroke::new(1.5, theme::ACCENT),
+                egui::StrokeKind::Inside,
+            );
+        }
+
+        CardHit {
+            clicked: response.clicked(),
+            double_clicked: response.double_clicked(),
+        }
+    }
+}
+
+struct CardHit {
+    clicked: bool,
+    double_clicked: bool,
+}
+
 // ----------------------------------------------------------------- library
 
 impl App {
     fn library_screen(&mut self, ui: &mut egui::Ui) {
         let filter = self.filter.trim().to_lowercase();
-        let visible: Vec<TorrentView> = self
-            .library
-            .iter()
-            .filter(|view| {
-                if filter.is_empty() {
-                    return true;
-                }
-                let name = view.name.clone().unwrap_or_default().to_lowercase();
-                name.contains(&filter)
-            })
-            .cloned()
-            .collect();
 
         if self.library.is_empty() {
             self.empty_library(ui);
             return;
         }
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            // A hero banner for the most recently added torrent gives the page
-            // a catalogue feel rather than a bare list.
-            if let Some(featured) = visible.first().cloned() {
-                self.hero(ui, &featured);
-                ui.add_space(18.0);
-            }
+        // When filtering, show one flat grid: rows would only fragment the
+        // matches.
+        if !filter.is_empty() {
+            let matches: Vec<LibraryItem> = self
+                .library
+                .iter()
+                .filter(|item| {
+                    let haystack = format!(
+                        "{} {}",
+                        item.entry.title(),
+                        item.entry.display_title
+                    )
+                    .to_lowercase();
+                    haystack.contains(&filter)
+                })
+                .cloned()
+                .collect();
 
-            let label = if filter.is_empty() {
-                "In your library".to_string()
-            } else {
-                format!("Matching \"{}\"", self.filter.trim())
-            };
-            ui.label(egui::RichText::new(label).size(16.0).strong());
-            ui.add_space(8.0);
-
-            if visible.is_empty() {
+            egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.label(
-                    egui::RichText::new("Nothing matches that filter.").color(theme::TEXT_DIM),
+                    egui::RichText::new(format!(
+                        "{} match{} for \"{}\"",
+                        matches.len(),
+                        if matches.len() == 1 { "" } else { "es" },
+                        self.filter.trim()
+                    ))
+                    .size(16.0)
+                    .strong(),
                 );
-                return;
+                ui.add_space(10.0);
+                if matches.is_empty() {
+                    ui.label(egui::RichText::new("Nothing here matches.").color(theme::TEXT_DIM));
+                } else {
+                    self.card_grid(ui, &matches);
+                }
+            });
+            return;
+        }
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            if let Some(featured) = self.library.first().cloned() {
+                self.hero(ui, &featured);
+                ui.add_space(16.0);
             }
 
-            self.card_grid(ui, &visible);
+            for row in self.rows.clone() {
+                let items: Vec<LibraryItem> = row
+                    .ids
+                    .iter()
+                    .filter_map(|id| self.library.iter().find(|i| i.torrent.id == *id).cloned())
+                    .collect();
+                if items.is_empty() {
+                    continue;
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(&row.title).size(16.0).strong());
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(plural(items.len(), "title"))
+                            .size(11.0)
+                            .color(theme::TEXT_DIM),
+                    );
+                });
+                ui.add_space(6.0);
+                self.row_strip(ui, &items, row.kind);
+                ui.add_space(20.0);
+            }
         });
+    }
+
+    /// A horizontally scrolling strip of posters.
+    fn row_strip(&mut self, ui: &mut egui::Ui, items: &[LibraryItem], kind: RowKind) {
+        // Resume cards are taller so the "resume from" line has room.
+        let (width, height) = match kind {
+            RowKind::ContinueWatching => (240.0, 135.0),
+            _ => (168.0, 252.0),
+        };
+
+        let mut open: Option<usize> = None;
+        let mut play: Option<usize> = None;
+
+        egui::ScrollArea::horizontal()
+            .id_salt(format!("row-{kind:?}"))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for item in items {
+                        let hit = self.card(ui, item, width, height);
+                        if hit.double_clicked {
+                            play = Some(item.torrent.id);
+                        } else if hit.clicked {
+                            open = Some(item.torrent.id);
+                        }
+                        ui.add_space(10.0);
+                    }
+                });
+            });
+
+        if let Some(id) = play {
+            self.play_with_ctx(id);
+        } else if let Some(id) = open {
+            self.screen = Screen::Detail(id);
+        }
+    }
+
+    /// A wrapped grid, used for filtered results and small libraries.
+    fn card_grid(&mut self, ui: &mut egui::Ui, items: &[LibraryItem]) {
+        const CARD_W: f32 = 168.0;
+        // 2:3, the shape of a real poster, so artwork is not stretched.
+        const CARD_H: f32 = 252.0;
+        const GAP: f32 = 12.0;
+
+        let available = ui.available_width();
+        let per_row = (((available + GAP) / (CARD_W + GAP)).floor() as usize).max(1);
+        let mut open: Option<usize> = None;
+        let mut play: Option<usize> = None;
+
+        for chunk in items.chunks(per_row) {
+            ui.horizontal(|ui| {
+                for item in chunk {
+                    let hit = self.card(ui, item, CARD_W, CARD_H);
+                    if hit.double_clicked {
+                        play = Some(item.torrent.id);
+                    } else if hit.clicked {
+                        open = Some(item.torrent.id);
+                    }
+                    ui.add_space(GAP);
+                }
+            });
+            ui.add_space(GAP);
+        }
+
+        if let Some(id) = play {
+            self.play_with_ctx(id);
+        } else if let Some(id) = open {
+            self.screen = Screen::Detail(id);
+        }
     }
 
     fn empty_library(&mut self, ui: &mut egui::Ui) {
@@ -482,8 +783,8 @@ impl App {
             ui.add_space(10.0);
             ui.label(
                 egui::RichText::new(
-                    "Add a magnet link or a .torrent URL and reel will start \
-                     fetching the video, streaming it while it downloads.",
+                    "Add a magnet link or a .torrent URL and reel will start fetching the \
+                     video, streaming it while it downloads.",
                 )
                 .color(theme::TEXT_DIM),
             );
@@ -494,233 +795,123 @@ impl App {
         });
     }
 
-    fn hero(&mut self, ui: &mut egui::Ui, view: &TorrentView) {
-        let clean = clean_title(view.name.as_deref().unwrap_or(&view.info_hash));
-        let height = 190.0;
+    /// The banner at the top of the library: newest entry, blown up.
+    fn hero(&mut self, ui: &mut egui::Ui, item: &LibraryItem) {
+        let height = 240.0;
         let width = ui.available_width();
         let (rect, hero_response) =
             ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
         let painter = ui.painter().clone();
 
-        let base = theme::poster_color(&clean.title);
-        painter.rect_filled(rect, theme::PANEL_RADIUS, base);
+        Self::paint_art(ui, rect, item, ArtworkKind::Backdrop, theme::PANEL_RADIUS);
 
-        // A darker band on the right keeps the text side readable.
-        let mut shade = rect;
-        shade.set_left(rect.left() + rect.width() * 0.45);
-        painter.rect_filled(shade, theme::PANEL_RADIUS, theme::poster_shade(&clean.title));
-
-        let text_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + 22.0, rect.top() + 22.0),
-            egui::pos2(rect.right() - 260.0, rect.bottom() - 18.0),
-        );
+        // Darken the lower half so the text reads over any artwork.
+        let mut scrim = rect;
+        scrim.set_top(rect.bottom() - 120.0);
+        painter.rect_filled(scrim, theme::PANEL_RADIUS, Color32::from_black_alpha(180));
 
         ui.put(
-            egui::Rect::from_min_size(text_rect.left_top(), Vec2::new(90.0, 16.0)),
-            egui::Label::new(
-                egui::RichText::new("LATEST").size(11.0).strong().color(theme::ACCENT),
-            )
-            .selectable(false),
-        );
-        ui.put(
-            egui::Rect::from_min_size(
-                egui::pos2(text_rect.left(), text_rect.top() + 20.0),
-                Vec2::new(text_rect.width(), 38.0),
+            Rect::from_min_size(
+                egui::pos2(rect.left() + 24.0, rect.top() + 22.0),
+                Vec2::new(160.0, 18.0),
             ),
             egui::Label::new(
-                egui::RichText::new(reel_core::title::truncate(&clean.display(), 46))
-                    .size(28.0)
-                    .color(Color32::WHITE),
+                egui::RichText::new("LATEST")
+                    .size(11.0)
+                    .strong()
+                    .color(theme::ACCENT),
             )
+            .halign(egui::Align::LEFT)
             .selectable(false),
         );
 
-        let resume = ui
+        ui.put(
+            Rect::from_min_size(
+                egui::pos2(rect.left() + 24.0, rect.bottom() - 84.0),
+                Vec2::new(rect.width() - 300.0, 40.0),
+            ),
+            egui::Label::new(
+                egui::RichText::new(reel_core::title::truncate(&item.heading(), 52))
+                    .size(30.0)
+                    .color(Color32::WHITE),
+            )
+            .halign(egui::Align::LEFT)
+            .selectable(false),
+        );
+
+        // Metadata line: genres and rating when we have them, otherwise the
+        // transfer state.
+        let meta = match item.entry.metadata.as_ref() {
+            Some(metadata) => {
+                let mut parts = Vec::new();
+                if let Some(year) = metadata.year {
+                    parts.push(year.to_string());
+                }
+                if let Some(runtime) = metadata.runtime_label() {
+                    parts.push(runtime);
+                }
+                if let Some(rating) = metadata.rating {
+                    parts.push(format!("\u{2605} {rating:.1}/10"));
+                }
+                if !metadata.genres.is_empty() {
+                    parts.push(metadata.genres.join(" \u{2022} "));
+                }
+                parts.join("   \u{2022}   ")
+            }
+            None => format!(
+                "{}   \u{2022}   {} peers   \u{2022}   {:.0}% downloaded",
+                item.torrent.stats.state,
+                item.torrent.stats.peers.live,
+                item.torrent.stats.percent
+            ),
+        };
+        ui.put(
+            Rect::from_min_size(
+                egui::pos2(rect.left() + 24.0, rect.bottom() - 44.0),
+                Vec2::new(rect.width() - 300.0, 18.0),
+            ),
+            egui::Label::new(egui::RichText::new(meta).size(12.0).color(theme::TEXT_DIM))
+                .halign(egui::Align::LEFT)
+                .selectable(false),
+        );
+
+        let label = match item.resume_position() {
+            Some(position) => format!("\u{25b6}  Resume {}", fmt::human_duration(position)),
+            None if item.torrent.finished => "\u{25b6}  Play".to_string(),
+            None => "\u{25b6}  Play".to_string(),
+        };
+        let play = ui
             .put(
-                egui::Rect::from_min_size(
-                    egui::pos2(rect.right() - 232.0, rect.bottom() - 60.0),
-                    Vec2::new(200.0, 34.0),
+                Rect::from_min_size(
+                    egui::pos2(rect.right() - 224.0, rect.bottom() - 74.0),
+                    Vec2::new(190.0, 38.0),
                 ),
-                egui::Button::new(
-                    egui::RichText::new(if view.finished {
-                        "\u{25b6}  Play"
-                    } else {
-                        "\u{25b6}  Resume"
-                    })
-                    .size(15.0),
-                ),
+                egui::Button::new(egui::RichText::new(label).size(15.0)),
             )
             .clicked();
 
-        let progress_rect = egui::Rect::from_min_size(
-            egui::pos2(text_rect.left(), rect.bottom() - 40.0),
-            Vec2::new(text_rect.width(), 6.0),
-        );
-        let mut filled = progress_rect;
-        filled.set_right(progress_rect.left() + progress_rect.width() * (view.stats.percent as f32 / 100.0));
-        painter.rect_filled(progress_rect, CornerRadius::same(3), theme::BG);
-        painter.rect_filled(filled, CornerRadius::same(3), theme::ACCENT);
-        painter.text(
-            egui::pos2(text_rect.left(), rect.bottom() - 62.0),
-            egui::Align2::LEFT_BOTTOM,
-            format!(
-                "{} of {}  \u{2022}  {}  \u{2022}  {} peers",
-                fmt::human_bytes(view.stats.progress_bytes),
-                fmt::human_bytes(view.stats.total_bytes),
-                view.state,
-                view.stats.peers.live
-            ),
-            egui::FontId::proportional(12.0),
-            theme::TEXT_DIM,
-        );
-
-        if resume {
-            self.play_primary(view.id);
+        if play {
+            self.play_with_ctx(item.torrent.id);
         } else if hero_response.clicked() {
-            self.screen = Screen::Detail(view.id);
-        }
-    }
-
-    fn play_primary(&mut self, id: usize) {
-        let Some(view) = self.view(id) else { return };
-        let file_id = view
-            .primary_file_id
-            .or_else(|| view.files.iter().find(|f| f.is_video).map(|f| f.id));
-        match file_id {
-            Some(file_id) => {
-                let ctx = self.pending_ctx.clone();
-                match ctx {
-                    Some(ctx) => self.play_file(&ctx, id, file_id),
-                    None => self.warn("Playback is not ready yet"),
-                }
-            }
-            None => self.warn("This torrent has no playable file"),
-        }
-    }
-
-    fn card_grid(&mut self, ui: &mut egui::Ui, views: &[TorrentView]) {
-        const CARD_W: f32 = 178.0;
-        const CARD_H: f32 = 250.0;
-        const GAP: f32 = 14.0;
-
-        let available = ui.available_width();
-        let per_row = (((available + GAP) / (CARD_W + GAP)).floor() as usize).max(1);
-        let mut clicked: Option<usize> = None;
-        let mut play: Option<usize> = None;
-
-        for row in views.chunks(per_row) {
-            ui.horizontal(|ui| {
-                for view in row {
-                    let (rect, response) =
-                        ui.allocate_exact_size(Vec2::new(CARD_W, CARD_H), Sense::click());
-                    let painter = ui.painter().clone();
-                    let clean = clean_title(view.name.as_deref().unwrap_or(&view.info_hash));
-
-                    // Artwork: a stable colour per title until real posters
-                    // arrive with the metadata layer.
-                    painter.rect_filled(rect, theme::CARD_RADIUS, theme::poster_color(&clean.title));
-                    let mut badge = rect;
-                    badge.set_top(rect.bottom() - 74.0);
-                    painter.rect_filled(badge, theme::CARD_RADIUS, theme::poster_shade(&clean.title));
-
-                    painter.text(
-                        rect.center() - Vec2::new(0.0, 26.0),
-                        egui::Align2::CENTER_CENTER,
-                        reel_core::title::initials(&clean.title),
-                        egui::FontId::proportional(46.0),
-                        Color32::from_white_alpha(38),
-                    );
-
-                    // Title and meta as real labels rather than painted text, so
-                    // they are visible to accessibility tools (and to tests).
-                    ui.put(
-                        egui::Rect::from_min_size(
-                            egui::pos2(rect.left() + 10.0, rect.bottom() - 64.0),
-                            Vec2::new(rect.width() - 20.0, 20.0),
-                        ),
-                        egui::Label::new(
-                            egui::RichText::new(reel_core::title::truncate(&clean.title, 20))
-                                .size(14.0)
-                                .color(Color32::WHITE),
-                        )
-                        .selectable(false),
-                    );
-                    ui.put(
-                        egui::Rect::from_min_size(
-                            egui::pos2(rect.left() + 10.0, rect.bottom() - 46.0),
-                            Vec2::new(rect.width() - 20.0, 16.0),
-                        ),
-                        egui::Label::new(
-                            egui::RichText::new(match clean.year {
-                                Some(year) => format!("{year}"),
-                                None => reel_core::title::truncate(&view.info_hash, 10),
-                            })
-                            .size(11.0)
-                            .color(theme::TEXT_DIM),
-                        )
-                        .selectable(false),
-                    );
-
-                    // Progress bar.
-                    let bar = egui::Rect::from_min_size(
-                        egui::pos2(rect.left() + 10.0, rect.bottom() - 26.0),
-                        Vec2::new(rect.width() - 20.0, 5.0),
-                    );
-                    let mut filled = bar;
-                    filled.set_right(bar.left() + bar.width() * (view.stats.percent as f32 / 100.0));
-                    painter.rect_filled(bar, CornerRadius::same(2), theme::BG);
-                    painter.rect_filled(filled, CornerRadius::same(2), theme::OK);
-
-                    // State dot.
-                    painter.circle_filled(
-                        egui::pos2(rect.right() - 16.0, rect.top() + 16.0),
-                        5.0,
-                        theme::state_color(&view.state),
-                    );
-
-                    if response.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        painter.rect_stroke(
-                            rect,
-                            theme::CARD_RADIUS,
-                            egui::Stroke::new(1.5, theme::ACCENT),
-                            egui::StrokeKind::Inside,
-                        );
-                    }
-
-                    if response.clicked() {
-                        clicked = Some(view.id);
-                    }
-                    // Double click plays, matching the rest of the app.
-                    if response.double_clicked() {
-                        play = Some(view.id);
-                    }
-                }
-            });
-            ui.add_space(GAP);
-        }
-
-        if let Some(id) = clicked {
-            if play.is_none() {
-                self.screen = Screen::Detail(id);
-            }
-        }
-        if let Some(id) = play {
-            self.play_with_ctx(id);
+            self.screen = Screen::Detail(item.torrent.id);
         }
     }
 
     fn play_with_ctx(&mut self, id: usize) {
-        let ctx = self.pending_ctx.clone();
-        match ctx {
-            Some(ctx) => {
-                let Some(view) = self.view(id) else { return };
-                match view.primary_file_id {
-                    Some(file_id) => self.play_file(&ctx, id, file_id),
-                    None => self.warn("This torrent has no playable file yet"),
-                }
-            }
-            None => self.warn("Playback is not ready yet"),
+        let Some(ctx) = self.pending_ctx.clone() else {
+            self.warn("Playback is not ready yet");
+            return;
+        };
+        let Some(item) = self.item(id) else { return };
+
+        let file_id = item
+            .torrent
+            .primary_file_id
+            .or_else(|| item.torrent.files.iter().find(|f| f.is_video).map(|f| f.id));
+
+        match file_id {
+            Some(file_id) => self.play_file(&ctx, id, file_id),
+            None => self.warn("This torrent has no playable file yet"),
         }
     }
 }
@@ -729,7 +920,7 @@ impl App {
 
 impl App {
     fn detail_screen(&mut self, ui: &mut egui::Ui) {
-        let Some(view) = self.selected() else {
+        let Some(item) = self.selected() else {
             ui.label("That torrent is no longer in the library.");
             if ui.button("Back to library").clicked() {
                 self.screen = Screen::Library;
@@ -737,7 +928,6 @@ impl App {
             return;
         };
 
-        let clean = clean_title(view.name.as_deref().unwrap_or(&view.info_hash));
         let mut action: Option<DetailAction> = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -745,116 +935,205 @@ impl App {
                 if ui.button("\u{2b05}  Library").clicked() {
                     action = Some(DetailAction::Navigate(Screen::Library));
                 }
-                ui.label(egui::RichText::new(format!("torrent #{}", view.id)).color(theme::TEXT_DIM));
+                ui.label(
+                    egui::RichText::new(format!("torrent #{}", item.torrent.id))
+                        .color(theme::TEXT_DIM),
+                );
             });
 
             ui.add_space(10.0);
 
+            // Backdrop header, with the poster overlapping it.
+            let header_height = 200.0;
+            let (header, _) = ui.allocate_exact_size(
+                Vec2::new(ui.available_width(), header_height),
+                Sense::hover(),
+            );
+            let painter = ui.painter().clone();
+            Self::paint_art(ui, header, &item, ArtworkKind::Backdrop, theme::PANEL_RADIUS);
+            let mut scrim = header;
+            scrim.set_left(header.left() + header.width() * 0.4);
+            painter.rect_filled(scrim, theme::PANEL_RADIUS, Color32::from_black_alpha(150));
+
+            ui.add_space(-header_height + 24.0);
             ui.horizontal(|ui| {
-                // Poster
-                let (rect, _) = ui.allocate_exact_size(Vec2::new(190.0, 268.0), Sense::hover());
-                let painter = ui.painter().clone();
-                painter.rect_filled(rect, theme::CARD_RADIUS, theme::poster_color(&clean.title));
-                painter.text(
-                    rect.center() - Vec2::new(0.0, 20.0),
-                    egui::Align2::CENTER_CENTER,
-                    reel_core::title::initials(&clean.title),
-                    egui::FontId::proportional(52.0),
-                    Color32::from_white_alpha(40),
-                );
+                ui.add_space(24.0);
+                let poster_size = Vec2::new(160.0, 230.0);
+                let (poster, _) = ui.allocate_exact_size(poster_size, Sense::hover());
+                Self::paint_art(ui, poster, &item, ArtworkKind::Poster, theme::CARD_RADIUS);
 
-                ui.add_space(18.0);
-
+                ui.add_space(20.0);
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new(clean.display()).size(26.0).strong());
-                    ui.add_space(4.0);
+                    ui.add_space(40.0);
                     ui.label(
-                        egui::RichText::new(format!(
-                            "{}  \u{2022}  {}  \u{2022}  {}",
-                            view.state,
-                            fmt::human_bytes(view.stats.total_bytes),
-                            reel_core::title::truncate(&view.info_hash, 16)
-                        ))
-                        .color(theme::TEXT_DIM),
+                        egui::RichText::new(item.heading())
+                            .size(28.0)
+                            .strong()
+                            .color(Color32::WHITE),
                     );
 
-                    ui.add_space(12.0);
-                    ui.add(
-                        egui::ProgressBar::new((view.stats.percent / 100.0) as f32)
-                            .desired_width(420.0)
-                            .fill(theme::ACCENT)
-                            .text(format!("{:.1}%", view.stats.percent)),
-                    );
+                    if let Some(metadata) = item.entry.metadata.as_ref() {
+                        if let Some(tagline) = metadata.tagline.as_deref() {
+                            ui.label(
+                                egui::RichText::new(tagline)
+                                    .size(13.0)
+                                    .italics()
+                                    .color(theme::TEXT_DIM),
+                            );
+                        }
 
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        stat(ui, "downloaded", &fmt::human_bytes(view.stats.progress_bytes));
-                        stat(ui, "down", &fmt::human_rate(view.stats.download_bps));
-                        stat(ui, "up", &fmt::human_rate(view.stats.upload_bps));
-                        stat(ui, "peers", &view.stats.peers.live.to_string());
-                        stat(ui, "eta", &fmt::human_eta(view.stats.eta_seconds));
-                    });
+                        let mut facts = Vec::new();
+                        if let Some(rating) = metadata.rating {
+                            facts.push(format!("\u{2605} {rating:.1}/10"));
+                        }
+                        if let Some(votes) = metadata.vote_count {
+                            facts.push(format!("{votes} votes"));
+                        }
+                        if let Some(runtime) = metadata.runtime_label() {
+                            facts.push(runtime);
+                        }
+                        facts.push(fmt::human_bytes(item.torrent.stats.total_bytes));
+                        if !facts.is_empty() {
+                            ui.label(
+                                egui::RichText::new(facts.join("   \u{2022}   "))
+                                    .size(12.0)
+                                    .color(theme::TEXT_DIM),
+                            );
+                        }
 
-                    if let Some(error) = view.stats.error.as_deref() {
-                        ui.add_space(8.0);
-                        ui.colored_label(theme::DANGER, error);
+                        if !metadata.genres.is_empty() {
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(metadata.genres.join("  \u{2022}  "))
+                                    .size(12.0)
+                                    .color(theme::ACCENT),
+                            );
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}  \u{2022}  {}  \u{2022}  {}",
+                                item.torrent.stats.state,
+                                fmt::human_bytes(item.torrent.stats.total_bytes),
+                                reel_core::title::truncate(item.info_hash(), 16)
+                            ))
+                            .color(theme::TEXT_DIM),
+                        );
                     }
-
-                    ui.add_space(14.0);
-                    ui.horizontal(|ui| {
-                        let playable = view.primary_file_id.or_else(|| {
-                            view.files.iter().find(|f| f.is_video).map(|f| f.id)
-                        });
-                        let enabled = playable.is_some();
-
-                        if ui
-                            .add_enabled(
-                                enabled,
-                                egui::Button::new(egui::RichText::new("\u{25b6}  Play").size(15.0)),
-                            )
-                            .clicked()
-                        {
-                            if let Some(file_id) = playable {
-                                action = Some(DetailAction::Play(file_id));
-                            }
-                        }
-
-                        let pause_label = if view.stats.is_paused() { "\u{25b6}  Resume" } else { "\u{23f8}  Pause" };
-                        if ui.add_enabled(!view.finished, egui::Button::new(pause_label)).clicked() {
-                            action = Some(DetailAction::SetPaused(!view.stats.is_paused()));
-                        }
-
-                        if ui.button("\u{1f5d1}  Remove").clicked() {
-                            action = Some(DetailAction::ConfirmRemove);
-                        }
-
-                        if let Some(path) = view.primary_file() {
-                            let url = path
-                                .stream
-                                .url
-                                .clone()
-                                .unwrap_or_else(|| path.stream.path.clone());
-                            if ui
-                                .button("\u{1f4cb}  Copy stream URL")
-                                .on_hover_text(url.clone())
-                                .clicked()
-                            {
-                                ui.ctx().copy_text(url);
-                            }
-                        }
-                    });
                 });
             });
 
-            ui.add_space(20.0);
+            ui.add_space(16.0);
+
+            let playable = item
+                .torrent
+                .primary_file_id
+                .or_else(|| item.torrent.files.iter().find(|f| f.is_video).map(|f| f.id));
+
+            ui.horizontal(|ui| {
+                let resume = item.resume_position();
+                let label = match resume {
+                    Some(position) => format!("\u{25b6}  Resume {}", fmt::human_duration(position)),
+                    None => "\u{25b6}  Play".to_string(),
+                };
+                if ui
+                    .add_enabled(
+                        playable.is_some(),
+                        egui::Button::new(egui::RichText::new(label).size(15.0)),
+                    )
+                    .clicked()
+                {
+                    if let Some(file_id) = playable {
+                        action = Some(DetailAction::Play(file_id));
+                    }
+                }
+
+                if resume.is_some() && ui.button("Start over").clicked() {
+                    if let Some(file_id) = playable {
+                        action = Some(DetailAction::PlayFrom(file_id, 0.0));
+                    }
+                }
+
+                if let Some(hash) = Some(item.entry.info_hash.clone()) {
+                    if ui.button("Mark watched").clicked() {
+                        action = Some(DetailAction::MarkWatched(hash));
+                    }
+                }
+
+                let pause_label = if item.torrent.stats.is_paused() {
+                    "\u{25b6}  Resume download"
+                } else {
+                    "\u{23f8}  Pause download"
+                };
+                if ui
+                    .add_enabled(!item.torrent.finished, egui::Button::new(pause_label))
+                    .clicked()
+                {
+                    action = Some(DetailAction::SetPaused(!item.torrent.stats.is_paused()));
+                }
+
+                if ui.button("\u{1f5d1}  Remove").clicked() {
+                    action = Some(DetailAction::ConfirmRemove);
+                }
+
+                if let Some(file) = item.torrent.primary_file() {
+                    let url = file
+                        .stream
+                        .url
+                        .clone()
+                        .unwrap_or_else(|| file.stream.path.clone());
+                    if ui
+                        .button("\u{1f4cb}  Copy stream URL")
+                        .on_hover_text(url.clone())
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(url);
+                    }
+                }
+            });
+
+            ui.add_space(14.0);
+
+            if let Some(metadata) = item.entry.metadata.as_ref() {
+                if let Some(overview) = metadata.overview.as_deref() {
+                    ui.label(egui::RichText::new(overview).size(13.5).color(theme::TEXT));
+                    ui.add_space(12.0);
+                }
+            }
+
+            ui.add(
+                egui::ProgressBar::new((item.torrent.stats.percent / 100.0) as f32)
+                    .desired_width(440.0)
+                    .fill(theme::ACCENT)
+                    .text(format!("{:.1}%", item.torrent.stats.percent)),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                stat(ui, "downloaded", &fmt::human_bytes(item.torrent.stats.progress_bytes));
+                stat(ui, "down", &fmt::human_rate(item.torrent.stats.download_bps));
+                stat(ui, "up", &fmt::human_rate(item.torrent.stats.upload_bps));
+                stat(ui, "peers", &item.torrent.stats.peers.live.to_string());
+                stat(ui, "eta", &fmt::human_eta(item.torrent.stats.eta_seconds));
+            });
+
+            if let Some(error) = item.torrent.stats.error.as_deref() {
+                ui.add_space(6.0);
+                ui.colored_label(theme::DANGER, error);
+            }
+
+            ui.add_space(16.0);
             ui.separator();
             ui.add_space(10.0);
 
-            ui.label(egui::RichText::new(format!("Files ({})", view.files.len())).size(16.0).strong());
+            ui.label(
+                egui::RichText::new(format!("Files ({})", item.torrent.files.len()))
+                    .size(16.0)
+                    .strong(),
+            );
             ui.add_space(6.0);
 
-            for file in &view.files {
-                let row = ui.horizontal(|ui| {
+            for file in &item.torrent.files {
+                ui.horizontal(|ui| {
                     let icon = if file.is_video {
                         "\u{1f3ac}"
                     } else if file.is_audio {
@@ -866,13 +1145,16 @@ impl App {
                     };
                     ui.label(icon);
                     ui.label(
-                        egui::RichText::new(reel_core::title::truncate(&file.path, 60))
-                            .color(if file.included { theme::TEXT } else { theme::TEXT_DIM }),
+                        egui::RichText::new(reel_core::title::truncate(&file.path, 60)).color(
+                            if file.included {
+                                theme::TEXT
+                            } else {
+                                theme::TEXT_DIM
+                            },
+                        ),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if media::is_media_file(&file.name)
-                            && ui.small_button("Play").clicked()
-                        {
+                        if media::is_media_file(&file.name) && ui.small_button("Play").clicked() {
                             action = Some(DetailAction::Play(file.id));
                         }
                         ui.label(
@@ -880,33 +1162,54 @@ impl App {
                                 .color(theme::TEXT_DIM),
                         );
                         if !file.included {
-                            ui.label(
-                                egui::RichText::new("skipped").color(theme::WARN).size(11.0),
-                            );
+                            ui.label(egui::RichText::new("skipped").color(theme::WARN).size(11.0));
                         }
                     });
                 });
-                let _ = row;
                 ui.separator();
             }
 
             ui.add_space(6.0);
             ui.label(
-                egui::RichText::new(format!("Stored in {}", view.output_folder))
-                    .color(theme::TEXT_DIM)
-                    .size(11.0),
+                egui::RichText::new(format!(
+                    "Stored in {}{}",
+                    item.torrent.output_folder,
+                    item.entry
+                        .metadata
+                        .as_ref()
+                        .map(|m| format!("   \u{2022}   matched on {}", m.source))
+                        .unwrap_or_default()
+                ))
+                .color(theme::TEXT_DIM)
+                .size(11.0),
             );
         });
 
         match action {
             Some(DetailAction::Navigate(screen)) => self.screen = screen,
-            Some(DetailAction::SetPaused(paused)) => self.backend.set_paused(view.id, paused),
-            Some(DetailAction::ConfirmRemove) => self.show_delete_confirm = Some(view.id),
+            Some(DetailAction::SetPaused(paused)) => self.backend.set_paused(item.torrent.id, paused),
+            Some(DetailAction::ConfirmRemove) => self.show_delete_confirm = Some(item.torrent.id),
+            Some(DetailAction::MarkWatched(hash)) => {
+                self.backend
+                    .mark_finished(&hash, Some(item.entry.title()));
+                self.refresh();
+            }
             Some(DetailAction::Play(file_id)) => {
                 let ctx = self.pending_ctx.clone();
                 match ctx {
-                    Some(ctx) => self.play_file(&ctx, view.id, file_id),
+                    Some(ctx) => self.play_file(&ctx, item.torrent.id, file_id),
                     None => self.warn("Playback is not ready yet"),
+                }
+            }
+            Some(DetailAction::PlayFrom(file_id, position)) => {
+                self.backend.forget_watch(item.info_hash());
+                self.refresh();
+                let ctx = self.pending_ctx.clone();
+                if let Some(ctx) = ctx {
+                    self.play_file(&ctx, item.torrent.id, file_id);
+                    if position > 0.0 {
+                        self.player.seek_relative(position);
+                    }
                 }
             }
             None => {}
@@ -918,7 +1221,59 @@ enum DetailAction {
     Navigate(Screen),
     SetPaused(bool),
     ConfirmRemove,
+    MarkWatched(String),
     Play(usize),
+    PlayFrom(usize, f64),
+}
+
+/// The shape providers publish artwork in.
+fn source_aspect(kind: ArtworkKind) -> f32 {
+    match kind {
+        ArtworkKind::Poster => 2.0 / 3.0,
+        ArtworkKind::Backdrop => 16.0 / 9.0,
+    }
+}
+
+/// A UV sub-rectangle that fills `target_aspect` from a `source_aspect` image
+/// without distorting it, cropped centrally.
+///
+/// This is the "cover" fit: a 16:9 backdrop shown in a 5:1 banner keeps its
+/// middle band rather than being squashed vertically.
+pub fn cover_uv(source_aspect: f32, target_aspect: f32) -> Rect {
+    let full = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+
+    if !source_aspect.is_finite()
+        || !target_aspect.is_finite()
+        || source_aspect <= 0.0
+        || target_aspect <= 0.0
+    {
+        return full;
+    }
+
+    let mut uv = full;
+    if source_aspect > target_aspect {
+        // Source is wider than the hole: keep a centred vertical slice.
+        let keep = (target_aspect / source_aspect).clamp(0.0, 1.0);
+        let inset = (1.0 - keep) / 2.0;
+        uv.min.x = inset;
+        uv.max.x = 1.0 - inset;
+    } else {
+        // Source is taller: keep a centred horizontal band.
+        let keep = (source_aspect / target_aspect).clamp(0.0, 1.0);
+        let inset = (1.0 - keep) / 2.0;
+        uv.min.y = inset;
+        uv.max.y = 1.0 - inset;
+    }
+    uv
+}
+
+/// `1 title`, `2 titles`.
+fn plural(count: usize, singular: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {singular}s")
+    }
 }
 
 fn stat(ui: &mut egui::Ui, label: &str, value: &str) {
@@ -933,7 +1288,7 @@ fn stat(ui: &mut egui::Ui, label: &str, value: &str) {
 
 impl App {
     fn add_screen(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(20.0);
+        ui.add_space(16.0);
         ui.label(egui::RichText::new("Add a torrent").size(22.0).strong());
         ui.add_space(6.0);
         ui.label(
@@ -944,7 +1299,7 @@ impl App {
             .color(theme::TEXT_DIM),
         );
 
-        ui.add_space(16.0);
+        ui.add_space(14.0);
         let response = ui.add(
             egui::TextEdit::multiline(&mut self.add_source)
                 .hint_text("magnet:?xt=urn:btih:\u{2026}")
@@ -969,16 +1324,30 @@ impl App {
             self.submit_add();
         }
 
+        let status = self.backend.catalog_status();
+        if !status.configured {
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new(
+                    status
+                        .note
+                        .clone()
+                        .unwrap_or_else(|| "Metadata is unavailable.".into()),
+                )
+                .color(theme::WARN)
+                .size(12.0),
+            );
+        }
+
         if !self.library.is_empty() {
-            ui.add_space(28.0);
+            ui.add_space(24.0);
             ui.label(egui::RichText::new("Already in your library").size(16.0).strong());
             ui.add_space(6.0);
-            for view in self.library.clone() {
-                let clean = clean_title(view.name.as_deref().unwrap_or(&view.info_hash));
+            for item in self.library.clone() {
                 ui.horizontal(|ui| {
-                    ui.label(reel_core::title::truncate(&clean.display(), 50));
+                    ui.label(reel_core::title::truncate(&item.heading(), 50));
                     if ui.small_button("Open").clicked() {
-                        self.screen = Screen::Detail(view.id);
+                        self.screen = Screen::Detail(item.torrent.id);
                     }
                 });
             }
@@ -991,74 +1360,152 @@ impl App {
 impl App {
     fn settings_screen(&mut self, ui: &mut egui::Ui) {
         let caps = self.backend.capabilities().clone();
+        let catalog = self.backend.catalog_status();
+        let mut action: Option<SettingsAction> = None;
 
-        ui.add_space(20.0);
-        ui.label(egui::RichText::new("Settings").size(22.0).strong());
-        ui.add_space(14.0);
-
-        ui.label(egui::RichText::new("Library").size(16.0).strong());
-        row(ui, "Download folder", &caps.download_dir);
-        row(ui, "Streaming API", self.backend.base_url());
-        row(ui, "Client name", &caps.client_name);
         ui.add_space(16.0);
-
-        ui.label(egui::RichText::new("Playback").size(16.0).strong());
-        match &caps.player {
-            PlayerCapability::Embedded => {
-                row(ui, "Backend", "libmpv (embedded in this window)");
-                if let Some((major, minor)) = caps.mpv_api {
-                    row(ui, "mpv client API", &format!("{major}.{minor}"));
-                }
-                ui.label(
-                    egui::RichText::new(
-                        "Video is decoded by libmpv and rendered into the app window. \
-                         No browser, no webview.",
-                    )
-                    .color(theme::TEXT_DIM),
-                );
-            }
-            PlayerCapability::External { program } => {
-                row(ui, "Backend", &format!("external player ({program})"));
-                if let Some(note) = caps.player_note.as_deref() {
-                    ui.label(egui::RichText::new(note).color(theme::WARN));
-                }
-                ui.label(
-                    egui::RichText::new(
-                        "Embedded playback is unavailable, so video opens in a separate \
-                         player window.",
-                    )
-                    .color(theme::TEXT_DIM),
-                );
-            }
-            PlayerCapability::Unavailable { reason } => {
-                row(ui, "Backend", "unavailable");
-                ui.label(egui::RichText::new(reason).color(theme::DANGER));
-            }
-        }
+        ui.label(egui::RichText::new("Settings").size(22.0).strong());
         ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            let mut volume = self.player.volume();
-            ui.label("Volume");
-            if ui
-                .add(egui::Slider::new(&mut volume, 0.0..=130.0).suffix(" %"))
-                .changed()
-            {
-                self.player.set_volume(volume);
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.label(egui::RichText::new("Library").size(16.0).strong());
+            row(ui, "Download folder", &caps.download_dir);
+            row(ui, "Streaming API", self.backend.base_url());
+            row(ui, "Client name", &caps.client_name);
+            ui.add_space(14.0);
+
+            ui.label(egui::RichText::new("Metadata and artwork").size(16.0).strong());
+            row(ui, "Provider", &catalog.provider);
+            let status = if catalog.configured {
+                format!(
+                    "{} of {} titles matched, {} lookups in flight",
+                    catalog.enriched,
+                    self.library.len(),
+                    catalog.pending
+                )
+            } else {
+                "not configured".to_string()
+            };
+            row(ui, "Status", &status);
+            row(ui, "Cache folder", &catalog.cache_dir);
+            row(
+                ui,
+                "Cache",
+                &format!(
+                    "{} files, {}",
+                    catalog.cached_metadata,
+                    fmt::human_bytes(catalog.cache_bytes)
+                ),
+            );
+
+            if let Some(note) = catalog.note.as_deref() {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(note).color(theme::WARN).size(12.0));
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Set REEL_TMDB_API_KEY, or start the app with it in the environment. \
+                         Both a v3 API key and a v4 API token are accepted.",
+                    )
+                    .color(theme::TEXT_DIM)
+                    .size(11.0),
+                );
             }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Look up metadata again").clicked() {
+                    action = Some(SettingsAction::RefreshMetadata);
+                }
+                if ui.button("Clear poster and metadata cache").clicked() {
+                    action = Some(SettingsAction::ClearCache);
+                }
+            });
+            ui.add_space(14.0);
+
+            ui.label(egui::RichText::new("Search sources").size(16.0).strong());
+            ui.label(
+                egui::RichText::new(
+                    "reel ships no indexers. A search backend is anything implementing the \
+                     SearchBackend trait; until one is configured there is nothing to search.",
+                )
+                .color(theme::TEXT_DIM)
+                .size(12.0),
+            );
+            ui.add_space(14.0);
+
+            ui.label(egui::RichText::new("Playback").size(16.0).strong());
+            match &caps.player {
+                PlayerCapability::Embedded => {
+                    row(ui, "Backend", "libmpv (embedded in this window)");
+                    if let Some((major, minor)) = caps.mpv_api {
+                        row(ui, "mpv client API", &format!("{major}.{minor}"));
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "Video is decoded by libmpv and rendered into the app window. \
+                             No browser, no webview.",
+                        )
+                        .color(theme::TEXT_DIM)
+                        .size(12.0),
+                    );
+                }
+                PlayerCapability::External { program } => {
+                    row(ui, "Backend", &format!("external player ({program})"));
+                    if let Some(note) = caps.player_note.as_deref() {
+                        ui.label(egui::RichText::new(note).color(theme::WARN).size(12.0));
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "Embedded playback is unavailable, so video opens in a separate \
+                             player window.",
+                        )
+                        .color(theme::TEXT_DIM)
+                        .size(12.0),
+                    );
+                }
+                PlayerCapability::Unavailable { reason } => {
+                    row(ui, "Backend", "unavailable");
+                    ui.label(egui::RichText::new(reason).color(theme::DANGER).size(12.0));
+                }
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let mut volume = self.player.volume();
+                ui.label("Volume");
+                if ui
+                    .add(egui::Slider::new(&mut volume, 0.0..=130.0).suffix(" %"))
+                    .changed()
+                {
+                    self.player.set_volume(volume);
+                }
+            });
+
+            ui.add_space(14.0);
+            ui.label(egui::RichText::new("About").size(16.0).strong());
+            row(ui, "Version", env!("CARGO_PKG_VERSION"));
+            ui.label(
+                egui::RichText::new(
+                    "reel streams torrents over HTTP with byte-range seeking. Titles are \
+                     matched against a metadata provider; artwork is generated from each \
+                     title when none is available.",
+                )
+                .color(theme::TEXT_DIM)
+                .size(12.0),
+            );
         });
 
-        ui.add_space(16.0);
-        ui.label(egui::RichText::new("About").size(16.0).strong());
-        row(ui, "Version", env!("CARGO_PKG_VERSION"));
-        ui.label(
-            egui::RichText::new(
-                "reel streams torrents over HTTP with byte-range seeking. The catalogue \
-                 and metadata providers are the next milestone; artwork is currently \
-                 generated from each title.",
-            )
-            .color(theme::TEXT_DIM),
-        );
+        match action {
+            Some(SettingsAction::RefreshMetadata) => self.backend.refresh_metadata(),
+            Some(SettingsAction::ClearCache) => self.backend.clear_catalog_cache(),
+            None => {}
+        }
     }
+}
+
+enum SettingsAction {
+    RefreshMetadata,
+    ClearCache,
 }
 
 fn row(ui: &mut egui::Ui, label: &str, value: &str) {
@@ -1067,7 +1514,7 @@ fn row(ui: &mut egui::Ui, label: &str, value: &str) {
             Vec2::new(150.0, 18.0),
             egui::Label::new(egui::RichText::new(label).color(theme::TEXT_DIM)),
         );
-        ui.label(egui::RichText::new(value).monospace());
+        ui.label(egui::RichText::new(value).monospace().size(12.0));
     });
     ui.add_space(2.0);
 }
@@ -1076,11 +1523,11 @@ fn row(ui: &mut egui::Ui, label: &str, value: &str) {
 
 impl App {
     fn player_screen(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // Repaint continuously so the video keeps advancing even without input.
+        // Repaint continuously so the video keeps advancing without input.
         ctx.request_repaint();
+        self.record_watch_progress();
 
         let Some(info) = self.player.current().cloned() else {
-            // Playback ended or was never started.
             self.screen = self
                 .player_origin
                 .map(Screen::Detail)
@@ -1097,17 +1544,12 @@ impl App {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     if ui.button("\u{2b05}  Back").clicked() {
-                        self.player.close();
-                        self.screen = self
-                            .player_origin
-                            .map(Screen::Detail)
-                            .unwrap_or(Screen::Library);
+                        self.leave_player();
                     }
                     ui.label(egui::RichText::new(&info.title).size(15.0).strong());
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let backend = self.player.backend();
-                        let label = match backend {
+                        let label = match self.player.backend() {
                             Some(reel_player::Backend::Embedded) => "libmpv (embedded)",
                             Some(reel_player::Backend::External) => "external player",
                             _ => "unknown backend",
@@ -1133,8 +1575,8 @@ impl App {
                         ui.label(
                             egui::RichText::new(
                                 "libmpv is not available, so playback was handed to a \
-                                 separate player process. The picture is in that \
-                                 program's own window.",
+                                 separate player process. The picture is in that program's \
+                                 own window.",
                             )
                             .color(theme::TEXT_DIM),
                         );
@@ -1184,6 +1626,35 @@ impl App {
                 });
         }
     }
+
+    /// Leave the player, saving where we got to.
+    fn leave_player(&mut self) {
+        if let (Some(info_hash), true) = (
+            self.watch_recording_for.clone(),
+            self.player.state().loaded,
+        ) {
+            let state = self.player.state();
+            let info = self.player.current().cloned();
+            if state.position >= 1.0 {
+                self.backend.record_watch(
+                    &info_hash,
+                    info.as_ref().map(|i| i.file_name.clone()),
+                    info.as_ref().map(|i| i.title.clone()),
+                    state.position,
+                    state.duration,
+                );
+            }
+        }
+
+        self.player.close();
+        self.watch_recording_for = None;
+        self.watch_last_recorded = 0.0;
+        self.screen = self
+            .player_origin
+            .map(Screen::Detail)
+            .unwrap_or(Screen::Library);
+        self.refresh();
+    }
 }
 
 /// The egui context is needed by UI actions that can also be triggered by
@@ -1198,19 +1669,24 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::sample_torrents;
+    use crate::testing::sample_library;
 
     fn app() -> App {
-        App::new(Box::new(crate::backend::FakeBackend::new(
-            sample_torrents(),
-        )))
+        App::new(Box::new(crate::backend::FakeBackend::new(sample_library())))
     }
 
     #[test]
-    fn starts_on_the_library_with_torrents() {
+    fn starts_on_the_library_with_rows() {
         let app = app();
         assert_eq!(app.screen(), &Screen::Library);
         assert_eq!(app.library_len(), 3);
+
+        let rows = app.row_titles();
+        assert_eq!(
+            rows,
+            ["Continue watching", "Recently added", "Not started", "Watched"],
+            "every row should have something in the sample library"
+        );
     }
 
     #[test]
@@ -1244,19 +1720,111 @@ mod tests {
         let mut app = app();
         app.backend.set_paused(1, true);
         app.refresh();
-        assert!(app.view(1).expect("torrent 1").stats.is_paused());
+        assert!(app.item(1).expect("torrent 1").torrent.stats.is_paused());
 
         app.backend.remove(1, false);
         app.refresh();
-        assert!(app.view(1).is_none());
+        assert!(app.item(1).is_none());
         assert_eq!(app.library_len(), 2);
     }
 
     #[test]
-    fn playable_files_are_detected() {
+    fn metadata_and_resume_positions_reach_the_ui() {
         let app = app();
-        let view = app.view(1).expect("torrent 1");
-        assert_eq!(view.primary_file_id, Some(0));
-        assert!(view.primary_file().is_some());
+
+        // Torrent 1 is partly watched and has metadata.
+        let matrix = app.item(1).expect("torrent 1");
+        assert_eq!(matrix.heading(), "The Matrix (1999)");
+        assert!(matrix.entry.metadata.is_some());
+        assert!(matrix.resume_position().is_some());
+        assert!(matrix.entry.poster().is_some());
+
+        // Torrent 3 was watched to the end, so it offers no resume.
+        let sintel = app.item(3).expect("torrent 3");
+        assert!(sintel.entry.watch.as_ref().unwrap().is_finished());
+        assert!(sintel.resume_position().is_none());
+
+        // Torrent 2 has never been opened.
+        let bunny = app.item(2).expect("torrent 2");
+        assert!(bunny.entry.watch.is_none());
+        assert!(bunny.resume_position().is_none());
+    }
+
+    #[test]
+    fn filtered_library_matches_metadata_titles() {
+        let mut app = app();
+        app.filter = "matrix".to_string();
+        // The filter is applied while rendering; assert the data it selects.
+        let matches: Vec<String> = app
+            .library
+            .iter()
+            .filter(|item| item.entry.title().to_lowercase().contains("matrix"))
+            .map(|item| item.entry.title())
+            .collect();
+        assert_eq!(matches, ["The Matrix"]);
+    }
+
+    #[test]
+    fn marking_watched_removes_it_from_continue_watching() {
+        let mut app = app();
+        app.backend
+            .mark_finished("a3f1c0ffee1234567890abcdef1234567890abcd", None);
+        app.refresh();
+
+        let rows = app.row_titles();
+        assert!(
+            !rows.contains(&"Continue watching".to_string()),
+            "nothing should be resumable any more: {rows:?}"
+        );
+        assert!(rows.contains(&"Watched".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod cover_tests {
+    use super::*;
+
+    #[test]
+    fn a_matching_aspect_is_not_cropped() {
+        let uv = cover_uv(16.0 / 9.0, 16.0 / 9.0);
+        assert_eq!(uv, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)));
+    }
+
+    #[test]
+    fn an_image_wider_than_the_hole_is_cropped_left_and_right() {
+        // 16:9 source into a square hole: scaling to fill the height overflows
+        // the width, so the sides go. Always centred, so both insets match.
+        let source: f32 = 16.0 / 9.0;
+        let uv = cover_uv(source, 1.0);
+        assert!((uv.width() - (1.0 / source)).abs() < 0.001, "{uv:?}");
+        assert!((uv.height() - 1.0).abs() < 0.001, "{uv:?}");
+        assert!((uv.min.x - (1.0 - uv.max.x)).abs() < 0.001, "{uv:?}");
+    }
+
+    #[test]
+    fn an_image_narrower_than_the_hole_is_cropped_top_and_bottom() {
+        // 16:9 source into a 5:1 banner: the hole is much wider, so filling it
+        // overflows vertically and the middle band is what survives.
+        let source: f32 = 16.0 / 9.0;
+        let uv = cover_uv(source, 5.0);
+        assert!((uv.width() - 1.0).abs() < 0.001, "{uv:?}");
+        assert!((uv.height() - (source / 5.0)).abs() < 0.001, "{uv:?}");
+        assert!((uv.min.y - (1.0 - uv.max.y)).abs() < 0.001, "{uv:?}");
+    }
+
+    #[test]
+    fn posters_in_poster_shaped_cards_are_untouched() {
+        // The card is built to 2:3, so a real poster needs no crop at all.
+        let uv = cover_uv(2.0 / 3.0, 168.0 / 252.0);
+        assert!((uv.width() - 1.0).abs() < 0.001, "{uv:?}");
+        assert!((uv.height() - 1.0).abs() < 0.001, "{uv:?}");
+    }
+
+    #[test]
+    fn degenerate_aspects_fall_back_to_the_whole_image() {
+        let full = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        for (source, target) in [(0.0, 1.0), (1.0, 0.0), (f32::NAN, 1.0), (1.0, f32::INFINITY)] {
+            assert_eq!(cover_uv(source, target), full);
+        }
     }
 }

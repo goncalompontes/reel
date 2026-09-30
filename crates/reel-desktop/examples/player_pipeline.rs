@@ -63,9 +63,11 @@ fn main() {
 
     let info = PlaybackInfo {
         torrent_id: 0,
+        info_hash: "pipeline-test".to_string(),
         title: "pipeline test".to_string(),
         file_name: url.rsplit('/').next().unwrap_or("stream").to_string(),
         fallback_duration: None,
+        start_at: None,
     };
 
     if let Err(e) = controller.open(&ctx, &capability, &url, info) {

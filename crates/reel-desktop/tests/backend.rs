@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 
 use reel_core::EngineConfig;
-use reel_desktop::backend::{Backend, EngineBackend};
+use reel_desktop::backend::{Backend, CatalogOptions, EngineBackend};
 
 fn scratch_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("reel-test-{}-{name}", std::process::id()));
@@ -44,7 +44,14 @@ fn engine_backend_serves_its_api_in_process() {
         ..EngineConfig::new(&dir)
     };
 
-    let backend = EngineBackend::start(config).expect("start the engine backend");
+    // Point the catalog at a scratch directory and configure no provider, so
+    // the test never reaches the network or the real cache.
+    let catalog = CatalogOptions {
+        api_key: None,
+        data_dir: dir.join("catalog"),
+    };
+    let backend =
+        EngineBackend::start_with_options(config, catalog).expect("start the engine backend");
 
     let base = backend.base_url().to_string();
     assert!(
@@ -54,7 +61,7 @@ fn engine_backend_serves_its_api_in_process() {
     let host = base.trim_start_matches("http://");
 
     // An empty library is the expected starting state.
-    assert!(backend.torrents().is_empty());
+    assert!(backend.library().is_empty());
 
     let health = get(host, "/api/health");
     assert!(
@@ -95,12 +102,15 @@ fn engine_backend_serves_its_api_in_process() {
 #[test]
 fn fake_backend_drives_the_ui_without_an_engine() {
     use reel_desktop::backend::FakeBackend;
-    use reel_desktop::testing::sample_torrents;
+    use reel_desktop::testing::sample_library;
 
-    let backend = FakeBackend::new(sample_torrents());
-    assert_eq!(backend.torrents().len(), 3);
-    assert!(backend.view(1).is_some());
-    assert!(backend.view(999).is_none());
+    let backend = FakeBackend::new(sample_library());
+    assert_eq!(backend.library().len(), 3);
+    assert!(backend.item(1).is_some());
+    assert!(backend.item(999).is_none());
+
+    // The fake reports a catalog that is configured, so settings render.
+    assert!(backend.catalog_status().configured);
 
     // The fake must never advertise embedded playback, or a test could try to
     // open a real video device.

@@ -58,9 +58,9 @@ fn main() -> eframe::Result<()> {
     init_tracing(args.verbose);
 
     let backend: Box<dyn Backend> = if args.demo {
-        let torrents = testing::sample_torrents();
-        tracing::info!(count = torrents.len(), "running with a sample library");
-        Box::new(FakeBackend::new(torrents))
+        let library = testing::sample_library();
+        tracing::info!(count = library.len(), "running with a sample library");
+        Box::new(FakeBackend::new(library))
     } else {
         let dir = args.dir.unwrap_or_else(default_download_dir);
         tracing::info!(dir = %dir.display(), "starting engine");
@@ -86,7 +86,7 @@ fn main() -> eframe::Result<()> {
         "reel",
         options,
         Box::new(move |cc| {
-            reel_desktop::apply_theme(&cc.egui_ctx);
+            reel_desktop::install(&cc.egui_ctx);
             Ok(Box::new(App::new(backend)))
         }),
     )

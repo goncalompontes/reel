@@ -3,13 +3,16 @@
 A native desktop client for streaming torrents, with a Netflix-shaped catalog.
 
 `reel` is a Rust workspace: a torrent engine, an HTTP streaming server, a
-libmpv-backed player, a CLI, and an **egui desktop app that renders with wgpu
-directly to the window — no webview, no browser**. Video is decoded by libmpv
-and uploaded as a texture, and playback starts after a few pieces rather than
-after the whole file.
+libmpv-backed player, a metadata/artwork catalog, a CLI, and an **egui desktop
+app that renders with wgpu directly to the window — no webview, no browser**.
+Video is decoded by libmpv and uploaded as a texture, playback starts after a
+few pieces rather than after the whole file, and titles are matched against a
+metadata provider so the library shows posters and synopses instead of release
+names.
 
-**Status: engine, streaming, player and desktop app all work end to end.**
-Catalog metadata (TMDB artwork, search backends) is the next milestone.
+**Status: engine, streaming, player, catalog and desktop app all work end to
+end.** Discovery is deliberately unfinished: search backends are a trait with no
+implementations shipped.
 
 ---
 
@@ -23,11 +26,15 @@ Catalog metadata (TMDB artwork, search backends) is the next milestone.
 | Media detection ("only download the video, skip the sample") | done |
 | JSON control plane + live SSE updates | done |
 | Native playback (libmpv, RGBA frames into an egui texture) | done |
-| Desktop app: library grid, hero banner, detail page, player, settings | done |
+| Desktop app: catalog rows, hero banner, detail page, player, settings | done |
 | CLI (`serve`, `add`, `ls`, `play`, `rm`, `create`) | done |
 | Rate limits, pause/resume, delete with/without files | done |
 | Torrent creation + seeding your own content | done |
-| TMDB metadata, real posters, search backends | not yet |
+| TMDB metadata: posters, backdrops, synopsis, genres, rating, runtime | done |
+| Title matching that prefers a miss over a wrong match | done |
+| Watch history, "continue watching", resume playback | done |
+| On-disk metadata and artwork cache | done |
+| Search backends | trait only — none shipped |
 | In-window subtitles, transcoding for odd codecs | not yet |
 
 ## Try it
@@ -35,7 +42,10 @@ Catalog metadata (TMDB artwork, search backends) is the next milestone.
 ```bash
 cargo build --release
 
-# The desktop app: engine + streaming server + player, all in one process.
+# Optional: real posters and synopses. Both a v3 API key and a v4 API token work.
+export REEL_TMDB_API_KEY=...
+
+# The desktop app: engine + streaming server + player + catalog, one process.
 ./target/release/reel-desktop
 
 # No engine or network, just the sample library (good for a quick look):
@@ -43,7 +53,9 @@ cargo build --release
 ```
 
 Then paste a magnet link into **Add**. reel fetches the metadata, picks the
-video, and starts streaming it while it downloads.
+video, starts streaming it while it downloads, and looks up the title so the
+card gets a poster. Without an API key everything still works — artwork is
+generated from each title instead.
 
 The CLI is still there and shares the same engine:
 
@@ -61,7 +73,7 @@ The CLI is still there and shares the same engine:
 ## Verify it
 
 ```bash
-cargo test --workspace     # 56 tests: range parsing, media/title detection, ABI, UI, backend
+cargo test --workspace     # 131 tests: engine, ranges, matching, UI, catalog, ABI, backend
 bash scripts/e2e.sh        # 51 assertions: create, seed, stream, decode, verify bytes
 ```
 
@@ -90,7 +102,22 @@ The desktop app is verified separately, without a display server, by
 * `backend.rs` starts the real engine and streaming server and talks to it over
   a real localhost socket,
 * `glyphs.rs` pins the icon font coverage, because egui's bundled fonts render
-  `←`, `↓` and `●` as empty boxes.
+  `←`, `↓` and `●` as empty boxes,
+* a snapshot with real PNG posters on disk proves the artwork path end to end:
+  cached file → image loader → decode → texture → painted into a card.
+
+The catalog is verified separately by `crates/reel-catalog`:
+
+* `matching` is unit-tested against the cases that actually go wrong — sequels,
+  remakes, off-by-one years, typos, punctuation,
+* `tests/tmdb_stub.rs` drives the **real** client against a stub server, covering
+  query building, both auth styles, candidate scoring end to end, artwork
+  downloads landing in the cache, clean misses, and a cached lookup still
+  working with the network gone.
+
+The one thing not covered by an automated test is a live call to the real TMDB
+API, because that needs a personal key. The request and response handling around
+it is tested against the stub, and against TMDB's real 401 body shape.
 
 ## Architecture
 
@@ -98,6 +125,7 @@ The desktop app is verified separately, without a display server, by
 crates/reel-core      engine, media/title detection, wire model   (no HTTP, no UI)
 crates/reel-http      axum API + range streaming + SSE
 crates/reel-player    libmpv playback, frames as RGBA             (no UI toolkit)
+crates/reel-catalog   metadata, artwork cache, watch history      (no UI, no engine)
 crates/reel-cli       the `reel` binary: daemon + HTTP client
 crates/reel-desktop   the native app: egui UI over the above
 ```
@@ -108,6 +136,7 @@ Dependencies only ever point downwards:
 reel-desktop ──> reel-player ──> libmpv (dlopen)
       │
       ├──────> reel-http ──> reel-core ──> librqbit
+      ├──────> reel-catalog ──> reel-core (release-name cleaning only)
       └──────> reel-core
 ```
 
@@ -125,6 +154,11 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the reasoning.
   teardown crashes away from the event loop.
 * **No video is ever handed to a browser.** eframe renders with wgpu (Vulkan on
   this machine) into the OS window.
+* **Metadata enrichment runs in the background.** At most two lookups are in
+  flight at once, each title is attempted once per session, and results arrive
+  as events, so a library of two hundred titles does not stall the first frame.
+* **Watch positions are keyed by info hash**, not torrent id, so they survive a
+  restart, and writes are throttled to a few seconds.
 
 ## Notes and caveats
 
@@ -142,7 +176,15 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the reasoning.
   just fetches the index from the end of the file first.
 * **Content.** This is a general-purpose BitTorrent client and HTTP server. Use
   it for content you own or are licensed to distribute. It ships with no
-  indexers and none are hard-coded.
+  indexers and none are hard-coded. `SearchBackend` exists so you can add one;
+  what it returns is your responsibility.
+* **Matching.** Title matching prefers "no match" over a wrong match, so some
+  films simply will not be found. That is deliberate: a confidently wrong poster
+  is worse than generated artwork. If a title is wrong, the fix belongs in
+  `reel-catalog/src/matching.rs`, and there are tests there that show the shape.
+* **Artwork aspect.** TMDB's standard shapes (2:3 posters, 16:9 backdrops) are
+  assumed when cropping artwork to fit, so an unusual image would be cropped
+  slightly off-centre rather than distorted.
 
 ## Requirements
 

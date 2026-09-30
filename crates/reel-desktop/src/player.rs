@@ -16,10 +16,14 @@ use crate::theme;
 #[derive(Debug, Clone)]
 pub struct PlaybackInfo {
     pub torrent_id: usize,
+    /// Stable across restarts, and the key watch positions are stored under.
+    pub info_hash: String,
     pub title: String,
     pub file_name: String,
     /// Duration known from metadata, used until the player reports its own.
     pub fallback_duration: Option<f64>,
+    /// Resume from here rather than the beginning.
+    pub start_at: Option<f64>,
 }
 
 /// Engine numbers the controls display alongside the player's own state.
@@ -111,10 +115,26 @@ impl PlayerController {
         self.scrub_position = None;
         self.texture = None;
 
+        let start_at = self.current.as_ref().and_then(|info| info.start_at);
+        let file_name = self
+            .current
+            .as_ref()
+            .map(|info| info.file_name.clone())
+            .unwrap_or_default();
+
         let player = self.player.as_ref().expect("player created above");
         player.set_target_size(Some((640, 360)));
         let _ = player.set_volume(self.volume as f64);
-        player.load(url).map_err(|e| e.to_string())?;
+
+        match start_at.filter(|start| *start > 1.0) {
+            Some(start) => {
+                tracing::info!(file = %file_name, start, "resuming playback");
+                player.load_at(url, start).map_err(|e| e.to_string())?;
+            }
+            None => {
+                player.load(url).map_err(|e| e.to_string())?;
+            }
+        }
         Ok(())
     }
 
