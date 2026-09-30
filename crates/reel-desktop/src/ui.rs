@@ -8,7 +8,7 @@
 use std::time::{Duration, Instant};
 
 use egui::{Color32, CornerRadius, Rect, Sense, Vec2};
-use reel_catalog::{ArtworkKind, RowKind};
+use reel_catalog::{ArtworkKind, RowKind, SearchHit};
 use reel_core::fmt;
 use reel_core::media;
 
@@ -23,6 +23,7 @@ pub enum Screen {
     Detail(usize),
     Player,
     Add,
+    Search,
     Settings,
 }
 
@@ -46,6 +47,13 @@ pub struct App {
     add_source: String,
     add_media_only: bool,
     filter: String,
+    /// The search box, and what it last returned.
+    search_query: String,
+    search_for: Option<String>,
+    search_hits: Vec<SearchHit>,
+    /// Source names and failures worth showing under the results.
+    search_note: Option<String>,
+    searching: bool,
     player: PlayerController,
     /// Torrent id the player was started from, to return to.
     player_origin: Option<usize>,
@@ -84,6 +92,11 @@ impl App {
             add_source: String::new(),
             add_media_only: true,
             filter: String::new(),
+            search_query: String::new(),
+            search_for: None,
+            search_hits: Vec::new(),
+            search_note: None,
+            searching: false,
             player: PlayerController::new(),
             player_origin: None,
             show_delete_confirm: None,
@@ -127,6 +140,27 @@ impl App {
         self.backend.add(&source, self.add_media_only);
         self.set_toast("Adding torrent\u{2026}", false);
         self.add_source.clear();
+    }
+
+    /// Numbers of results currently shown. Exposed for tests.
+    pub fn search_result_count(&self) -> usize {
+        self.search_hits.len()
+    }
+
+    pub fn set_search_query(&mut self, query: impl Into<String>) {
+        self.search_query = query.into();
+    }
+
+    pub fn submit_search(&mut self) {
+        let query = self.search_query.trim().to_string();
+        if query.is_empty() {
+            self.warn("Type something to search for");
+            return;
+        }
+        self.searching = true;
+        self.search_note = None;
+        self.search_for = Some(query.clone());
+        self.backend.search(&query);
     }
 
     pub fn item(&self, id: usize) -> Option<LibraryItem> {
@@ -233,6 +267,22 @@ impl App {
                 BackendEvent::Metadata { .. } | BackendEvent::WatchUpdated => {
                     self.refresh();
                 }
+                BackendEvent::SearchResults { query, results } => {
+                    // A late answer for an older query must not replace what the
+                    // user is looking at now.
+                    if self.search_for.as_deref() == Some(query.as_str()) {
+                        self.searching = false;
+                        self.search_note = describe_search(&results);
+                        self.search_hits = results.hits;
+                    }
+                }
+                BackendEvent::SearchFailed { query, message } => {
+                    if self.search_for.as_deref() == Some(query.as_str()) {
+                        self.searching = false;
+                        self.search_hits.clear();
+                        self.search_note = Some(message);
+                    }
+                }
             }
             ctx.request_repaint();
         }
@@ -325,6 +375,7 @@ impl eframe::App for App {
                 Screen::Library => self.library_screen(ui),
                 Screen::Detail(_) => self.detail_screen(ui),
                 Screen::Add => self.add_screen(ui),
+                Screen::Search => self.search_screen(ui),
                 Screen::Settings => self.settings_screen(ui),
                 Screen::Player => unreachable!("handled above"),
             });
@@ -361,6 +412,7 @@ impl App {
 
             let mut next = None;
             next = next.or(tab(ui, &self.screen, Screen::Library, "  Library  "));
+            next = next.or(tab(ui, &self.screen, Screen::Search, "  Search  "));
             next = next.or(tab(ui, &self.screen, Screen::Add, "  Add  "));
             next = next.or(tab(ui, &self.screen, Screen::Settings, "  Settings  "));
             if let Some(target) = next {
@@ -1355,6 +1407,164 @@ impl App {
     }
 }
 
+// ------------------------------------------------------------------ search
+
+impl App {
+    fn search_screen(&mut self, ui: &mut egui::Ui) {
+        let sources = self.backend.search_sources();
+
+        ui.add_space(16.0);
+        ui.label(egui::RichText::new("Search").size(22.0).strong());
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(
+                "Look for something to watch across the configured sources. Adding a result \
+                 hands it to the same engine, which streams it while it downloads.",
+            )
+            .color(theme::TEXT_DIM),
+        );
+
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut self.search_query)
+                    .hint_text("title to search for\u{2026}")
+                    .desired_width(420.0),
+            );
+            let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let clicked = ui.button("Search").clicked();
+            if clicked || enter {
+                self.submit_search();
+            }
+            if self.searching {
+                ui.spinner();
+            }
+        });
+
+        ui.add_space(6.0);
+        if sources.is_empty() {
+            ui.colored_label(
+                theme::WARN,
+                "No search sources are configured. See docs/ADDING_A_SOURCE.md.",
+            );
+        } else {
+            let names: Vec<String> = sources
+                .iter()
+                .map(|source| {
+                    if source.configured {
+                        source.name.clone()
+                    } else {
+                        format!("{} (disabled)", source.name)
+                    }
+                })
+                .collect();
+            ui.label(
+                egui::RichText::new(format!("Sources: {}", names.join(", ")))
+                    .size(11.0)
+                    .color(theme::TEXT_DIM),
+            );
+        }
+
+        if let Some(note) = self.search_note.clone() {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(note).size(11.5).color(theme::TEXT_DIM));
+        }
+
+        ui.add_space(12.0);
+
+        if self.search_hits.is_empty() {
+            ui.label(
+                egui::RichText::new(if self.search_for.is_some() {
+                    "Nothing matched."
+                } else {
+                    "Results will appear here."
+                })
+                .color(theme::TEXT_DIM),
+            );
+            return;
+        }
+
+        let mut add: Option<SearchHit> = None;
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for hit in self.search_hits.clone() {
+                egui::Frame::NONE
+                    .fill(theme::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .corner_radius(theme::CARD_RADIUS)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new(reel_core::title::truncate(&hit.title, 70))
+                                        .size(14.0)
+                                        .strong(),
+                                );
+
+                                let mut facts = Vec::new();
+                                if let Some(year) = hit.year {
+                                    facts.push(year.to_string());
+                                }
+                                facts.push(hit.source.clone());
+                                if let Some(size) = hit.size_bytes {
+                                    facts.push(fmt::human_bytes(size));
+                                }
+                                if let Some(seeders) = hit.seeders {
+                                    facts.push(format!("{seeders} seeders"));
+                                }
+                                if let Some(popularity) = hit.popularity {
+                                    facts.push(format!("{popularity} downloads"));
+                                }
+                                ui.label(
+                                    egui::RichText::new(facts.join("   \u{2022}   "))
+                                        .size(11.0)
+                                        .color(theme::TEXT_DIM),
+                                );
+                            });
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add_enabled(
+                                            hit.is_usable(),
+                                            egui::Button::new("Add"),
+                                        )
+                                        .on_disabled_hover_text("This result has no magnet or .torrent URL")
+                                        .clicked()
+                                    {
+                                        add = Some(hit.clone());
+                                    }
+                                },
+                            );
+                        });
+                    });
+                ui.add_space(6.0);
+            }
+        });
+
+        if let Some(hit) = add {
+            match hit.magnet.clone().or_else(|| hit.torrent_url.clone()) {
+                Some(source) => {
+                    self.backend.add(&source, self.add_media_only);
+                    self.set_toast(format!("Adding {}", reel_core::title::truncate(&hit.title, 40)), false);
+                }
+                None => self.warn("This result has nothing to add"),
+            }
+        }
+    }
+}
+
+/// One line summarising a search, including sources that failed.
+fn describe_search(results: &reel_catalog::SearchResults) -> Option<String> {
+    let mut parts = Vec::new();
+    parts.push(plural(results.hits.len(), "result"));
+    for (source, message) in &results.failures {
+        parts.push(format!("{source} failed: {}", reel_core::title::truncate(message, 80)));
+    }
+    Some(parts.join("   \u{2022}   "))
+}
+
 // ---------------------------------------------------------------- settings
 
 impl App {
@@ -1424,10 +1634,28 @@ impl App {
             ui.add_space(14.0);
 
             ui.label(egui::RichText::new("Search sources").size(16.0).strong());
+            let sources = self.backend.search_sources();
+            if sources.is_empty() {
+                row(ui, "Sources", "none");
+            } else {
+                for source in &sources {
+                    row(
+                        ui,
+                        "Source",
+                        &if source.configured {
+                            source.name.clone()
+                        } else {
+                            format!("{} (disabled)", source.name)
+                        },
+                    );
+                }
+            }
             ui.label(
                 egui::RichText::new(
-                    "reel ships no indexers. A search backend is anything implementing the \
-                     SearchBackend trait; until one is configured there is nothing to search.",
+                    "reel bundles one source, the Internet Archive, which serves public-\
+                     domain and Creative Commons film. A search backend is anything \
+                     implementing the SearchBackend trait; add your own in \
+                     docs/ADDING_A_SOURCE.md.",
                 )
                 .color(theme::TEXT_DIM)
                 .size(12.0),

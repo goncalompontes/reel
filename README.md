@@ -10,9 +10,11 @@ few pieces rather than after the whole file, and titles are matched against a
 metadata provider so the library shows posters and synopses instead of release
 names.
 
-**Status: engine, streaming, player, catalog and desktop app all work end to
-end.** Discovery is deliberately unfinished: search backends are a trait with no
-implementations shipped.
+**Status: engine, streaming, player, catalog, search and desktop app all work
+end to end.** Exactly one search source is bundled — the Internet Archive, which
+serves public-domain and Creative Commons film — and adding your own is a
+documented, tested extension point: see
+[`docs/ADDING_A_SOURCE.md`](docs/ADDING_A_SOURCE.md).
 
 ---
 
@@ -34,7 +36,8 @@ implementations shipped.
 | Title matching that prefers a miss over a wrong match | done |
 | Watch history, "continue watching", resume playback | done |
 | On-disk metadata and artwork cache | done |
-| Search backends | trait only — none shipped |
+| Search screen + pluggable sources | done |
+| Bundled sources | one: the Internet Archive (public domain / CC film) |
 | In-window subtitles, transcoding for odd codecs | not yet |
 
 ## Try it
@@ -73,7 +76,7 @@ The CLI is still there and shares the same engine:
 ## Verify it
 
 ```bash
-cargo test --workspace     # 131 tests: engine, ranges, matching, UI, catalog, ABI, backend
+cargo test --workspace     # 144 tests: engine, ranges, matching, UI, catalog, search, backend
 bash scripts/e2e.sh        # 51 assertions: create, seed, stream, decode, verify bytes
 ```
 
@@ -115,6 +118,11 @@ The catalog is verified separately by `crates/reel-catalog`:
   downloads landing in the cache, clean misses, and a cached lookup still
   working with the network gone.
 
+Search sources are covered the same way: `archive_org`'s parsing is unit-tested
+against fixtures with the field-type inconsistencies the real API produces, plus
+an `#[ignore]`d test that searches the live Archive and checks the torrent URL it
+produces actually resolves.
+
 There is also an `#[ignore]`d test that talks to the **real** TMDB API:
 
 ```bash
@@ -131,7 +139,7 @@ REEL_TMDB_API_KEY=... cargo test -p reel-catalog --test tmdb_stub -- --ignored -
 crates/reel-core      engine, media/title detection, wire model   (no HTTP, no UI)
 crates/reel-http      axum API + range streaming + SSE
 crates/reel-player    libmpv playback, frames as RGBA             (no UI toolkit)
-crates/reel-catalog   metadata, artwork cache, watch history      (no UI, no engine)
+crates/reel-catalog   metadata, artwork cache, watch history, search (no UI)
 crates/reel-cli       the `reel` binary: daemon + HTTP client
 crates/reel-desktop   the native app: egui UI over the above
 ```
@@ -180,10 +188,15 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the reasoning.
 * **Faststart.** For instant playback the container should have its index at the
   front (`ffmpeg -movflags +faststart`); otherwise the engine still works, it
   just fetches the index from the end of the file first.
-* **Content.** This is a general-purpose BitTorrent client and HTTP server. Use
-  it for content you own or are licensed to distribute. It ships with no
-  indexers and none are hard-coded. `SearchBackend` exists so you can add one;
-  what it returns is your responsibility.
+* **Content and sources.** This is a general-purpose BitTorrent client and HTTP
+  server. Use it for content you own or are licensed to distribute. Exactly one
+  search source is bundled, chosen because it indexes only material anyone may
+  share; anything else you add is your decision and your responsibility.
+* **The bundled source needs a swarm.** Internet Archive torrents carry
+  BEP-19 HTTP web seeds, which librqbit does not implement, so playback depends
+  on the Archive's own seeders. Popular items are well seeded; obscure ones may
+  not be. Web-seed support would fix this properly and is the most valuable
+  engine feature left.
 * **Matching.** Title matching prefers "no match" over a wrong match, so some
   films simply will not be found. That is deliberate: a confidently wrong poster
   is worse than generated artwork. If a title is wrong, the fix belongs in

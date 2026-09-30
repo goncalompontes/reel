@@ -56,8 +56,15 @@ pub struct SearchHit {
     pub title: String,
     pub year: Option<u16>,
     pub size_bytes: Option<u64>,
+    /// Peers seen by the source. Sources that are not swarm trackers — a web
+    /// archive, say — leave this unset rather than inventing a number.
     pub seeders: Option<u32>,
     pub leechers: Option<u32>,
+    /// A source-specific popularity signal, in whatever unit the source uses.
+    ///
+    /// Only ever used to order results when the swarm is unknown, so that a
+    /// source with no seeder count does not silently rank last.
+    pub popularity: Option<u64>,
     /// Name of the backend that produced this.
     pub source: String,
     /// What to hand to the engine. At least one of these must be present.
@@ -77,6 +84,7 @@ impl SearchHit {
             size_bytes: None,
             seeders: None,
             leechers: None,
+            popularity: None,
             source: source.into(),
             magnet: None,
             torrent_url: None,
@@ -96,9 +104,13 @@ impl SearchHit {
                 .is_some_and(|u| u.starts_with("http://") || u.starts_with("https://"))
     }
 
-    /// Prefer seeders, then size, so the best copy sorts first.
-    pub fn sort_key(&self) -> (u32, u64) {
-        (self.seeders.unwrap_or(0), self.size_bytes.unwrap_or(0))
+    /// Prefer known seeders, then the source's own popularity, then size.
+    pub fn sort_key(&self) -> (u32, u64, u64) {
+        (
+            self.seeders.unwrap_or(0),
+            self.popularity.unwrap_or(0),
+            self.size_bytes.unwrap_or(0),
+        )
     }
 }
 
@@ -139,7 +151,7 @@ pub struct SearchAggregator {
     backends: Vec<Box<dyn SearchBackend>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SearchResults {
     pub hits: Vec<SearchHit>,
     /// `(backend name, message)` for each backend that failed.
@@ -264,6 +276,27 @@ mod tests {
             magnet: magnet.map(str::to_string),
             ..SearchHit::new(title, "fake")
         }
+    }
+
+    #[test]
+    fn a_source_without_a_swarm_ranks_by_its_own_popularity() {
+        // A web archive reports no seeders but a large download count; a tracker
+        // reports a small swarm. Both must be orderable.
+        let archive = SearchHit {
+            popularity: Some(400_000),
+            ..SearchHit::new("archive item", "archive.org")
+        };
+        let small_swarm = SearchHit {
+            seeders: Some(3),
+            ..SearchHit::new("tracker item", "tracker")
+        };
+        assert!(small_swarm.sort_key() > archive.sort_key());
+
+        let popular_swarm = SearchHit {
+            seeders: Some(500),
+            ..SearchHit::new("popular", "tracker")
+        };
+        assert!(popular_swarm.sort_key() > small_swarm.sort_key());
     }
 
     #[test]

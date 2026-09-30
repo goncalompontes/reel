@@ -49,6 +49,8 @@ fn engine_backend_serves_its_api_in_process() {
     let catalog = CatalogOptions {
         api_key: None,
         data_dir: dir.join("catalog"),
+        // Keep the test offline: the bundled source searches over the network.
+        disable_bundled_sources: true,
     };
     let backend =
         EngineBackend::start_with_options(config, catalog).expect("start the engine backend");
@@ -118,4 +120,69 @@ fn fake_backend_drives_the_ui_without_an_engine() {
         backend.capabilities().player,
         reel_desktop::PlayerCapability::Unavailable { .. }
     ));
+}
+
+/// The real wiring: the app's backend, the real bundled source, a real network.
+///
+/// Marked `#[ignore]` because it needs the network. It covers what the UI test
+/// with the fake cannot: that the search is spawned onto the runtime correctly
+/// and that results come back as an event.
+#[test]
+#[ignore = "requires network access"]
+fn the_bundled_source_searches_through_the_app_backend() {
+    use reel_desktop::backend::BackendEvent;
+
+    let dir = scratch_dir("search");
+    let config = EngineConfig {
+        disable_dht: true,
+        disable_trackers: true,
+        persist_session: false,
+        ..EngineConfig::new(&dir)
+    };
+    let backend = EngineBackend::start_with_options(
+        config,
+        CatalogOptions {
+            api_key: None,
+            data_dir: dir.join("catalog"),
+            disable_bundled_sources: false,
+        },
+    )
+    .expect("start the engine backend");
+
+    assert_eq!(
+        backend.search_sources().iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        ["archive.org"],
+        "the bundled source should be registered"
+    );
+
+    backend.search("nosferatu");
+
+    // The search runs on the runtime and reports back through events.
+    let mut hits = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    while std::time::Instant::now() < deadline {
+        for event in backend.take_events() {
+            match event {
+                BackendEvent::SearchResults { results, .. } => {
+                    assert!(results.failures.is_empty(), "{:?}", results.failures);
+                    hits = Some(results.hits);
+                }
+                BackendEvent::SearchFailed { message, .. } => panic!("search failed: {message}"),
+                _ => {}
+            }
+        }
+        if hits.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let hits = hits.expect("the search should answer within 45s");
+    assert!(!hits.is_empty(), "expected results for a well-known film");
+    assert!(hits.iter().all(|hit| hit.is_usable()));
+
+    println!("top hit: {} ({:?})", hits[0].title, hits[0].year);
+    println!("torrent: {}", hits[0].torrent_url.as_deref().unwrap_or(""));
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

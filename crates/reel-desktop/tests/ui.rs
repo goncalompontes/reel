@@ -147,6 +147,66 @@ fn settings_reports_the_backend_and_catalog() {
     }
 }
 
+#[test]
+fn search_finds_results_and_can_add_one() {
+    let mut harness = harness();
+    harness.run_steps(3);
+
+    {
+        let tab = harness
+            .get_all_by_label_contains("Search")
+            .next()
+            .expect("the Search tab");
+        tab.click();
+    }
+    harness.run_steps(3);
+    assert_eq!(harness.state().screen(), &Screen::Search);
+    assert_eq!(harness.state().search_result_count(), 0);
+
+    // An empty query must warn rather than searching for nothing.
+    {
+        let button = harness
+            .get_all_by_label("Search")
+            .next()
+            .expect("the Search button");
+        button.click();
+    }
+    harness.run_steps(3);
+    assert_eq!(harness.state().search_result_count(), 0);
+
+    // The demo backend answers from fixtures; results arrive as an event, so
+    // they appear on a later frame rather than immediately.
+    harness.state_mut().set_search_query("nosferatu");
+    harness.state_mut().submit_search();
+    harness.run_steps(4);
+
+    assert_eq!(
+        harness.state().search_result_count(),
+        1,
+        "the demo backend knows one nosferatu"
+    );
+    assert!(
+        harness.query_all_by_label_contains("Nosferatu").next().is_some(),
+        "the result title should be on screen"
+    );
+    assert!(
+        harness.query_all_by_label_contains("archive.org").next().is_some(),
+        "the source should be shown"
+    );
+}
+
+/// Renders the search screen with results in it.
+#[test]
+fn snapshot_search() {
+    let mut harness = harness();
+    harness.run_steps(3);
+    harness.state_mut().navigate(Screen::Search);
+    harness.state_mut().set_search_query("nosferatu");
+    harness.state_mut().submit_search();
+    harness.run_steps(4);
+    harness.snapshot("search");
+}
+
 /// The image loader must decode a poster from disk: this is the path a cached
 /// poster takes on its way to a card.
 #[test]

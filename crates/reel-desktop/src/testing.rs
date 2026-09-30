@@ -1,6 +1,8 @@
 //! Test and demo fixtures.
 
-use reel_catalog::{Artwork, ArtworkRef, CatalogEntry, Metadata, WatchProgress};
+use reel_catalog::{
+    Artwork, ArtworkRef, CatalogEntry, Metadata, SearchHit, WatchProgress,
+};
 use reel_core::model::{FileView, PeerView, StatsView, StreamTarget, TorrentView};
 
 use crate::backend::LibraryItem;
@@ -200,4 +202,26 @@ fn file(id: usize, path: &str, length: u64, included: bool) -> FileView {
             url: Some(format!("http://127.0.0.1:0/stream/0/{id}/{name}")),
         },
     }
+}
+
+/// Search results for the demo backend, so the search screen has something to
+/// show without touching a network.
+pub fn sample_search_hits() -> Vec<SearchHit> {
+    let mut nosferatu = SearchHit::new("Nosferatu, eine Symphonie des Grauens", "archive.org");
+    nosferatu.year = Some(1922);
+    nosferatu.popularity = Some(432_789);
+    nosferatu.size_bytes = Some(562_561_084);
+    nosferatu.torrent_url =
+        Some("https://archive.org/download/nosferatu/nosferatu_archive.torrent".to_string());
+    nosferatu.detail = Some("archive.org \u{2022} nosferatu".to_string());
+
+    let mut caligari = SearchHit::new("The Cabinet of Dr. Caligari", "archive.org");
+    caligari.year = Some(1920);
+    caligari.popularity = Some(95_000);
+    caligari.size_bytes = Some(410_000_000);
+    caligari.torrent_url =
+        Some("https://archive.org/download/caligari/caligari_archive.torrent".to_string());
+    caligari.detail = Some("archive.org \u{2022} caligari".to_string());
+
+    vec![nosferatu, caligari]
 }

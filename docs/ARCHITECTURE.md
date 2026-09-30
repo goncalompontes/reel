@@ -204,9 +204,16 @@ the two agree on what a title is.
 `NullProvider` is what you get with no API key, and `StaticProvider` backs the
 tests and `--demo`. The UI never knows which is in use.
 
-`SearchBackend` is the seam for *discovery*, and nothing in the tree implements
-it. That is a deliberate policy rather than an omission: where results come from
-is the operator's decision and their responsibility.
+`SearchBackend` is the seam for *discovery*. Exactly one implementation is
+bundled — `backends::archive_org`, the Internet Archive — chosen because it
+indexes only public-domain and Creative Commons film, and because it doubles as
+the reference implementation: one HTTP request, no scraping, no credentials.
+
+Where the *rest* of the results come from is the operator's decision and their
+responsibility, which is why the seam is a trait and
+`docs/ADDING_A_SOURCE.md` exists. `SearchAggregator` merges sources, drops hits
+with no magnet or `.torrent` URL, sorts by seeders then popularity then size, and
+reports per-backend failures rather than hiding them behind an empty list.
 
 ### Caching and history
 
@@ -251,11 +258,13 @@ never stop the app from starting.
 Everything in the original plan is now built. What is left is either optional or
 needs a decision from whoever runs the app.
 
-* **A search backend.** `SearchBackend` has no implementations by design. A
-  backend plus a results page is the natural next feature, and the trait is
-  already shaped for it: `SearchAggregator` merges several, sorts by seeders,
-  drops hits with no magnet, and reports per-backend failures instead of hiding
-  them. There is a fake backend in the tests to build against.
+* **More search sources.** The seam, the aggregator, the search screen and the
+  failure reporting are all done, and `archive_org` is a complete template.
+  Adding one is a single struct; see `docs/ADDING_A_SOURCE.md`.
+* **Web seeds (BEP-19).** Internet Archive torrents carry HTTP web seeds that
+  librqbit does not implement, so playback on such sources depends on the
+  Archive's seeders. Supporting web seeds would make any web-seeded torrent
+  stream reliably, and is the highest-value engine feature left.
 * **In-window subtitles.** mpv renders subtitles into the frame today, which
   works but costs CPU on the software renderer. Reading the subtitle track and
   drawing it in egui would be cheaper and more controllable.

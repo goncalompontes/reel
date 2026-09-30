@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use reel_catalog::{
-    CatalogCache, CatalogEntry, Metadata, MetadataProvider, WatchHistory, WatchProgress,
-    default_data_dir, provider_from_key,
+    ArchiveOrgBackend, CatalogCache, CatalogEntry, Metadata, MetadataProvider, SearchAggregator,
+    SearchResults, WatchHistory, WatchProgress, default_data_dir, provider_from_key,
 };
 use reel_core::model::TorrentView;
 use reel_core::title::clean_title;
@@ -70,6 +70,13 @@ pub struct CatalogStatus {
     pub pending: usize,
 }
 
+/// One configured place to look for torrents.
+#[derive(Debug, Clone)]
+pub struct SourceInfo {
+    pub name: String,
+    pub configured: bool,
+}
+
 /// A torrent together with what the catalogue knows about it.
 #[derive(Debug, Clone)]
 pub struct LibraryItem {
@@ -105,6 +112,11 @@ pub enum BackendEvent {
     Metadata { info_hash: String },
     /// Watch positions changed.
     WatchUpdated,
+    /// Results for a search. Carries the query so a stale answer for an older
+    /// query can be recognised and dropped.
+    SearchResults { query: String, results: SearchResults },
+    /// A search that could not run at all.
+    SearchFailed { query: String, message: String },
 }
 
 pub trait Backend {
@@ -133,6 +145,11 @@ pub trait Backend {
     fn mark_finished(&self, info_hash: &str, title: Option<String>);
     fn forget_watch(&self, info_hash: &str);
 
+    /// Start a search. Results arrive as [`BackendEvent::SearchResults`].
+    fn search(&self, query: &str);
+    /// The configured search sources, for the settings page.
+    fn search_sources(&self) -> Vec<SourceInfo>;
+
     fn catalog_status(&self) -> CatalogStatus;
     /// Clear cached metadata and artwork, then enrich again.
     fn clear_catalog_cache(&self);
@@ -152,6 +169,7 @@ struct CatalogState {
     attempted: Mutex<HashSet<String>>,
     history: Mutex<WatchHistory>,
     last_history_write: Mutex<Instant>,
+    search: SearchAggregator,
 }
 
 impl CatalogState {
@@ -249,6 +267,15 @@ impl EngineBackend {
             player_note,
         };
 
+        // The one backend we ship: the Internet Archive, which serves
+        // public-domain and Creative Commons film. Anything else is the
+        // operator's to add — see docs/ADDING_A_SOURCE.md.
+        let mut backends: Vec<Box<dyn reel_catalog::search::SearchBackend>> = Vec::new();
+        if !catalog_options.disable_bundled_sources {
+            backends.push(Box::new(ArchiveOrgBackend::new()));
+        }
+        let search = SearchAggregator::new(backends);
+
         let catalog = Arc::new(CatalogState {
             provider,
             cache,
@@ -257,6 +284,7 @@ impl EngineBackend {
             attempted: Mutex::new(HashSet::new()),
             history: Mutex::new(history),
             last_history_write: Mutex::new(Instant::now() - HISTORY_WRITE_INTERVAL),
+            search,
         });
 
         let backend = Self {
@@ -438,6 +466,8 @@ impl EngineBackend {
 pub struct CatalogOptions {
     pub api_key: Option<String>,
     pub data_dir: std::path::PathBuf,
+    /// Leave the bundled search source out entirely.
+    pub disable_bundled_sources: bool,
 }
 
 impl CatalogOptions {
@@ -449,6 +479,9 @@ impl CatalogOptions {
                 .ok()
                 .filter(|key| !key.trim().is_empty()),
             data_dir: default_data_dir(),
+            disable_bundled_sources: std::env::var("REEL_NO_BUNDLED_SOURCES")
+                .map(|value| value != "0")
+                .unwrap_or(false),
         }
     }
 }
@@ -605,6 +638,54 @@ impl Backend for EngineBackend {
         let _ = history.forget(info_hash);
         drop(history);
         self.push(BackendEvent::WatchUpdated);
+    }
+
+    fn search(&self, query: &str) {
+        let query = query.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+
+        let state = self.catalog.clone();
+        let events = self.events.clone();
+
+        self.runtime.spawn(async move {
+            let request = reel_catalog::SearchQuery::new(query.clone());
+            let outcome = state.search.search(&request).await;
+
+            let event = match outcome {
+                Ok(results) => {
+                    tracing::info!(
+                        query = %query,
+                        hits = results.hits.len(),
+                        failures = results.failures.len(),
+                        "search finished"
+                    );
+                    BackendEvent::SearchResults {
+                        query: query.clone(),
+                        results,
+                    }
+                }
+                Err(e) => BackendEvent::SearchFailed {
+                    query: query.clone(),
+                    message: e.to_string(),
+                },
+            };
+
+            events.lock().unwrap_or_else(|e| e.into_inner()).push(event);
+        });
+    }
+
+    fn search_sources(&self) -> Vec<SourceInfo> {
+        self.catalog
+            .search
+            .names()
+            .into_iter()
+            .map(|name| SourceInfo {
+                configured: self.catalog.search.configured().contains(&name),
+                name: name.to_string(),
+            })
+            .collect()
     }
 
     fn catalog_status(&self) -> CatalogStatus {
@@ -828,6 +909,34 @@ impl Backend for FakeBackend {
         if let Some(item) = items.iter_mut().find(|i| i.entry.info_hash == info_hash) {
             item.entry.watch = None;
         }
+    }
+
+    fn search(&self, query: &str) {
+        // Answer with fixtures, so the UI can be driven without a network.
+        let mut results = SearchResults::default();
+        for hit in crate::testing::sample_search_hits() {
+            if hit.title.to_lowercase().contains(&query.to_lowercase())
+                || query.trim().is_empty()
+            {
+                results.hits.push(hit);
+            }
+        }
+        results.hits.sort_by_key(|hit| std::cmp::Reverse(hit.sort_key()));
+
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(BackendEvent::SearchResults {
+                query: query.to_string(),
+                results,
+            });
+    }
+
+    fn search_sources(&self) -> Vec<SourceInfo> {
+        vec![SourceInfo {
+            name: "demo".to_string(),
+            configured: true,
+        }]
     }
 
     fn catalog_status(&self) -> CatalogStatus {

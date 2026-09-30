@@ -23,6 +23,7 @@
 //! "no match" rather than "confidently wrong match", and it is exhaustively
 //! unit-tested.
 
+pub mod backends;
 pub mod cache;
 pub mod error;
 pub mod history;
@@ -33,6 +34,7 @@ pub mod rows;
 pub mod search;
 pub mod tmdb;
 
+pub use backends::ArchiveOrgBackend;
 pub use cache::CatalogCache;
 pub use error::CatalogError;
 pub use history::WatchHistory;
