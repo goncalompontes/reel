@@ -40,20 +40,66 @@ documented, tested extension point: see
 | Bundled sources | one: the Internet Archive (public domain / CC film) |
 | In-window subtitles, transcoding for odd codecs | not yet |
 
+## Install
+
+```bash
+git clone <this repo> && cd reel
+scripts/install.sh
+```
+
+That builds the release binaries and installs them into `~/.local`, which needs
+no root and is already on the `PATH` of most desktop Linux setups. It writes:
+
+| Path | What |
+| --- | --- |
+| `~/.local/bin/reel` | the CLI and daemon |
+| `~/.local/bin/reel-desktop` | the app |
+| `~/.local/share/applications/reel.desktop` | launcher entry |
+| `~/.local/share/icons/hicolor/{16..256,scalable}/apps/reel.{png,svg}` | icons |
+| `~/.local/share/licenses/reel/` | licence texts |
+
+Re-running it is a no-op rather than an error, and there is an undo:
+
+```bash
+scripts/install.sh --uninstall        # removes files, keeps your library
+```
+
+Your downloads and metadata live in `~/Downloads/reel` and `~/.local/share/reel`
+and are never touched by install or uninstall.
+
+### Other ways
+
+```bash
+# System-wide, if you would rather it lived in /usr
+sudo scripts/install.sh --prefix /usr
+
+# A systemd user unit for the headless daemon (off by default)
+scripts/install.sh --with-service
+systemctl --user enable --now reel.service
+
+# Straight from cargo, if you only want the binaries and no desktop entry
+cargo install --path crates/reel-cli
+cargo install --path crates/reel-desktop
+
+# Arch: the same installer, driven by makepkg
+cd packaging && makepkg -si
+```
+
+`scripts/install.sh --help` lists everything, including `--destdir`, which is
+how the PKGBUILD reuses it — the file layout has one source of truth.
+
 ## Try it
 
 ```bash
-cargo build --release
-
 # Optional: real posters and synopses. Both a v3 API key and a v4 API token work.
 export REEL_TMDB_API_KEY=...
 
-# The desktop app: engine + streaming server + player + catalog, one process.
-./target/release/reel-desktop
-
-# No engine or network, just the sample library (good for a quick look):
-./target/release/reel-desktop --demo
+reel-desktop            # engine + streaming server + player + catalog, one process
+reel-desktop --demo     # sample library, no engine and no network
 ```
+
+Without the script, `cargo build --release` and `./target/release/reel-desktop`
+work exactly the same.
 
 Then paste a magnet link into **Add**. reel fetches the metadata, picks the
 video, starts streaming it while it downloads, and looks up the title so the
@@ -65,17 +111,17 @@ A torrent can be addressed four ways and all four work: a **magnet URI**, an
 **40-character info hash**. A magnet shows up as *Resolving magnet…* until its
 metadata arrives, and the API stays responsive while it does.
 
-The CLI is still there and shares the same engine:
+The CLI ships alongside it and shares the same engine:
 
 ```bash
 # Turn a file you own into a torrent, then seed it.
-./target/release/reel create ~/Videos/holiday.mp4
-./target/release/reel serve --dir ~/Videos --overwrite --add ~/Videos/holiday.mp4.torrent
+reel create ~/Videos/holiday.mp4
+reel serve --dir ~/Videos --overwrite --add ~/Videos/holiday.mp4.torrent
 
 # Or just play something.
-./target/release/reel add 'magnet:?xt=urn:btih:...'
-./target/release/reel ls
-./target/release/reel play 0          # launches mpv on the stream URL
+reel add 'magnet:?xt=urn:btih:...'
+reel ls
+reel play 0          # launches mpv on the stream URL
 ```
 
 ## Verify it

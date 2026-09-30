@@ -1,0 +1,19 @@
+[Unit]
+Description=reel torrent streaming daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/reel serve --api-addr 127.0.0.1:3030
+Restart=on-failure
+RestartSec=5
+
+# A torrent client is a background service; do not let it compete with the
+# desktop for CPU or disk time.
+Nice=5
+IOSchedulingClass=best-effort
+CPUWeight=20
+
+[Install]
+WantedBy=default.target

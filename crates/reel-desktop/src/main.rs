@@ -77,6 +77,9 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("reel")
+            // Matches packaging/reel.desktop, so the taskbar groups the window
+            // with the launcher and shows the right icon on Wayland.
+            .with_app_id("reel")
             .with_inner_size([1360.0, 880.0])
             .with_min_inner_size([940.0, 620.0]),
         ..Default::default()

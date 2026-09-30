@@ -1,0 +1,52 @@
+# Maintainer: the reel contributors
+#
+# Builds from a local checkout:
+#
+#   cd /path/to/reel
+#   makepkg -si
+#
+# Once the project has a public URL, replace `source` with the release tarball,
+# set `sha256sums` properly, and drop the `cd "$startdir"` lines in favour of
+# working inside `$srcdir`. Everything else stays as it is, because the file
+# layout is the installer's job, not this script's.
+
+pkgname=reel
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Native desktop client for streaming torrents, with a catalogue"
+arch=('x86_64')
+# Dual licensed, like most of the Rust ecosystem. The texts are installed.
+license=('MIT' 'Apache')
+# url="" until the project has a home; makepkg warns about an empty one.
+depends=('gcc-libs')
+makedepends=('cargo' 'rust')
+# libmpv is loaded at runtime, so the app builds and runs without it and simply
+# cannot play video until it is present.
+optdepends=('mpv: video playback via libmpv, and the external-player fallback')
+provides=('reel-cli' 'reel-desktop')
+# The release profile sets its own LTO and codegen-units.
+options=('!lto')
+
+source=()
+sha256sums=()
+
+build() {
+  cd "$startdir"
+  cargo build --release --locked --workspace
+}
+
+# Only the unit tests: the integration and snapshot tests need a GPU and a
+# display, which a clean chroot does not have.
+check() {
+  cd "$startdir"
+  cargo test --release --locked --workspace --lib
+}
+
+package() {
+  cd "$startdir"
+  # One layout, one source of truth: the same script users run.
+  scripts/install.sh --prefix /usr --destdir "$pkgdir" --no-build --with-service
+
+  # The licence is declared in two files; makepkg expects a directory too.
+  install -d "$pkgdir/usr/share/licenses/$pkgname"
+}

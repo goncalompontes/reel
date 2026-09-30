@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=reel
+GenericName=Media Catalogue
+Comment=Stream torrents with a Netflix-style catalogue
+Comment[en_GB]=Stream torrents with a Netflix-style catalogue
+Exec=reel-desktop
+TryExec=reel-desktop
+Icon=reel
+Terminal=false
+Categories=AudioVideo;Player;Video;TV;
+Keywords=torrent;stream;video;movie;media;player;catalogue;
+StartupNotify=true
+StartupWMClass=reel

@@ -1,0 +1,26 @@
+<!-- reel: a play mark inside a film spinner. Deliberately simple so it stays
+     legible at 16px in a taskbar. Installed as a scalable icon, so there is no
+     fixed size to keep in sync. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="reel">
+  <defs>
+    <linearGradient id="reel-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#232739"/>
+      <stop offset="1" stop-color="#0b0c11"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="128" height="128" rx="28" ry="28" fill="url(#reel-bg)"/>
+
+  <!-- Film perforations down each edge. -->
+  <g fill="#3a3f52">
+    <rect x="12" y="24" width="9" height="14" rx="3"/>
+    <rect x="12" y="57" width="9" height="14" rx="3"/>
+    <rect x="12" y="90" width="9" height="14" rx="3"/>
+    <rect x="107" y="24" width="9" height="14" rx="3"/>
+    <rect x="107" y="57" width="9" height="14" rx="3"/>
+    <rect x="107" y="90" width="9" height="14" rx="3"/>
+  </g>
+
+  <!-- Play mark. -->
+  <path d="M52 40 L92 64 L52 88 Z" fill="#5b9dff"/>
+</svg>
