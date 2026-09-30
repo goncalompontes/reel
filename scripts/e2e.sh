@@ -332,6 +332,35 @@ if [ "${MAGNET_SIZE:-0}" = "$SRC_SIZE" ]; then
     || bad "magnet-streamed bytes differ"
 fi
 
+echo "== 24. the installed launcher points at a real binary =="
+# The installer is how both users and packaging place files, so a wrong layout
+# or an unsubstituted path should fail here rather than silently when someone
+# clicks an icon. A desktop entry whose Exec cannot be found does nothing at
+# all: no window, no message, no journal entry.
+PREFIX_TREE="$ROOT/install-prefix"
+"$HERE/install.sh" --prefix "$PREFIX_TREE" --no-build --quiet >/dev/null 2>&1
+ENTRY="$PREFIX_TREE/share/applications/reel.desktop"
+
+if [ -f "$ENTRY" ]; then
+  ok "the installer wrote a desktop entry"
+  EXEC_PATH=$(sed -n 's/^Exec=//p' "$ENTRY" | head -1 | awk '{print $1}')
+  check "Exec names an absolute path" "$EXEC_PATH" "$PREFIX_TREE/bin/reel-desktop"
+  [ -x "$EXEC_PATH" ] && ok "the binary the launcher names is executable" \
+    || bad "the launcher names a binary that is not there: $EXEC_PATH"
+  [ -f "$PREFIX_TREE/share/icons/hicolor/scalable/apps/reel.svg" ] \
+    && ok "the icon is installed" || bad "no icon was installed"
+  if command -v desktop-file-validate >/dev/null 2>&1; then
+    desktop-file-validate "$ENTRY" >/dev/null 2>&1 \
+      && ok "the installed entry validates" || bad "the installed entry does not validate"
+  fi
+  # Nothing should be left pointing at a bare command name.
+  grep -qE '^(Exec|TryExec)=reel' "$ENTRY" \
+    && bad "the entry still contains a PATH-dependent command" \
+    || ok "no PATH-dependent command in the entry"
+else
+  bad "the installer wrote no desktop entry"
+fi
+
 echo
 echo "===== $PASS passed, $FAIL failed ====="
 exit $(( FAIL > 0 ))

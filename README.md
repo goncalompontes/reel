@@ -54,7 +54,7 @@ no root and is already on the `PATH` of most desktop Linux setups. It writes:
 | --- | --- |
 | `~/.local/bin/reel` | the CLI and daemon |
 | `~/.local/bin/reel-desktop` | the app |
-| `~/.local/share/applications/reel.desktop` | launcher entry |
+| `~/.local/share/applications/reel.desktop` | launcher entry, with an **absolute** `Exec` |
 | `~/.local/share/icons/hicolor/{16..256,scalable}/apps/reel.{png,svg}` | icons |
 | `~/.local/share/licenses/reel/` | licence texts |
 
@@ -87,6 +87,12 @@ cd packaging && makepkg -si
 
 `scripts/install.sh --help` lists everything, including `--destdir`, which is
 how the PKGBUILD reuses it — the file layout has one source of truth.
+
+The launcher entry gets an absolute path substituted in for exactly this reason:
+a GUI session does not read your shell rc files, so `~/.local/bin` is typically
+*not* on its `PATH`. An entry whose `Exec` cannot be found fails completely
+silently — no window, no message, nothing in the journal. `scripts/e2e.sh` step
+24 checks the installed entry names a binary that exists.
 
 ## Try it
 
@@ -128,7 +134,7 @@ reel play 0          # launches mpv on the stream URL
 
 ```bash
 cargo test --workspace     # 147 tests: engine, ranges, matching, UI, catalog, search, backend
-bash scripts/e2e.sh        # 57 assertions: create, seed, stream, decode, magnet, verify bytes
+bash scripts/e2e.sh        # 63 assertions: create, seed, stream, decode, magnet, packaging
 ```
 
 `scripts/e2e.sh` is the real proof. It generates a video, seeds it from one

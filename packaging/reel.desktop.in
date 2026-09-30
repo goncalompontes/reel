@@ -1,3 +1,8 @@
+# @BINDIR@ is substituted by scripts/install.sh.
+#
+# The path is absolute on purpose: a GUI launcher does not read shell rc files,
+# so it cannot be relied on to have ~/.local/bin on PATH, and a desktop entry
+# whose Exec cannot be found fails silently with no window and no message.
 [Desktop Entry]
 Type=Application
 Version=1.0
@@ -5,8 +10,8 @@ Name=reel
 GenericName=Media Catalogue
 Comment=Stream torrents with a Netflix-style catalogue
 Comment[en_GB]=Stream torrents with a Netflix-style catalogue
-Exec=reel-desktop
-TryExec=reel-desktop
+Exec=@BINDIR@/reel-desktop
+TryExec=@BINDIR@/reel-desktop
 Icon=reel
 Terminal=false
 Categories=AudioVideo;Player;Video;TV;

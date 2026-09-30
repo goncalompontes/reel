@@ -173,8 +173,13 @@ do_install() {
   install -m755 "$ROOT/target/release/reel-desktop" "$(DEST "$BIN_DIR/reel-desktop")"
   say "  $BIN_DIR/reel-desktop"
 
-  install -m644 "$ROOT/packaging/reel.desktop" "$(DEST "$APP_DIR/reel.desktop")"
-  say "  $APP_DIR/reel.desktop"
+  # The launcher gets an absolute Exec: a GUI session does not read shell rc
+  # files, so it cannot be relied on to have ~/.local/bin on PATH, and a desktop
+  # entry whose Exec is not found fails silently.
+  sed "s|@BINDIR@|$BIN_DIR|g" "$ROOT/packaging/reel.desktop.in" \
+    > "$(DEST "$APP_DIR/reel.desktop")"
+  chmod 644 "$(DEST "$APP_DIR/reel.desktop")"
+  say "  $APP_DIR/reel.desktop  (Exec=$BIN_DIR/reel-desktop)"
 
   install -m644 "$ROOT/assets/reel.svg" "$(DEST "$ICON_SCALABLE_DIR/reel.svg")"
   say "  $ICON_SCALABLE_DIR/reel.svg"
@@ -213,6 +218,11 @@ do_install() {
     if ! desktop-file-validate "$(DEST "$APP_DIR/reel.desktop")"; then
       printf 'warning: the installed desktop entry did not validate\n' >&2
     fi
+  fi
+
+  # The failure this guards against is silent, so check it here instead.
+  if [ -z "$DESTDIR" ] && ! command -v "$BIN_DIR/reel-desktop" >/dev/null 2>&1; then
+    printf 'warning: %s/reel-desktop is not executable; the launcher will not work\n' "$BIN_DIR" >&2
   fi
 
   say ""
