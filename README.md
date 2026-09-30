@@ -61,8 +61,8 @@ The CLI is still there and shares the same engine:
 ## Verify it
 
 ```bash
-cargo test --workspace     # 52 tests: range parsing, media/title detection, ABI, UI
-bash scripts/e2e.sh        # full stack: create, seed, stream, decode, verify bytes
+cargo test --workspace     # 56 tests: range parsing, media/title detection, ABI, UI, backend
+bash scripts/e2e.sh        # 51 assertions: create, seed, stream, decode, verify bytes
 ```
 
 `scripts/e2e.sh` is the real proof. It generates a video, seeds it from one
@@ -75,6 +75,9 @@ fetch the data from the first. It asserts, among other things, that:
   `404`/`400` on bad input,
 * **libmpv decodes a real 1280×720 picture out of the live torrent stream**
   (step 17) and can seek to 5 s inside it (step 18),
+* **the desktop app's own video surface renders that stream** (step 19): the
+  same `PlayerController` the UI uses decodes frames and uploads them to egui as
+  textures, with no window and no display server,
 * `ffprobe` can demux the stream while it is still downloading,
 * the full download is byte-identical to the source.
 

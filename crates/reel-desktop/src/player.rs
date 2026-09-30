@@ -189,6 +189,12 @@ impl PlayerController {
         self.volume
     }
 
+    /// How many frames have been uploaded as textures. Used by tests to tell
+    /// that the decode → texture path actually ran.
+    pub fn frames_uploaded(&self) -> u64 {
+        self.last_sequence
+    }
+
     /// Upload any newly rendered frame and paint the video area.
     ///
     /// The video is letterboxed inside the available space and rendered at the
@@ -236,13 +242,7 @@ impl PlayerController {
             let [tw, th] = texture.size();
             if tw > 0 && th > 0 {
                 let aspect = tw as f32 / th as f32;
-                let mut target = rect;
-                if target.width() / target.height() > aspect {
-                    target.set_width(target.height() * aspect);
-                } else {
-                    target.set_height(target.width() / aspect);
-                }
-                target = egui::Rect::from_center_size(rect.center(), target.size());
+                let target = fit_into(rect, aspect);
                 painter.image(
                     texture.id(),
                     target,
@@ -412,5 +412,74 @@ impl PlayerController {
                 let _ = player.seek_absolute(target);
             }
         }
+    }
+}
+
+/// Letterbox `aspect` inside `available`, centred.
+///
+/// Pure geometry, kept out of the draw call so it can be tested directly: a
+/// wrong fit shows up as a stretched or cropped picture, which is easy to miss
+/// by eye and hard to prove from a static snapshot.
+pub fn fit_into(available: egui::Rect, aspect: f32) -> egui::Rect {
+    if !aspect.is_finite()
+        || aspect <= 0.0
+        || available.width() <= 0.0
+        || available.height() <= 0.0
+    {
+        return available;
+    }
+
+    let mut target = available;
+    if target.width() / target.height() > aspect {
+        // The box is wider than the video: pillarbox it.
+        target.set_width(target.height() * aspect);
+    } else {
+        // The box is taller than the video: letterbox it.
+        target.set_height(target.width() / aspect);
+    }
+    egui::Rect::from_center_size(available.center(), target.size())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(w: f32, h: f32) -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(w, h))
+    }
+
+    #[test]
+    fn pillarboxes_when_the_box_is_wider_than_the_video() {
+        // 16:9 video in a 4:1 box: full height, bars left and right.
+        let fitted = fit_into(rect(400.0, 100.0), 16.0 / 9.0);
+        assert!((fitted.height() - 100.0).abs() < 0.01);
+        assert!((fitted.width() - 177.78).abs() < 0.01);
+        assert!((fitted.center().x - 200.0).abs() < 0.01, "must stay centred");
+    }
+
+    #[test]
+    fn letterboxes_when_the_box_is_taller_than_the_video() {
+        // 16:9 video in a square box: full width, bars top and bottom.
+        let fitted = fit_into(rect(100.0, 100.0), 16.0 / 9.0);
+        assert!((fitted.width() - 100.0).abs() < 0.01);
+        assert!((fitted.height() - 56.25).abs() < 0.01);
+        assert!((fitted.center().y - 50.0).abs() < 0.01, "must stay centred");
+    }
+
+    #[test]
+    fn exact_aspect_is_unchanged() {
+        let fitted = fit_into(rect(1920.0, 1080.0), 16.0 / 9.0);
+        assert!((fitted.width() - 1920.0).abs() < 0.01);
+        assert!((fitted.height() - 1080.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn degenerate_inputs_do_not_produce_nan() {
+        for aspect in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let fitted = fit_into(rect(100.0, 50.0), aspect);
+            assert!(fitted.width().is_finite() && fitted.height().is_finite());
+        }
+        let fitted = fit_into(rect(0.0, 0.0), 1.5);
+        assert!(fitted.width().is_finite() && fitted.height().is_finite());
     }
 }

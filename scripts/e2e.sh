@@ -225,7 +225,32 @@ else
   fi
   check "still opaque after seek" "$(sed -n 's/^opaque=//p' "$SEEKS")" "true"
 
-  echo "== 19. still incomplete while it was being played =="
+  echo "== 19. the desktop app's own video surface renders the stream =="
+# reel-player proves libmpv can decode the stream, and the UI snapshots prove
+# the interface renders. This proves the link between them: a decoded frame
+# reaching egui as a texture, through the code the desktop app actually runs.
+PIPELINE="${PIPELINE:-$HERE/../target/debug/examples/player_pipeline}"
+if [ ! -x "$PIPELINE" ]; then
+  bad "player_pipeline not built (run: cargo build -p reel-desktop --example player_pipeline)"
+else
+  PIPE_LOG="$ROOT/logs/pipeline.log"
+  "$PIPELINE" "$STREAM_URL" --frames 8 --timeout 90 --size 1280x720 > "$PIPE_LOG" 2>&1
+  PIPE_RC=$?
+  grep -E "^(backend|frames_uploaded|textures_uploaded|texture_size|video_size)=" "$PIPE_LOG" | sed 's/^/  /'
+
+  check "pipeline exit code" "$PIPE_RC" "0"
+  check "pipeline backend" "$(sed -n 's/^backend=//p' "$PIPE_LOG")" "embedded"
+  check "decoded video size" "$(sed -n 's/^video_size=//p' "$PIPE_LOG")" "1280x720"
+  check "surface texture size" "$(sed -n 's/^texture_size=//p' "$PIPE_LOG")" "1280x720"
+  UPLOADED=$(sed -n 's/^textures_uploaded=//p' "$PIPE_LOG")
+  if [ "${UPLOADED:-0}" -ge 8 ]; then
+    ok "frames reached egui as textures ($UPLOADED uploads)"
+  else
+    bad "expected >= 8 texture uploads, got ${UPLOADED:-0}"
+  fi
+fi
+
+echo "== 20. still incomplete while it was being played =="
   STILL=$(curl -sf "http://127.0.0.1:3042/api/torrents/$ID" | jq_ 'd["stats"]["finished"]')
   PROG=$(curl -sf "http://127.0.0.1:3042/api/torrents/$ID" | jq_ 'd["stats"]["progress_bytes"]')
   echo "  downloaded $PROG / $SRC_SIZE (finished=$STILL)"
@@ -236,13 +261,13 @@ else
   fi
 fi
 
-echo "== 20. full download matches the original byte for byte =="
+echo "== 21. full download matches the original byte for byte =="
 curl -s -o "$ROOT/full.mp4" "http://127.0.0.1:3042/stream/$ID/0/test.mp4"
 check "size" "$(stat -c%s "$ROOT/full.mp4")" "$SRC_SIZE"
 check "sha256" "$(sha256sum "$ROOT/full.mp4" | cut -d' ' -f1)" "$SRC_SHA"
 check "torrent marked finished" "$(curl -sf "http://127.0.0.1:3042/api/torrents/$ID" | jq_ 'd["stats"]["finished"]')" "True"
 
-echo "== 21. CLI client against the running server =="
+echo "== 22. CLI client against the running server =="
 LS=$("$REEL" ls --api http://127.0.0.1:3042 2>&1)
 echo "$LS" | grep -q "test.mp4" && ok "reel ls shows the torrent" || bad "reel ls output unexpected: $LS"
 PLAY=$("$REEL" play "$ID" --api http://127.0.0.1:3042 --player "" 2>&1)
