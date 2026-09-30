@@ -6,7 +6,7 @@ members = ["crates/reel-core", "crates/reel-http", "crates/reel-cli"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = ""
+rust-version = "1.86"
 
 [workspace.dependencies]
 reel-core = { path = "crates/reel-core" }

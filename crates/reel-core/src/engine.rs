@@ -311,7 +311,12 @@ impl Engine {
     /// One torrent by id.
     pub fn view(&self, id: usize) -> Result<TorrentView, EngineError> {
         let details = self.details(id)?;
-        let stats = self.stats(id).unwrap_or_default();
+        // Stats can be unavailable while a torrent is still initializing; never
+        // report an empty state string.
+        let stats = self.stats(id).unwrap_or_else(|| StatsView {
+            state: "unknown".to_string(),
+            ..Default::default()
+        });
         Ok(self.assemble(id, details, stats))
     }
 
@@ -539,19 +544,18 @@ impl Engine {
 }
 
 fn stats_to_view(stats: &TorrentStats) -> StatsView {
-    let (state, paused) = match &stats.state {
+    let state = match &stats.state {
         TorrentStatsState::Initializing { paused } => {
             if *paused {
-                ("paused", true)
+                "paused"
             } else {
-                ("initializing", false)
+                "initializing"
             }
         }
-        TorrentStatsState::Live => ("live", false),
-        TorrentStatsState::Paused => ("paused", true),
-        TorrentStatsState::Error => ("error", false),
+        TorrentStatsState::Live => "live",
+        TorrentStatsState::Paused => "paused",
+        TorrentStatsState::Error => "error",
     };
-    let _ = paused;
 
     let (download_bps, upload_bps, peers) = match stats.live.as_ref() {
         Some(live) => {

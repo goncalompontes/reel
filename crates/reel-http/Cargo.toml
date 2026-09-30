@@ -4,6 +4,7 @@ description = "HTTP API and range-request streaming server for reel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 reel-core.workspace = true

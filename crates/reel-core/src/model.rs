@@ -130,22 +130,6 @@ pub fn percent_encode_path_segment(input: &str) -> String {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn encodes_spaces_and_slashes() {
-        assert_eq!(percent_encode_path_segment("Movie.mkv"), "Movie.mkv");
-        assert_eq!(
-            percent_encode_path_segment("My Movie (2024).mkv"),
-            "My%20Movie%20(2024).mkv"
-        );
-        assert_eq!(percent_encode_path_segment("a/b"), "a%2Fb");
-        assert_eq!(percent_encode_path_segment("caf\u{e9}.srt"), "caf%C3%A9.srt");
-    }
-}
-
 /// What the caller asked to add.
 ///
 /// `source` is a `magnet:` URI, a bare 40-char info hash, or an HTTP(S) URL to
@@ -183,4 +167,20 @@ pub struct AddOutcome {
     pub torrent: TorrentView,
     /// `false` when the torrent was already known to the session.
     pub was_new: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encodes_spaces_and_slashes() {
+        assert_eq!(percent_encode_path_segment("Movie.mkv"), "Movie.mkv");
+        assert_eq!(
+            percent_encode_path_segment("My Movie (2024).mkv"),
+            "My%20Movie%20(2024).mkv"
+        );
+        assert_eq!(percent_encode_path_segment("a/b"), "a%2Fb");
+        assert_eq!(percent_encode_path_segment("caf\u{e9}.srt"), "caf%C3%A9.srt");
+    }
 }
