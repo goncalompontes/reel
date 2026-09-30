@@ -1,0 +1,25 @@
+[package]
+name = "reel-http"
+description = "HTTP API and range-request streaming server for reel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+reel-core.workspace = true
+
+anyhow.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+axum.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tower-http.workspace = true
+
+[dev-dependencies]
+http-body-util = "0.1"

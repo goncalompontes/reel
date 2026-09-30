@@ -1,0 +1,19 @@
+[package]
+name = "reel-core"
+description = "Torrent engine and streaming primitives for reel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+librqbit.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
