@@ -49,7 +49,7 @@ impl Trust {
 }
 
 /// What kind of thing a torrent holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MediaKind {
     /// A film, or a single video with no episode numbering.
@@ -97,6 +97,80 @@ impl ReleaseAttributes {
     fn is_empty(&self) -> bool {
         self == &Self::default()
     }
+
+    /// Coarse quality rank, `(resolution, source)`. Higher is better.
+    ///
+    /// Used to order the versions of one work, so "Play" starts the best copy
+    /// the library holds. Codec and audio deliberately do not rank: H.265 is
+    /// not better than H.264 for a player, and an unusual codec is a reason to
+    /// offer a choice, not to prefer one.
+    pub fn quality_rank(&self) -> (u8, u8) {
+        (
+            resolution_rank(self.resolution.as_deref()),
+            source_rank(self.source.as_deref()),
+        )
+    }
+
+    /// A short human label, e.g. `1080p · Blu-ray · x264`. Falls back to a
+    /// placeholder when nothing was recognised.
+    pub fn quality_label(&self) -> String {
+        let parts = self.summary();
+        if parts.is_empty() {
+            "quality unknown".to_string()
+        } else {
+            parts.join(" \u{00b7} ")
+        }
+    }
+}
+
+/// Numeric rank of a resolution string. `2160p` beats `1080p`, and anything
+/// unrecognised sits below a known low resolution rather than above it.
+fn resolution_rank(resolution: Option<&str>) -> u8 {
+    let Some(value) = resolution else {
+        return 0;
+    };
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("4320") || lower.contains("8k") {
+        return 6;
+    }
+    if lower.contains("2160") || lower.contains("4k") {
+        return 5;
+    }
+    if lower.contains("1440") {
+        return 4;
+    }
+    if lower.contains("1080") {
+        return 3;
+    }
+    if lower.contains("720") {
+        return 2;
+    }
+    if lower.contains("576") || lower.contains("480") || lower.contains("sd") {
+        return 1;
+    }
+    0
+}
+
+/// Numeric rank of a source string. Physical media beats a web rip beats TV
+/// capture, which is the order people actually pick when several are offered.
+fn source_rank(source: Option<&str>) -> u8 {
+    let Some(value) = source else {
+        return 0;
+    };
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("remux") {
+        return 4;
+    }
+    if lower.contains("blu") || lower.contains("bdrip") || lower.contains("brrip") {
+        return 3;
+    }
+    if lower.contains("web") {
+        return 2;
+    }
+    if lower.contains("hdtv") || lower.contains("dvd") || lower.contains("dvdrip") {
+        return 1;
+    }
+    0
 }
 
 /// A file that looks like an episode.
@@ -835,5 +909,40 @@ mod tests {
         let release = analyse(&[]);
         assert_eq!(release.kind, MediaKind::Unknown);
         assert!(release.episodes.is_empty());
+    }
+
+    #[test]
+    fn quality_rank_prefers_resolution_then_source() {
+        let uhd = ReleaseAttributes {
+            resolution: Some("2160p".into()),
+            source: Some("Blu-ray".into()),
+            ..Default::default()
+        };
+        let hd_web = ReleaseAttributes {
+            resolution: Some("1080p".into()),
+            source: Some("WEB-DL".into()),
+            ..Default::default()
+        };
+        let hd_blu = ReleaseAttributes {
+            resolution: Some("1080p".into()),
+            source: Some("Blu-ray".into()),
+            ..Default::default()
+        };
+        assert!(uhd.quality_rank() > hd_blu.quality_rank());
+        assert!(
+            hd_blu.quality_rank() > hd_web.quality_rank(),
+            "same resolution, better source wins"
+        );
+        assert_eq!(ReleaseAttributes::default().quality_rank(), (0, 0));
+    }
+
+    #[test]
+    fn quality_label_falls_back_when_nothing_is_known() {
+        assert_eq!(ReleaseAttributes::default().quality_label(), "quality unknown");
+        let attributes = ReleaseAttributes {
+            resolution: Some("1080p".into()),
+            ..Default::default()
+        };
+        assert_eq!(attributes.quality_label(), "1080p");
     }
 }

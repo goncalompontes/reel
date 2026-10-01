@@ -4,6 +4,7 @@
 //! state, which keeps this module pure — no engine, no history file, no network.
 
 use crate::model::CatalogEntry;
+use crate::work::Work;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowKind {
@@ -124,6 +125,89 @@ pub fn build_rows(entries: &[CatalogEntry], limit: usize) -> Vec<Row> {
     rows
 }
 
+/// A row of works, for the library page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkRow {
+    pub kind: RowKind,
+    pub title: String,
+    pub works: Vec<Work>,
+}
+
+/// Build the library rows from merged works.
+///
+/// The classification is the same as [`build_rows`], but a work is one title
+/// however many torrents back it, so its watch state is the most recent member's
+/// and its recency is the newest member's id.
+pub fn build_work_rows(works: &[Work], limit: usize) -> Vec<WorkRow> {
+    let recency = |work: &Work| {
+        work.members
+            .iter()
+            .map(|member| member.torrent_id())
+            .max()
+            .unwrap_or(0)
+    };
+
+    let mut continue_watching: Vec<Work> = Vec::new();
+    let mut finished: Vec<Work> = Vec::new();
+    let mut unwatched: Vec<Work> = Vec::new();
+
+    for work in works {
+        match work.watch() {
+            Some(progress) if progress.is_finished() => finished.push(work.clone()),
+            Some(progress) if progress.is_resumable() => continue_watching.push(work.clone()),
+            Some(_) => unwatched.push(work.clone()),
+            None => unwatched.push(work.clone()),
+        }
+    }
+
+    continue_watching.sort_by(|a, b| {
+        let at = a.watch().map(|w| w.updated_at).unwrap_or(0);
+        let bt = b.watch().map(|w| w.updated_at).unwrap_or(0);
+        bt.cmp(&at).then_with(|| a.lead_torrent_id().cmp(&b.lead_torrent_id()))
+    });
+    finished.sort_by(|a, b| {
+        let at = a.watch().map(|w| w.updated_at).unwrap_or(0);
+        let bt = b.watch().map(|w| w.updated_at).unwrap_or(0);
+        bt.cmp(&at).then_with(|| a.lead_torrent_id().cmp(&b.lead_torrent_id()))
+    });
+
+    let mut recent = works.to_vec();
+    recent.sort_by_key(|work| std::cmp::Reverse(recency(work)));
+    unwatched.sort_by_key(|work| std::cmp::Reverse(recency(work)));
+
+    let anything_watched = works.iter().any(|work| work.watch().is_some());
+
+    let mut rows = vec![
+        WorkRow {
+            kind: RowKind::ContinueWatching,
+            title: RowKind::ContinueWatching.title().to_string(),
+            works: continue_watching,
+        },
+        WorkRow {
+            kind: RowKind::RecentlyAdded,
+            title: RowKind::RecentlyAdded.title().to_string(),
+            works: recent,
+        },
+        WorkRow {
+            kind: RowKind::Unwatched,
+            title: RowKind::Unwatched.title().to_string(),
+            works: if anything_watched { unwatched } else { Vec::new() },
+        },
+        WorkRow {
+            kind: RowKind::Finished,
+            title: RowKind::Finished.title().to_string(),
+            works: finished,
+        },
+    ];
+
+    for row in &mut rows {
+        row.works.truncate(limit);
+    }
+    rows.retain(|row| !row.works.is_empty());
+    rows.sort_by_key(|row| row.kind.order());
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +316,21 @@ mod tests {
     #[test]
     fn an_empty_library_produces_no_rows() {
         assert!(build_rows(&[], 10).is_empty());
+    }
+
+    fn work(id: usize, hash: &str, watch: Option<(f64, f64, i64)>) -> Work {
+        Work::single(crate::work::WorkMember::new(entry(id, hash, watch), None))
+    }
+
+    #[test]
+    fn work_rows_classify_by_aggregate_watch() {
+        let works = vec![
+            work(1, "a", None),
+            work(2, "b", Some((300.0, 1000.0, 10))),
+        ];
+        let rows = build_work_rows(&works, 10);
+        assert_eq!(rows[0].kind, RowKind::ContinueWatching);
+        assert_eq!(rows[0].works[0].lead_torrent_id(), 2);
+        assert!(build_work_rows(&[], 10).is_empty());
     }
 }

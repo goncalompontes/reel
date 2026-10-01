@@ -116,7 +116,59 @@ pointer movement.
 
 ## Out of scope
 
-- True disk-less streaming (librqbit streams through on-disk pieces; not
-  downloading at all is an engine change, not a client change).
 - An OMDb/IMDb provider. IMDb has no official public API; TMDB is the provider
   the app integrates, and the settings label says so.
+
+---
+
+# Phase 2: merging torrents into works, and temporary streaming
+
+> **Phase 2 status: merging is implemented** (`reel-catalog/src/work.rs`,
+> `rows.rs`, the desktop library/detail screens, and the *Merge copies* setting).
+> The temporary-streaming / persisted-library lifecycle below is the next pass.
+
+## Merging
+
+Multiple torrents that are the same film or show become one *work*:
+
+* **Identity.** Same work when both have metadata and share
+  `(source, source_id)`, or otherwise when normalized title + compatible year +
+  `MediaKind` agree. `kind` is in the key, so the *Fargo* film and the *Fargo*
+  series never merge. A metadata-less torrent folds into a metadata group only
+  when exactly one group matches and the years do not conflict.
+* **Films** get a `Version` list (torrent + feature file + attributes + size),
+  ordered best-first by resolution, then source, then size.
+* **Series** merge episode lists keyed by `(season, episode)`, or air date for
+  daily shows, so the same episode from two torrents becomes one row with a
+  chooser. Distinct seasons from distinct torrents become one season list.
+* Settings gets a **Merge duplicate titles** toggle (default on).
+
+This lives in a pure `reel-catalog/src/work.rs`; the desktop backend supplies
+`primary_file_id` and the UI renders works.
+
+## Temporary streaming and optional downloads
+
+Playing must not create a persistent download; downloading is an explicit,
+cancellable action.
+
+* **Play** streams from storage that is discarded when playback stops.
+* **Download** persists to the download folder and the button toggles to
+  cancel/remove.
+
+### The storage constraint
+
+librqbit 9's `FileStream::poll_read` trusts the chunk-tracker have-bit and reads
+storage directly; a missing piece is a hard stream error, and the tracker is not
+reachable from outside the crate. A bounded in-memory buffer that **evicts** is
+therefore unsafe for a seekable player. The chosen design is **memory-first with
+spill**: pieces stay in RAM up to a budget (~512 MiB), then spill to a scratch
+file deleted when the stream stops. Bounded, seek-safe, and nothing persists.
+
+### Library lifecycle
+
+Ephemeral streaming requires the library to survive independently of the
+session, so a persisted store of sources (magnet/info hash + metadata +
+`streaming | downloading`) is introduced; the session then holds only what is
+actively streaming or downloading. `Play` ensures a temporary-storage torrent
+and removes it on stop; `Download` ensures a filesystem-storage torrent and
+keeps it. This is implemented as a separate pass, after merging lands.

@@ -141,6 +141,7 @@ fn settings_reports_the_backend_and_catalog() {
     assert_eq!(harness.state().screen(), &Screen::Settings);
     for label in [
         "Download folder",
+        "Merge copies",
         "Metadata API key",
         "Metadata and artwork",
         "Search sources",
@@ -312,6 +313,38 @@ fn snapshot_season_pack() {
     harness.run_steps(3);
 
     harness.snapshot("season-pack");
+}
+
+/// Two torrents overlapping on the same episodes: each episode row gets a copy
+/// chooser, and the 2160p copy is preferred.
+#[test]
+fn snapshot_season_pack_with_duplicates() {
+    let mut items = sample_library();
+    items.push(reel_desktop::testing::sample_season_pack());
+
+    let mut copy = reel_desktop::testing::sample_season_pack();
+    copy.torrent.id = 11;
+    copy.entry.torrent_id = 11;
+    copy.entry.info_hash = "1111111111111111111111111111111111111111".into();
+    copy.torrent.info_hash = copy.entry.info_hash.clone();
+    copy.torrent.name = Some("Some.Show.S01.2160p.WEB-DL.x265".into());
+    copy.entry.release.title = "Some Show".into();
+    copy.entry.release.attributes.resolution = Some("2160p".into());
+    items.push(copy);
+
+    let mut harness = Harness::builder()
+        .with_size((1280.0, 1000.0))
+        .build_ui_state(
+            |ui, app: &mut App| {
+                let mut frame = eframe::Frame::_new_kittest();
+                eframe::App::ui(app, ui, &mut frame);
+            },
+            App::new(Box::new(FakeBackend::new(items))),
+        );
+    harness.run_steps(3);
+    harness.state_mut().navigate(Screen::Detail(11));
+    harness.run_steps(3);
+    harness.snapshot("season-pack-duplicates");
 }
 
 /// A pack with two seasons: each season gets its own heading, and every episode

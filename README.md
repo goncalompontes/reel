@@ -45,6 +45,7 @@ documented, tested extension point: see
 | Search screen + pluggable sources | done |
 | Bundled sources | one: the Internet Archive (public domain / CC film) |
 | Settings file as the canonical configuration (not env) | done |
+| Merge copies of a film or show into one title | done |
 | Stream on demand; per-file / per-episode / per-season downloads | done |
 | Subtitles: embedded tracks, sidecar files, track and delay controls | done |
 | Audio track, speed and aspect controls; fullscreen + shortcuts | done |
@@ -340,6 +341,37 @@ Two things resume, and they resume independently:
   as an empty file. Verified by stopping a throttled download partway,
   restarting, and checking both that progress was retained and that the retained
   bytes matched the source.
+
+## One title, several torrents
+
+Adding two releases of the same thing should not produce two unrelated cards.
+reel groups torrents into one **work** — one film, or one series — automatically.
+
+**What merges.** Two torrents are the same work when they share a metadata id
+(both resolved to TMDB `603`), or, with no metadata, when their normalised title,
+a compatible year and the same kind agree. Kind is part of the identity, so the
+*Fargo* film and the *Fargo* series never merge. A torrent whose lookup failed
+joins a metadata group only when exactly one group matches and the years do not
+conflict: a slightly split library is better than one that claims two different
+films are the same.
+
+**A film** gets a **Versions** list, best copy first — resolution, then source
+(Remux/Blu-ray/WEB), then size. Each copy has its own Play, Download and Remove,
+so a 4K and a 1080p copy are a choice rather than a duplicate. The card and the
+title's Play button use the best copy.
+
+**A series** merges its episode lists. Episodes are matched by `SxxEyy`, or by
+air date for daily shows, so two torrents that overlap on a few episodes become
+one row with a **copy chooser** on it; the best copy is selected by default.
+Seasons held in different torrents become one season list, and *Download season*
+fetches the best copy of each episode across whichever torrent holds it.
+
+The whole merge is a setting: **Settings → Merge copies of the same film or show
+into one title**, on by default. Turn it off to list every torrent separately.
+
+Removing is explicit: **Remove** opens a dialog listing every source with a tick
+box, so you can drop one bad copy without touching the rest, and optionally
+delete its files. Each row in Versions and Sources also has its own Remove.
 
 ## Subtitles and player controls
 

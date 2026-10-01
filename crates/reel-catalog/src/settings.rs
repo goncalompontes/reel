@@ -45,6 +45,10 @@ pub struct CatalogSettings {
     #[serde(default = "default_true")]
     pub enable_bundled_sources: bool,
 
+    /// Merge torrents that are the same film or show into one library title.
+    #[serde(default = "default_true")]
+    pub merge_works: bool,
+
     /// Preferred subtitle language, e.g. `en`. `None` lets mpv choose.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle_language: Option<String>,
@@ -70,6 +74,7 @@ impl Default for CatalogSettings {
             stream_only: default_true(),
             subtitles_enabled: default_true(),
             enable_bundled_sources: default_true(),
+            merge_works: default_true(),
             subtitle_language: None,
             default_volume: default_volume(),
         }
