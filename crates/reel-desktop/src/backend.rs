@@ -19,8 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use reel_catalog::{
-    ArchiveOrgBackend, CatalogCache, CatalogEntry, Metadata, MetadataProvider, SearchAggregator,
-    SearchResults, WatchHistory, WatchProgress, default_data_dir, provider_from_key,
+    ArchiveOrgBackend, CatalogCache, CatalogEntry, FileInput, LookupQuery, Metadata,
+    MetadataProvider, Release, SearchAggregator, SearchResults, WatchHistory, WatchProgress,
+    analyse, default_data_dir, provider_from_key,
 };
 use reel_core::model::TorrentView;
 use reel_core::title::clean_title;
@@ -137,17 +138,22 @@ pub trait Backend {
     /// stop being requested.
     fn set_only_files(&self, id: usize, files: &[usize]);
 
-    /// Remember how far through a torrent playback got.
+    /// Remember how far through one file of a torrent playback got.
+    ///
+    /// Per file, not per torrent: a series is one torrent with many episodes,
+    /// and one position for all of them would resume episode one at episode
+    /// two's timestamp.
     fn record_watch(
         &self,
         info_hash: &str,
+        file_id: usize,
         file_name: Option<String>,
         title: Option<String>,
         position: f64,
         duration: Option<f64>,
     );
-    fn mark_finished(&self, info_hash: &str, title: Option<String>);
-    fn forget_watch(&self, info_hash: &str);
+    fn mark_finished(&self, info_hash: &str, file_id: usize, title: Option<String>);
+    fn forget_watch(&self, info_hash: &str, file_id: usize);
 
     /// Start a search. Results arrive as [`BackendEvent::SearchResults`].
     fn search(&self, query: &str);
@@ -381,25 +387,28 @@ impl EngineBackend {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(key.clone());
 
-            to_start.push((key, torrent.name.clone()));
+            to_start.push((key, torrent.clone()));
         }
 
-        for (info_hash, name) in to_start {
-            self.spawn_lookup(info_hash, name);
+        for (info_hash, torrent) in to_start {
+            self.spawn_lookup(info_hash, torrent);
         }
     }
 
-    fn spawn_lookup(&self, info_hash: String, name: Option<String>) {
+    fn spawn_lookup(&self, info_hash: String, torrent: TorrentView) {
         let provider = self.catalog.provider.clone();
         let state = self.catalog.clone();
         let events = self.events.clone();
 
         self.runtime.spawn(async move {
-            // The same cleaner the UI uses, so the provider sees a title rather
-            // than a filename.
-            let query = reel_catalog::LookupQuery::from_release_name(
-                name.as_deref().unwrap_or(&info_hash),
-            );
+            // The torrent's own names decide what this is, so the provider is
+            // asked about a film or a series and, for a series, which season.
+            let release = analyse_torrent(&torrent);
+            let query = if release.title.is_empty() {
+                LookupQuery::from_release_name(&info_hash)
+            } else {
+                LookupQuery::from_release(&release)
+            };
 
             let result = provider.lookup(query).await;
 
@@ -439,7 +448,12 @@ impl EngineBackend {
     }
 
     fn entry_for(&self, torrent: &TorrentView) -> LibraryItem {
-        let (display_title, year) = display_title_for(torrent);
+        let release = analyse_torrent(torrent);
+        let (display_title, year) = if release.title.is_empty() {
+            display_title_for(torrent)
+        } else {
+            (release.title.clone(), release.year)
+        };
 
         let metadata = self
             .catalog
@@ -449,13 +463,10 @@ impl EngineBackend {
             .get(&torrent.info_hash)
             .cloned();
 
-        let watch = self
-            .catalog
-            .history
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&torrent.info_hash)
-            .cloned();
+        let history = self.catalog.history.lock().unwrap_or_else(|e| e.into_inner());
+        let watch_by_file = history.per_file(&torrent.info_hash);
+        let watch = history.get(&torrent.info_hash).cloned();
+        drop(history);
 
         LibraryItem {
             torrent: torrent.clone(),
@@ -466,9 +477,24 @@ impl EngineBackend {
                 year,
                 metadata,
                 watch,
+                release,
+                watch_by_file,
             },
         }
     }
+}
+
+/// Parse a torrent's file names into a film-or-series judgement.
+///
+/// Only video files are considered: a subtitle or an `.nfo` should not be able
+/// to change what the torrent is.
+pub(crate) fn analyse_torrent(torrent: &TorrentView) -> Release {
+    let files: Vec<FileInput> = torrent
+        .files
+        .iter()
+        .map(|file| FileInput::new(file.id, file.path.clone(), file.length))
+        .collect();
+    analyse(&files)
 }
 
 /// What to call a torrent in the UI.
@@ -546,6 +572,9 @@ impl Backend for EngineBackend {
         self.runtime.spawn(async move {
             let options = AddOptions {
                 media_only,
+                // A season pack should wait until an episode is chosen; a film
+                // has nothing to choose, so it starts on its own.
+                pause_multi_file: true,
                 ..Default::default()
             };
             let result = match AddSource::detect(&source) {
@@ -626,13 +655,14 @@ impl Backend for EngineBackend {
     fn record_watch(
         &self,
         info_hash: &str,
+        file_id: usize,
         file_name: Option<String>,
         title: Option<String>,
         position: f64,
         duration: Option<f64>,
     ) {
         let mut history = self.catalog.history.lock().unwrap_or_else(|e| e.into_inner());
-        if let Err(e) = history.record(info_hash, file_name, title, position, duration) {
+        if let Err(e) = history.record_file(info_hash, file_id, file_name, title, position, duration) {
             tracing::warn!(error = %e, "could not record watch position");
             return;
         }
@@ -654,9 +684,9 @@ impl Backend for EngineBackend {
         }
     }
 
-    fn mark_finished(&self, info_hash: &str, title: Option<String>) {
+    fn mark_finished(&self, info_hash: &str, file_id: usize, title: Option<String>) {
         let mut history = self.catalog.history.lock().unwrap_or_else(|e| e.into_inner());
-        if let Err(e) = history.mark_finished(info_hash, None, title) {
+        if let Err(e) = history.mark_file_finished(info_hash, file_id, None, title) {
             tracing::warn!(error = %e, "could not mark as finished");
             return;
         }
@@ -664,9 +694,9 @@ impl Backend for EngineBackend {
         self.push(BackendEvent::WatchUpdated);
     }
 
-    fn forget_watch(&self, info_hash: &str) {
+    fn forget_watch(&self, info_hash: &str, file_id: usize) {
         let mut history = self.catalog.history.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = history.forget(info_hash);
+        let _ = history.forget_file(info_hash, file_id);
         drop(history);
         self.push(BackendEvent::WatchUpdated);
     }
@@ -907,6 +937,7 @@ impl Backend for FakeBackend {
     fn record_watch(
         &self,
         info_hash: &str,
+        file_id: usize,
         file_name: Option<String>,
         _title: Option<String>,
         position: f64,
@@ -914,33 +945,46 @@ impl Backend for FakeBackend {
     ) {
         let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(item) = items.iter_mut().find(|i| i.entry.info_hash == info_hash) {
-            item.entry.watch = Some(WatchProgress {
+            let progress = WatchProgress {
                 position,
                 duration,
                 updated_at: now_unix(),
                 file_name,
                 title: None,
-            });
+            };
+            item.entry.watch_by_file.insert(file_id, progress.clone());
+            item.entry.watch = Some(progress);
         }
     }
 
-    fn mark_finished(&self, info_hash: &str, _title: Option<String>) {
+    fn mark_finished(&self, info_hash: &str, file_id: usize, _title: Option<String>) {
         let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(item) = items.iter_mut().find(|i| i.entry.info_hash == info_hash) {
-            let duration = item.entry.watch.as_ref().and_then(|w| w.duration).unwrap_or(100.0);
-            item.entry.watch = Some(WatchProgress {
+            let duration = item
+                .entry
+                .watch_by_file
+                .get(&file_id)
+                .and_then(|w| w.duration)
+                .or_else(|| item.entry.watch.as_ref().and_then(|w| w.duration))
+                .unwrap_or(100.0);
+            let progress = WatchProgress {
                 position: duration,
                 duration: Some(duration),
                 updated_at: now_unix(),
                 file_name: None,
                 title: None,
-            });
+            };
+            item.entry.watch_by_file.insert(file_id, progress.clone());
+            // The torrent-level record is what "continue watching" reads, and
+            // the real backend derives it from the newest per-file entry.
+            item.entry.watch = Some(progress);
         }
     }
 
-    fn forget_watch(&self, info_hash: &str) {
+    fn forget_watch(&self, info_hash: &str, file_id: usize) {
         let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(item) = items.iter_mut().find(|i| i.entry.info_hash == info_hash) {
+            item.entry.watch_by_file.remove(&file_id);
             item.entry.watch = None;
         }
     }

@@ -284,7 +284,17 @@ fn snapshot_season_pack() {
     let mut items = sample_library();
     items.push(reel_desktop::testing::sample_season_pack());
 
-    let mut harness = harness_with(App::new(Box::new(FakeBackend::new(items))));
+    // Taller than the default so the whole episode list is in the snapshot; the
+    // point of this one is that every episode row is visible at once.
+    let mut harness = Harness::builder()
+        .with_size((1280.0, 1150.0))
+        .build_ui_state(
+            |ui, app: &mut App| {
+                let mut frame = eframe::Frame::_new_kittest();
+                eframe::App::ui(app, ui, &mut frame);
+            },
+            App::new(Box::new(FakeBackend::new(items))),
+        );
     harness.run_steps(3);
 
     // What pressing play on episode 2 does.

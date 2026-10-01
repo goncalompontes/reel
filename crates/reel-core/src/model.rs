@@ -170,6 +170,9 @@ pub struct AddRequest {
     /// Peers to connect to immediately, e.g. `["127.0.0.1:51413"]`.
     #[serde(default)]
     pub initial_peers: Option<Vec<String>>,
+    /// Hold the torrent until a file is chosen, when it holds more than one.
+    #[serde(default)]
+    pub pause_multi_file: Option<bool>,
     /// Upload cap in bytes per second.
     #[serde(default)]
     pub upload_limit_bps: Option<u32>,
@@ -184,6 +187,10 @@ pub struct AddOutcome {
     pub torrent: TorrentView,
     /// `false` when the torrent was already known to the session.
     pub was_new: bool,
+    /// `true` when the torrent was held back because it holds more than one
+    /// playable file, so the user can choose what to fetch.
+    #[serde(default)]
+    pub paused_for_selection: bool,
 }
 
 #[cfg(test)]

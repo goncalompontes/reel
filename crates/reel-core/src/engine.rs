@@ -120,6 +120,16 @@ pub struct AddOptions {
     pub upload_limit_bps: Option<u32>,
     /// Cap download for this torrent, in bytes per second.
     pub download_limit_bps: Option<u32>,
+    /// Pause after adding when the torrent turns out to hold more than one
+    /// playable file.
+    ///
+    /// A season pack is a library, not a download: fetching every episode
+    /// because someone opened episode three is the wrong default. A single-file
+    /// torrent is left running, because there is nothing to choose.
+    ///
+    /// Off by default: the CLI is also used for seeding, where pausing would be
+    /// exactly wrong.
+    pub pause_multi_file: bool,
 }
 
 impl Default for AddOptions {
@@ -132,6 +142,7 @@ impl Default for AddOptions {
             allow_overwrite: false,
             upload_limit_bps: None,
             download_limit_bps: None,
+            pause_multi_file: false,
         }
     }
 }
@@ -281,9 +292,23 @@ impl Engine {
             }
         };
 
+        let mut view = self.view(id)?;
+        let mut paused_for_selection = false;
+
+        if opts.pause_multi_file && !opts.paused {
+            let playable = view.files.iter().filter(|f| f.included).count();
+            if playable > 1 {
+                self.pause(id).await?;
+                view = self.view(id)?;
+                paused_for_selection = true;
+                tracing::info!(id, playable, "added paused: more than one file to choose from");
+            }
+        }
+
         Ok(AddOutcome {
-            torrent: self.view(id)?,
+            torrent: view,
             was_new,
+            paused_for_selection,
         })
     }
 

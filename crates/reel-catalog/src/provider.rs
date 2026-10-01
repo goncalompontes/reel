@@ -11,6 +11,7 @@ use crate::cache::CatalogCache;
 use crate::error::CatalogError;
 use crate::matching::LookupQuery;
 use crate::model::{ArtworkKind, ArtworkSize, Candidate, Metadata};
+use crate::release::MediaKind;
 use crate::search::BoxFuture;
 use crate::tmdb::TmdbClient;
 
@@ -90,17 +91,134 @@ impl TmdbProvider {
             return Ok(Some(cached));
         }
 
-        let Some(mut metadata) = self.client.resolve(&query).await? else {
+        let found = match query.kind {
+            MediaKind::Series => self.resolve_series(&query).await?,
+            // A film, or a torrent too ambiguous to call: the film catalogue is
+            // the better guess, and matching will reject a bad one anyway.
+            _ => self.client.resolve(&query).await?,
+        };
+
+        let Some(mut metadata) = found else {
             return Ok(None);
         };
 
         self.ensure_artwork(&mut metadata).await;
+        self.ensure_stills(&mut metadata, &query).await;
         let _ = self.cache.write_metadata(&metadata);
         let _ = self
             .cache
             .write_metadata_at("index", &index_key, &metadata);
 
         Ok(Some(metadata))
+    }
+
+    /// A series needs three calls: find it, read it, then read the season the
+    /// torrent actually holds.
+    async fn resolve_series(&self, query: &LookupQuery) -> Result<Option<Metadata>, CatalogError> {
+        let candidates = self.client.search_tv(&query.title, query.year).await?;
+        let Some((chosen, score)) = crate::matching::best(query, &candidates) else {
+            tracing::debug!(
+                title = %query.title,
+                ?query.year,
+                considered = candidates.len(),
+                "no series candidate scored high enough"
+            );
+            return Ok(None);
+        };
+
+        let id: u64 = chosen.source_id.parse().map_err(|_| {
+            CatalogError::Decode(format!("non-numeric tmdb id {}", chosen.source_id))
+        })?;
+
+        tracing::debug!(
+            title = %query.title,
+            matched = %chosen.title,
+            ?score,
+            season = ?query.season,
+            "matched series candidate"
+        );
+
+        let mut metadata = self.client.tv(id).await?;
+        metadata.popularity = chosen.popularity;
+
+        // Without a season we know the show but not which episodes the torrent
+        // holds; the interface falls back to listing files.
+        if let Some(season) = query.season {
+            match self.client.tv_season(id, season).await {
+                Ok(episodes) => metadata.episodes = episodes,
+                Err(e) => {
+                    tracing::debug!(season, error = %e, "could not read the season");
+                }
+            }
+        }
+
+        Ok(Some(metadata))
+    }
+
+    /// Download thumbnails for the episodes the torrent holds, and only those:
+    /// a season can be twenty-odd images and a torrent usually has a handful.
+    async fn ensure_stills(&self, metadata: &mut Metadata, query: &LookupQuery) {
+        if query.episodes.is_empty() {
+            return;
+        }
+        let source = metadata.source.clone();
+        let series_id = metadata.source_id.clone();
+
+        let wanted: Vec<(u32, u32)> = metadata
+            .episodes
+            .iter()
+            .filter(|episode| query.episodes.contains(&episode.number))
+            .map(|episode| (episode.season, episode.number))
+            .collect();
+
+        for (season, number) in wanted {
+            let Some(path) = metadata
+                .episode(season, number)
+                .and_then(|e| e.still.as_ref())
+                .map(|still| still.remote_path.clone())
+            else {
+                continue;
+            };
+
+            let key = format!("{series_id}-s{season}e{number}");
+            if let Some(existing) =
+                self.cache
+                    .cached_artwork(&source, &key, ArtworkKind::Poster, ArtworkSize::Card)
+            {
+                if let Some(still) = metadata
+                    .episodes
+                    .iter_mut()
+                    .find(|e| e.season == season && e.number == number)
+                    .and_then(|e| e.still.as_mut())
+                {
+                    still.local_path = Some(existing);
+                }
+                continue;
+            }
+
+            let url = self.client.still_url(&path, ArtworkSize::Card);
+            match self.download(&url).await {
+                Ok(bytes) => {
+                    match self
+                        .cache
+                        .store_artwork(&source, &key, ArtworkKind::Poster, ArtworkSize::Card, &bytes)
+                    {
+                        Ok(saved) => {
+                            if let Some(still) = metadata
+                                .episodes
+                                .iter_mut()
+                                .find(|e| e.season == season && e.number == number)
+                                .and_then(|e| e.still.as_mut())
+                            {
+                                still.local_path = Some(saved);
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "could not cache an episode still"),
+                    }
+                }
+                Err(e) => tracing::debug!(url = %url, error = %e, "still download failed"),
+            }
+        }
     }
 
     /// Download the poster and backdrop if they are not already cached, and
@@ -167,6 +285,17 @@ impl TmdbProvider {
     /// Re-point artwork references at files that exist right now.
     fn attach_cached_artwork(&self, metadata: &mut Metadata) {
         let (source, id) = (metadata.source.clone(), metadata.source_id.clone());
+
+        // Episode stills, if this is a series.
+        for episode in metadata.episodes.iter_mut() {
+            let key = format!("{id}-s{}e{}", episode.season, episode.number);
+            let found = self
+                .cache
+                .cached_artwork(&source, &key, ArtworkKind::Poster, ArtworkSize::Card);
+            if let Some(still) = episode.still.as_mut() {
+                still.local_path = found;
+            }
+        }
         for (kind, size) in [
             (ArtworkKind::Poster, ArtworkSize::Card),
             (ArtworkKind::Backdrop, ArtworkSize::Hero),
@@ -273,11 +402,21 @@ impl MetadataProvider for StaticProvider {
 }
 
 /// Cache key for a title lookup. A plain, filesystem-safe slug.
+///
+/// Includes the kind and season: the same title can be both a film and a series,
+/// and two seasons of one series are different lookups.
 fn query_index_key(query: &LookupQuery) -> String {
     let title = crate::matching::normalize(&query.title).replace(' ', "-");
-    match query.year {
-        Some(year) => format!("{title}-{year}"),
-        None => title,
+    let kind = match query.kind {
+        MediaKind::Series => "series-",
+        MediaKind::Movie => "movie-",
+        MediaKind::Unknown => "unknown-",
+    };
+    match (query.year, query.season) {
+        (Some(year), Some(season)) => format!("{kind}{title}-{year}-s{season}"),
+        (Some(year), None) => format!("{kind}{title}-{year}"),
+        (None, Some(season)) => format!("{kind}{title}-s{season}"),
+        (None, None) => format!("{kind}{title}"),
     }
 }
 
@@ -340,6 +479,27 @@ mod tests {
         assert!(!key.contains('/'), "{key}");
         assert!(!key.contains(' '), "{key}");
         assert!(key.ends_with("-2001"), "{key}");
-        assert_eq!(query_index_key(&LookupQuery::new("The Matrix", None)), "matrix");
+    }
+
+    #[test]
+    fn index_keys_separate_the_things_that_are_actually_different() {
+        let film = LookupQuery::new("Fargo", Some(1996));
+        let series = LookupQuery {
+            kind: MediaKind::Series,
+            ..LookupQuery::new("Fargo", Some(2014))
+        };
+        // Same title, different medium: different cache entries, or one would
+        // serve the other's metadata.
+        assert_ne!(query_index_key(&film), query_index_key(&series));
+
+        // Two seasons of one series are different lookups.
+        let s1 = LookupQuery {
+            kind: MediaKind::Series,
+            season: Some(1),
+            ..LookupQuery::new("Some Show", None)
+        };
+        let s2 = LookupQuery { season: Some(2), ..s1.clone() };
+        assert_ne!(query_index_key(&s1), query_index_key(&s2));
+        assert!(query_index_key(&s1).contains("s1"), "{}", query_index_key(&s1));
     }
 }

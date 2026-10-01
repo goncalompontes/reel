@@ -180,6 +180,7 @@ impl App {
 
         let info = PlaybackInfo {
             torrent_id,
+            file_id,
             info_hash: item.entry.info_hash.clone(),
             title: item.heading(),
             file_name: file.name.clone(),
@@ -374,6 +375,7 @@ impl App {
         self.watch_last_recorded = state.position;
         self.backend.record_watch(
             &info_hash,
+            info.as_ref().map(|i| i.file_id).unwrap_or(0),
             info.as_ref().map(|i| i.file_name.clone()),
             info.as_ref().map(|i| i.title.clone()),
             state.position,
@@ -1145,10 +1147,11 @@ impl App {
                     }
                 }
 
-                if let Some(hash) = Some(item.entry.info_hash.clone()) {
-                    if ui.button("Mark watched").clicked() {
-                        action = Some(DetailAction::MarkWatched(hash));
-                    }
+                if ui.button("Mark watched").clicked() {
+                    action = Some(DetailAction::MarkWatched(
+                        item.entry.info_hash.clone(),
+                        item.torrent.primary_file_id.unwrap_or(0),
+                    ));
                 }
 
                 let pause_label = if item.torrent.stats.is_paused() {
@@ -1216,125 +1219,16 @@ impl App {
             ui.separator();
             ui.add_space(10.0);
 
-            ui.label(
-                egui::RichText::new(format!("Files ({})", item.torrent.files.len()))
-                    .size(16.0)
-                    .strong(),
-            );
-            ui.add_space(6.0);
-
-            // Which files are fetched is the user's choice, and for a season
-            // pack it is the difference between one episode and all of them.
-            let included: Vec<usize> = item
-                .torrent
-                .files
-                .iter()
-                .filter(|f| f.included)
-                .map(|f| f.id)
-                .collect();
-            let narrowed = included.len() < item.torrent.files.len();
-
-            if narrowed {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Fetching {} of {} files",
-                            included.len(),
-                            item.torrent.files.len()
-                        ))
-                        .size(12.0)
-                        .color(theme::ACCENT),
-                    );
-                    if ui.small_button("Fetch every file").clicked() {
-                        action = Some(DetailAction::FetchAll(
-                            item.torrent.files.iter().map(|f| f.id).collect(),
-                        ));
-                    }
-                });
-                ui.add_space(6.0);
+            // A series is episodes; a film is a file. Showing a film's file list
+            // is fine. Showing one for a series means asking the user to read
+            // release names to find episode three.
+            if item.entry.is_series() {
+                self.episode_list(ui, &item, &mut action);
+            } else {
+                self.file_list(ui, &item, &mut action);
             }
 
-            for file in &item.torrent.files {
-                ui.horizontal(|ui| {
-                    let icon = if file.is_video {
-                        "\u{1f3ac}"
-                    } else if file.is_audio {
-                        "\u{1f3b5}"
-                    } else if file.is_subtitle {
-                        "\u{1f4ac}"
-                    } else {
-                        "\u{1f4c4}"
-                    };
-
-                    // Toggling the last remaining file off would leave the
-                    // torrent with nothing to fetch, so that one is locked.
-                    let mut wanted = file.included;
-                    let response = ui.add_enabled(
-                        !(file.included && included.len() == 1),
-                        egui::Checkbox::without_text(&mut wanted),
-                    );
-                    if response.changed() {
-                        let mut next: Vec<usize> = included.clone();
-                        if wanted {
-                            next.push(file.id);
-                            next.sort_unstable();
-                        } else {
-                            next.retain(|id| *id != file.id);
-                        }
-                        action = Some(DetailAction::SelectFiles(next));
-                    }
-
-                    ui.label(icon);
-                    ui.label(
-                        egui::RichText::new(reel_core::title::truncate(&file.path, 56)).color(
-                            if file.included {
-                                theme::TEXT
-                            } else {
-                                theme::TEXT_DIM
-                            },
-                        ),
-                    );
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if media::is_media_file(&file.name) && ui.small_button("Play").clicked() {
-                            action = Some(DetailAction::Play(file.id));
-                        }
-                        ui.label(
-                            egui::RichText::new(fmt::human_bytes(file.length))
-                                .color(theme::TEXT_DIM),
-                        );
-                        // Per-file progress: the reason to show it is that a
-                        // season pack should be fetching exactly one episode.
-                        if file.included && file.progress_bytes > 0 {
-                            let percent =
-                                (file.progress_bytes as f64 / file.length.max(1) as f64) * 100.0;
-                            ui.label(
-                                egui::RichText::new(format!("{percent:.0}%"))
-                                    .size(11.0)
-                                    .color(theme::OK),
-                            );
-                        } else if !file.included {
-                            ui.label(egui::RichText::new("not fetching").color(theme::WARN).size(11.0));
-                        }
-                    });
-                });
-                ui.separator();
-            }
-
-            ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new(format!(
-                    "Stored in {}{}",
-                    item.torrent.output_folder,
-                    item.entry
-                        .metadata
-                        .as_ref()
-                        .map(|m| format!("   \u{2022}   matched on {}", m.source))
-                        .unwrap_or_default()
-                ))
-                .color(theme::TEXT_DIM)
-                .size(11.0),
-            );
+            self.storage_line(ui, &item);
         });
 
         match action {
@@ -1344,9 +1238,9 @@ impl App {
             Some(DetailAction::SelectFiles(files)) | Some(DetailAction::FetchAll(files)) => {
                 self.select_files(item.torrent.id, &files);
             }
-            Some(DetailAction::MarkWatched(hash)) => {
+            Some(DetailAction::MarkWatched(hash, file_id)) => {
                 self.backend
-                    .mark_finished(&hash, Some(item.entry.title()));
+                    .mark_finished(&hash, file_id, Some(item.entry.title()));
                 self.refresh();
             }
             Some(DetailAction::Play(file_id)) => {
@@ -1357,7 +1251,7 @@ impl App {
                 }
             }
             Some(DetailAction::PlayFrom(file_id, position)) => {
-                self.backend.forget_watch(item.info_hash());
+                self.backend.forget_watch(item.info_hash(), file_id);
                 self.refresh();
                 let ctx = self.pending_ctx.clone();
                 if let Some(ctx) = ctx {
@@ -1370,13 +1264,370 @@ impl App {
             None => {}
         }
     }
+    /// The film view: the files themselves.
+    /// The film view: the files themselves.
+    ///
+    /// A film is one video and possibly some extras, so a plain list is the
+    /// honest presentation. The file-selection controls still apply, because a
+    /// film release often carries a sample that should not be fetched.
+    fn file_list(&mut self, ui: &mut egui::Ui, item: &LibraryItem, action: &mut Option<DetailAction>) {
+        let included: Vec<usize> = item
+            .torrent
+            .files
+            .iter()
+            .filter(|f| f.included)
+            .map(|f| f.id)
+            .collect();
+        let narrowed = included.len() < item.torrent.files.len();
+
+        ui.label(
+            egui::RichText::new(format!("Files ({})", item.torrent.files.len()))
+                .size(16.0)
+                .strong(),
+        );
+        ui.add_space(6.0);
+
+        if narrowed {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Fetching {} of {} files",
+                        included.len(),
+                        item.torrent.files.len()
+                    ))
+                    .size(12.0)
+                    .color(theme::ACCENT),
+                );
+                if ui.small_button("Fetch every file").clicked() {
+                    *action = Some(DetailAction::FetchAll(
+                        item.torrent.files.iter().map(|f| f.id).collect(),
+                    ));
+                }
+            });
+            ui.add_space(6.0);
+        }
+
+        for file in &item.torrent.files {
+            ui.horizontal(|ui| {
+                let icon = if file.is_video {
+                    "\u{1f3ac}"
+                } else if file.is_audio {
+                    "\u{1f3b5}"
+                } else if file.is_subtitle {
+                    "\u{1f4ac}"
+                } else {
+                    "\u{1f4c4}"
+                };
+
+                // Un-ticking the last remaining file would leave the torrent
+                // with nothing to fetch, so that one is locked on.
+                let mut wanted = file.included;
+                let toggle = ui.add_enabled(
+                    !(file.included && included.len() == 1),
+                    egui::Checkbox::without_text(&mut wanted),
+                );
+                if toggle.changed() {
+                    let mut next = included.clone();
+                    if wanted {
+                        next.push(file.id);
+                        next.sort_unstable();
+                    } else {
+                        next.retain(|id| *id != file.id);
+                    }
+                    *action = Some(DetailAction::SelectFiles(next));
+                }
+
+                ui.label(icon);
+                ui.label(
+                    egui::RichText::new(reel_core::title::truncate(&file.path, 56)).color(
+                        if file.included { theme::TEXT } else { theme::TEXT_DIM },
+                    ),
+                );
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if media::is_media_file(&file.name) && ui.small_button("Play").clicked() {
+                        *action = Some(DetailAction::Play(file.id));
+                    }
+                    ui.label(
+                        egui::RichText::new(fmt::human_bytes(file.length)).color(theme::TEXT_DIM),
+                    );
+                    if file.included && file.progress_bytes > 0 {
+                        let percent =
+                            (file.progress_bytes as f64 / file.length.max(1) as f64) * 100.0;
+                        ui.label(
+                            egui::RichText::new(format!("{percent:.0}%"))
+                                .size(11.0)
+                                .color(theme::OK),
+                        );
+                    } else if !file.included {
+                        ui.label(
+                            egui::RichText::new("not fetching")
+                                .color(theme::WARN)
+                                .size(11.0),
+                        );
+                    }
+                });
+            });
+            ui.separator();
+        }
+
+    }
+
+
+    /// What is stored where, shown under either view.
+    fn storage_line(&self, ui: &mut egui::Ui, item: &LibraryItem) {
+        ui.add_space(6.0);
+        let mut facts = vec![item.torrent.output_folder.clone()];
+        if let Some(metadata) = item.entry.metadata.as_ref() {
+            facts.push(format!("matched on {}", metadata.source));
+        }
+        let attributes = item.entry.attributes().summary();
+        if !attributes.is_empty() {
+            facts.push(attributes.join(" "));
+        }
+        ui.label(
+            egui::RichText::new(facts.join("   \u{2022}   "))
+                .color(theme::TEXT_DIM)
+                .size(11.0),
+        );
+    }
+
+    /// The series view: one row per episode, joined to the file that holds it.
+    fn episode_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        item: &LibraryItem,
+        action: &mut Option<DetailAction>,
+    ) {
+        let metadata = item.entry.metadata.as_ref();
+        let release = &item.entry.release;
+
+        let included: Vec<usize> = item
+            .torrent
+            .files
+            .iter()
+            .filter(|f| f.included)
+            .map(|f| f.id)
+            .collect();
+
+        // Header: what this is, and how much of the season is here.
+        let season = release.season;
+        let mut heading = match (season, metadata.map(|m| m.title.clone())) {
+            (Some(season), Some(title)) => format!("{title} \u{2014} Season {season}"),
+            (Some(season), None) => format!("Season {season}"),
+            (None, Some(title)) => title,
+            (None, None) => "Episodes".to_string(),
+        };
+        let numbered = release.episode_numbers().len();
+        if numbered > 0 {
+            heading.push_str(&format!("  \u{2022}  {numbered} episode{}", if numbered == 1 { "" } else { "s" }));
+        } else if release.is_season_pack {
+            heading.push_str("  \u{2022}  season pack");
+        }
+        if let Some(count) = metadata.and_then(|m| m.season_count) {
+            if count > 1 {
+                heading.push_str(&format!("  \u{2022}  {count} seasons"));
+            }
+        }
+
+        ui.label(egui::RichText::new(heading).size(16.0).strong());
+        ui.add_space(2.0);
+        if let Some(overview) = metadata.and_then(|m| m.overview.as_deref()) {
+            ui.label(
+                egui::RichText::new(reel_core::title::truncate(overview, 160))
+                    .size(12.0)
+                    .color(theme::TEXT_DIM),
+            );
+        }
+        ui.add_space(8.0);
+
+        let narrowed = included.len() < item.torrent.files.len();
+        if narrowed {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Fetching {} of {} files",
+                        included.len(),
+                        item.torrent.files.len()
+                    ))
+                    .size(12.0)
+                    .color(theme::ACCENT),
+                );
+                if ui.small_button("Fetch every episode").clicked() {
+                    *action = Some(DetailAction::FetchAll(
+                        item.torrent.files.iter().map(|f| f.id).collect(),
+                    ));
+                }
+            });
+            ui.add_space(6.0);
+        }
+
+        // One row per video file, ordered by episode number.
+        let mut rows: Vec<(Option<u32>, &reel_catalog::release::EpisodeFile)> = release
+            .episodes
+            .iter()
+            .filter(|e| !e.extra)
+            .map(|e| (e.episode, e))
+            .collect();
+        rows.sort_by_key(|(number, file)| (number.is_none(), number.unwrap_or(u32::MAX), file.file_id));
+
+        for (number, episode_file) in rows {
+            let file = item.torrent.files.iter().find(|f| f.id == episode_file.file_id);
+            let (length, progress, is_included) = file
+                .map(|f| (f.length, f.progress_bytes, f.included))
+                .unwrap_or((episode_file.length, 0, false));
+
+            let info = match (release.season, number) {
+                (Some(season), Some(number)) => metadata.and_then(|m| m.episode(season, number)),
+                _ => None,
+            };
+
+            let watched = item.entry.watch_for_file(episode_file.file_id);
+
+            egui::Frame::NONE
+                .fill(theme::SURFACE)
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .corner_radius(theme::CARD_RADIUS)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        // Thumbnail, when the provider gave us one.
+                        let (thumb, _) = ui.allocate_exact_size(Vec2::new(96.0, 54.0), Sense::hover());
+                        if let Some(uri) = info.and_then(|i| i.still_uri()) {
+                            egui::Image::new(uri)
+                                .corner_radius(CornerRadius::same(4))
+                                .paint_at(ui, thumb);
+                        } else {
+                            ui.painter().rect_filled(thumb, CornerRadius::same(4), theme::SURFACE_RAISED);
+                            ui.painter().text(
+                                thumb.center(),
+                                egui::Align2::CENTER_CENTER,
+                                number
+                                    .map(|n| format!("E{n:02}"))
+                                    .unwrap_or_else(|| "?".to_string()),
+                                egui::FontId::proportional(14.0),
+                                theme::TEXT_DIM,
+                            );
+                        }
+
+                        ui.add_space(6.0);
+                        ui.vertical(|ui| {
+                            let code = match (release.season, number) {
+                                (Some(season), Some(number)) => format!("S{season:02}E{number:02}"),
+                                (_, Some(number)) => format!("Episode {number}"),
+                                _ => reel_core::title::truncate(&episode_file.path, 40),
+                            };
+                            let title = info
+                                .and_then(|i| i.name.clone())
+                                .unwrap_or_else(|| "(no title found)".to_string());
+                            ui.label(
+                                egui::RichText::new(format!("{code}  {title}"))
+                                    .size(13.5)
+                                    .strong(),
+                            );
+
+                            let mut facts = Vec::new();
+                            if let Some(runtime) = info.and_then(|i| i.runtime_minutes) {
+                                facts.push(format!("{runtime}m"));
+                            }
+                            if let Some(air) = info.and_then(|i| i.air_date.as_deref()) {
+                                facts.push(air.to_string());
+                            }
+                            facts.push(fmt::human_bytes(length));
+                            if let Some(position) = watched.map(|w| w.position) {
+                                if !watched.is_some_and(|w| w.is_finished()) {
+                                    facts.push(format!("resume {}", fmt::human_duration(position)));
+                                } else {
+                                    facts.push("watched".to_string());
+                                }
+                            }
+                            ui.label(
+                                egui::RichText::new(facts.join("   \u{2022}   "))
+                                    .size(11.0)
+                                    .color(theme::TEXT_DIM),
+                            );
+                        });
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Play").clicked() {
+                                *action = Some(DetailAction::Play(episode_file.file_id));
+                            }
+                            if is_included && progress > 0 {
+                                let percent = (progress as f64 / length.max(1) as f64) * 100.0;
+                                ui.label(
+                                    egui::RichText::new(format!("{percent:.0}%"))
+                                        .size(11.0)
+                                        .color(theme::OK),
+                                );
+                            } else if !is_included {
+                                ui.label(
+                                    egui::RichText::new("not fetching")
+                                        .size(11.0)
+                                        .color(theme::WARN),
+                                );
+                            }
+
+                            let mut wanted = is_included;
+                            let toggle = ui.add_enabled(
+                                !(is_included && included.len() == 1),
+                                egui::Checkbox::without_text(&mut wanted),
+                            );
+                            if toggle.changed() {
+                                let mut next = included.clone();
+                                if wanted {
+                                    next.push(episode_file.file_id);
+                                    next.sort_unstable();
+                                } else {
+                                    next.retain(|id| *id != episode_file.file_id);
+                                }
+                                *action = Some(DetailAction::SelectFiles(next));
+                            }
+                        });
+                    });
+                });
+            ui.add_space(4.0);
+        }
+
+        // Extras and anything unnumbered, listed separately so they cannot be
+        // mistaken for episodes.
+        let leftovers: Vec<&reel_catalog::release::EpisodeFile> = release
+            .episodes
+            .iter()
+            .filter(|e| e.extra || e.episode.is_none())
+            .collect();
+        if !leftovers.is_empty() {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("Extras and other files")
+                    .size(13.0)
+                    .color(theme::TEXT_DIM),
+            );
+            for extra in leftovers {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(reel_core::title::truncate(&extra.path, 60))
+                            .size(12.0)
+                            .color(theme::TEXT_DIM),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(fmt::human_bytes(extra.length))
+                                .size(11.0)
+                                .color(theme::TEXT_DIM),
+                        );
+                    });
+                });
+            }
+        }
+
+    }
+
 }
 
 enum DetailAction {
     Navigate(Screen),
     SetPaused(bool),
     ConfirmRemove,
-    MarkWatched(String),
+    MarkWatched(String, usize),
     Play(usize),
     PlayFrom(usize, f64),
     /// Fetch exactly these files.
@@ -1433,6 +1684,7 @@ fn plural(count: usize, singular: &str) -> String {
         format!("{count} {singular}s")
     }
 }
+
 
 fn stat(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.vertical(|ui| {
@@ -1972,6 +2224,7 @@ impl App {
             if state.position >= 1.0 {
                 self.backend.record_watch(
                     &info_hash,
+                    info.as_ref().map(|i| i.file_id).unwrap_or(0),
                     info.as_ref().map(|i| i.file_name.clone()),
                     info.as_ref().map(|i| i.title.clone()),
                     state.position,
@@ -2153,7 +2406,7 @@ mod tests {
     fn marking_watched_removes_it_from_continue_watching() {
         let mut app = app();
         app.backend
-            .mark_finished("a3f1c0ffee1234567890abcdef1234567890abcd", None);
+            .mark_finished("a3f1c0ffee1234567890abcdef1234567890abcd", 0, None);
         app.refresh();
 
         let rows = app.row_titles();

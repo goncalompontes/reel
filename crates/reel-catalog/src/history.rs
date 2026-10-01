@@ -5,6 +5,28 @@
 //! plain JSON, small, and rewritten atomically.
 
 use std::collections::BTreeMap;
+
+/// Watch positions are stored per file: `<info hash>#<file id>`.
+///
+/// A series is one torrent with many episodes, and one position for the whole
+/// torrent would resume episode 1 at episode 2's timestamp. Entries without a
+/// `#` are the older format, still read so an existing history is not lost.
+const FILE_SEPARATOR: char = '#';
+
+fn file_key(info_hash: &str, file_id: usize) -> String {
+    format!("{info_hash}{FILE_SEPARATOR}{file_id}")
+}
+
+fn key_of(key: &str) -> &str {
+    match key.split_once(FILE_SEPARATOR) {
+        Some((hash, _)) => hash,
+        None => key,
+    }
+}
+
+fn file_id_of(key: &str) -> Option<usize> {
+    key.split_once(FILE_SEPARATOR)?.1.parse().ok()
+}
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -95,8 +117,30 @@ impl WatchHistory {
         self.entries.is_empty()
     }
 
+    /// The torrent's most recent position, for "continue watching".
     pub fn get(&self, info_hash: &str) -> Option<&WatchProgress> {
-        self.entries.get(info_hash)
+        // Prefer a per-file entry: it is the newer format.
+        self.entries
+            .iter()
+            .filter(|(key, _)| key_of(key) == info_hash)
+            .map(|(_, progress)| progress)
+            .max_by_key(|progress| progress.updated_at)
+    }
+
+    /// The position saved for one file of a torrent.
+    pub fn get_file(&self, info_hash: &str, file_id: usize) -> Option<&WatchProgress> {
+        self.entries
+            .get(&file_key(info_hash, file_id))
+            .or_else(|| if file_id == 0 { self.entries.get(info_hash) } else { None })
+    }
+
+    /// Every file of a torrent that has a saved position.
+    pub fn per_file(&self, info_hash: &str) -> BTreeMap<usize, WatchProgress> {
+        self.entries
+            .iter()
+            .filter(|(key, _)| key_of(key) == info_hash)
+            .filter_map(|(key, progress)| file_id_of(key).map(|id| (id, progress.clone())))
+            .collect()
     }
 
     /// Note that playback of `info_hash` reached `position`.
@@ -111,20 +155,42 @@ impl WatchHistory {
         position: f64,
         duration: Option<f64>,
     ) -> std::io::Result<()> {
+        self.record_file(info_hash, 0, file_name, title, position, duration)
+    }
+
+    /// Record a position for one file, so a series resumes the episode that was
+    /// actually being watched rather than applying one episode's timestamp to
+    /// another.
+    pub fn record_file(
+        &mut self,
+        info_hash: &str,
+        file_id: usize,
+        file_name: Option<String>,
+        title: Option<String>,
+        position: f64,
+        duration: Option<f64>,
+    ) -> std::io::Result<()> {
         if info_hash.is_empty() || !position.is_finite() || position < 1.0 {
             return Ok(());
         }
 
+        let key = file_key(info_hash, file_id);
         let duration = duration.filter(|d| d.is_finite() && *d > 0.0);
+        let previous = self.entries.get(&key).cloned();
         let progress = WatchProgress {
             position,
             duration,
             updated_at: now_unix(),
-            file_name: file_name.or_else(|| self.entries.get(info_hash).and_then(|p| p.file_name.clone())),
-            title: title.or_else(|| self.entries.get(info_hash).and_then(|p| p.title.clone())),
+            file_name: file_name.or_else(|| previous.as_ref().and_then(|p| p.file_name.clone())),
+            title: title.or_else(|| previous.as_ref().and_then(|p| p.title.clone())),
         };
 
-        self.entries.insert(info_hash.to_string(), progress);
+        self.entries.insert(key, progress);
+        // Keep the torrent-level record in step, for "continue watching" and
+        // for readers of the older format.
+        if file_id == 0 {
+            self.entries.remove(info_hash);
+        }
         self.save()
     }
 
@@ -135,9 +201,18 @@ impl WatchHistory {
         file_name: Option<String>,
         title: Option<String>,
     ) -> std::io::Result<()> {
+        self.mark_file_finished(info_hash, 0, file_name, title)
+    }
+
+    pub fn mark_file_finished(
+        &mut self,
+        info_hash: &str,
+        file_id: usize,
+        file_name: Option<String>,
+        title: Option<String>,
+    ) -> std::io::Result<()> {
         let duration = self
-            .entries
-            .get(info_hash)
+            .get_file(info_hash, file_id)
             .and_then(|p| p.duration)
             .filter(|d| *d > 0.0);
 
@@ -147,28 +222,52 @@ impl WatchHistory {
             .map(|d| (d * FINISHED_FRACTION).max(d - 1.0))
             .unwrap_or(FINISHED_FRACTION + 1.0);
 
-        self.record(info_hash, file_name, title, position.max(1.0), duration)
+        self.record_file(info_hash, file_id, file_name, title, position.max(1.0), duration)
     }
 
     pub fn forget(&mut self, info_hash: &str) -> std::io::Result<()> {
-        if self.entries.remove(info_hash).is_some() {
+        let before = self.entries.len();
+        self.entries.retain(|key, _| key_of(key) != info_hash);
+        if self.entries.len() != before {
             return self.save();
         }
         Ok(())
     }
 
-    /// Most recently watched first, optionally only those worth resuming.
-    pub fn recent(&self, limit: usize, only_resumable: bool) -> Vec<(&str, &WatchProgress)> {
-        let mut items: Vec<(&str, &WatchProgress)> = self
-            .entries
-            .iter()
-            .map(|(key, value)| (key.as_str(), value))
+    /// Forget one file's position, leaving the rest of the series alone.
+    pub fn forget_file(&mut self, info_hash: &str, file_id: usize) -> std::io::Result<()> {
+        if self.entries.remove(&file_key(info_hash, file_id)).is_some() {
+            return self.save();
+        }
+        Ok(())
+    }
+
+    /// Most recently watched first, one entry per torrent.
+    ///
+    /// A series stores a position per episode; "continue watching" wants the
+    /// torrent, so the newest of its files stands for it.
+    pub fn recent(&self, limit: usize, only_resumable: bool) -> Vec<(String, &WatchProgress)> {
+        let mut newest: BTreeMap<&str, &WatchProgress> = BTreeMap::new();
+        for (key, progress) in &self.entries {
+            let hash = key_of(key);
+            let keep = newest
+                .get(hash)
+                .map(|current| current.updated_at <= progress.updated_at)
+                .unwrap_or(true);
+            if keep {
+                newest.insert(hash, progress);
+            }
+        }
+
+        let mut items: Vec<(String, &WatchProgress)> = newest
+            .into_iter()
             .filter(|(_, progress)| !only_resumable || progress.is_resumable())
+            .map(|(hash, progress)| (hash.to_string(), progress))
             .collect();
         items.sort_by(|a, b| {
             b.1.updated_at
                 .cmp(&a.1.updated_at)
-                .then_with(|| a.0.cmp(b.0))
+                .then_with(|| a.0.cmp(&b.0))
         });
         items.truncate(limit);
         items
@@ -215,6 +314,57 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("reel-history-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir.join("history.json")
+    }
+
+    #[test]
+    fn each_episode_keeps_its_own_position() {
+        let mut history = WatchHistory::load(scratch("per-file"));
+
+        // One torrent, three episodes.
+        history
+            .record_file("show", 0, Some("e01.mkv".into()), None, 1200.0, Some(2800.0))
+            .unwrap();
+        history
+            .record_file("show", 1, Some("e02.mkv".into()), None, 300.0, Some(2800.0))
+            .unwrap();
+
+        assert_eq!(history.get_file("show", 0).unwrap().position, 1200.0);
+        assert_eq!(history.get_file("show", 1).unwrap().position, 300.0);
+        assert_eq!(history.get_file("show", 2), None);
+
+        // Finishing an episode must not disturb the other one.
+        history.mark_file_finished("show", 0, None, None).unwrap();
+        assert!(history.get_file("show", 0).unwrap().is_finished());
+        assert_eq!(history.get_file("show", 1).unwrap().position, 300.0);
+
+        // Continue watching is per torrent, and points at the newest episode.
+        let recent = history.recent(10, true);
+        assert_eq!(recent.len(), 1, "one row per torrent, not per episode");
+        assert_eq!(recent[0].0, "show");
+        assert_eq!(recent[0].1.position, 300.0);
+
+        // And only the finished episode is forgotten by a per-file forget.
+        history.forget_file("show", 0).unwrap();
+        assert_eq!(history.get_file("show", 0), None);
+        assert!(history.get_file("show", 1).is_some());
+    }
+
+    #[test]
+    fn an_older_history_without_file_ids_is_still_read() {
+        // A file written before positions were per-file.
+        let path = scratch("legacy");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            br#"{"version":1,"entries":{"legacyhash":{"position":900.0,"duration":1000.0,"updated_at":5,"file_name":"old.mkv"}}}"#,
+        )
+        .unwrap();
+
+        let history = WatchHistory::load(&path);
+        assert_eq!(history.get("legacyhash").unwrap().position, 900.0);
+        assert_eq!(history.get_file("legacyhash", 0).unwrap().position, 900.0);
+        assert_eq!(history.recent(5, false).len(), 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -285,16 +435,18 @@ mod tests {
         // updated_at has one-second granularity, so set it explicitly.
         {
             let entries = &mut history.entries;
-            entries.get_mut("old").unwrap().updated_at = 1_000;
-            entries.get_mut("finished").unwrap().updated_at = 4_000;
-            entries.get_mut("tiny").unwrap().updated_at = 5_000;
-            entries.get_mut("newest").unwrap().updated_at = 3_000;
+            for (hash, at) in [("old", 1_000), ("finished", 4_000), ("tiny", 5_000), ("newest", 3_000)] {
+                entries
+                    .get_mut(&file_key(hash, 0))
+                    .unwrap_or_else(|| panic!("{hash} should be recorded"))
+                    .updated_at = at;
+            }
         }
 
-        let all: Vec<&str> = history.recent(10, false).into_iter().map(|(k, _)| k).collect();
+        let all: Vec<String> = history.recent(10, false).into_iter().map(|(k, _)| k).collect();
         assert_eq!(all, ["tiny", "finished", "newest", "old"]);
 
-        let resumable: Vec<&str> = history.recent(10, true).into_iter().map(|(k, _)| k).collect();
+        let resumable: Vec<String> = history.recent(10, true).into_iter().map(|(k, _)| k).collect();
         assert_eq!(resumable, ["newest", "old"], "finished and unstarted are excluded");
 
         assert_eq!(history.recent(1, true).len(), 1);

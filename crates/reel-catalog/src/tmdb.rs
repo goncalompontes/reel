@@ -12,7 +12,8 @@ use serde_json::Value;
 
 use crate::error::CatalogError;
 use crate::matching::LookupQuery;
-use crate::model::{Artwork, ArtworkRef, ArtworkSize, Candidate, Metadata};
+use crate::model::{Artwork, ArtworkRef, ArtworkSize, Candidate, EpisodeInfo, Metadata};
+use crate::release::MediaKind;
 
 pub const DEFAULT_BASE_URL: &str = "https://api.themoviedb.org/3";
 pub const DEFAULT_IMAGE_BASE: &str = "https://image.tmdb.org/t/p";
@@ -223,6 +224,43 @@ impl TmdbClient {
         metadata.popularity = chosen.popularity;
         Ok(Some(metadata))
     }
+/// Search for a series. TMDB's TV endpoint spells the title `name`, not `title`,
+/// and the year `first_air_date_year`.
+pub async fn search_tv(
+    &self,
+    query: &str,
+    year: Option<u16>,
+) -> Result<Vec<Candidate>, CatalogError> {
+    let mut extra: Vec<(&str, String)> = vec![("query", query.to_string())];
+    if let Some(year) = year {
+        extra.push(("first_air_date_year", year.to_string()));
+    }
+    let body = self.get_json("search/tv", &extra).await?;
+    parse_tv_search(&body)
+}
+
+/// Details for one series.
+pub async fn tv(&self, id: u64) -> Result<Metadata, CatalogError> {
+    let body = self.get_json(&format!("tv/{id}"), &[]).await?;
+    parse_tv(&body)
+}
+
+/// Every episode of one season, which is where episode titles, stills and
+/// runtimes live.
+pub async fn tv_season(&self, id: u64, season: u32) -> Result<Vec<EpisodeInfo>, CatalogError> {
+    let body = self.get_json(&format!("tv/{id}/season/{season}"), &[]).await?;
+    parse_tv_season(&body, season)
+}
+
+/// URL for an episode still.
+pub fn still_url(&self, path: &str, size: ArtworkSize) -> String {
+    let size = match size {
+        ArtworkSize::Card => "w300",
+        ArtworkSize::Hero => "w780",
+    };
+    self.image_url(size, path)
+}
+
 }
 
 /// `1999-03-30` -> `1999`.
@@ -274,6 +312,142 @@ pub fn parse_search(body: &Value) -> Result<Vec<Candidate>, CatalogError> {
     Ok(results.iter().filter_map(parse_candidate).collect())
 }
 
+/// Parse a `search/tv` body. TMDB uses `name`/`first_air_date` here, so the
+/// result is mapped onto the same [`Candidate`] the film path uses and the
+/// matching code never has to care which it came from.
+pub fn parse_tv_search(body: &Value) -> Result<Vec<Candidate>, CatalogError> {
+    let results = body
+        .get("results")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CatalogError::Decode("response has no `results` array".into()))?;
+
+    Ok(results
+        .iter()
+        .filter_map(|value| {
+            let source_id = value.get("id")?.as_u64()?.to_string();
+            let title = value
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("original_name").and_then(Value::as_str))?
+                .to_string();
+
+            Some(Candidate {
+                source: PROVIDER.to_string(),
+                source_id,
+                title,
+                original_title: value
+                    .get("original_name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                year: parse_year(value.get("first_air_date").and_then(Value::as_str)),
+                overview: non_empty(value.get("overview").and_then(Value::as_str)),
+                rating: value.get("vote_average").and_then(Value::as_f64).map(|v| v as f32),
+                vote_count: value.get("vote_count").and_then(Value::as_u64).map(|v| v as u32),
+                popularity: value.get("popularity").and_then(Value::as_f64).map(|v| v as f32),
+                poster_path: non_empty(value.get("poster_path").and_then(Value::as_str)),
+                backdrop_path: non_empty(value.get("backdrop_path").and_then(Value::as_str)),
+            })
+        })
+        .collect())
+}
+
+/// Parse a `tv/{id}` body.
+pub fn parse_tv(body: &Value) -> Result<Metadata, CatalogError> {
+    let source_id = body
+        .get("id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| CatalogError::Decode("series has no `id`".into()))?
+        .to_string();
+
+    let title = body
+        .get("name")
+        .and_then(Value::as_str)
+        .or_else(|| body.get("original_name").and_then(Value::as_str))
+        .ok_or_else(|| CatalogError::Decode("series has no name".into()))?
+        .to_string();
+
+    let genres = body
+        .get("genres")
+        .and_then(Value::as_array)
+        .map(|genres| {
+            genres
+                .iter()
+                .filter_map(|g| g.get("name").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut artwork = Artwork::default();
+    if let Some(path) = non_empty(body.get("poster_path").and_then(Value::as_str)) {
+        artwork.poster = Some(ArtworkRef::new(path));
+    }
+    if let Some(path) = non_empty(body.get("backdrop_path").and_then(Value::as_str)) {
+        artwork.backdrop = Some(ArtworkRef::new(path));
+    }
+
+    // Series report a list of episode runtimes rather than one number.
+    let runtime_minutes = body
+        .get("episode_run_time")
+        .and_then(Value::as_array)
+        .and_then(|times| times.first())
+        .and_then(Value::as_u64)
+        .map(|v| v as u32)
+        .filter(|v| *v > 0);
+
+    Ok(Metadata {
+        kind: MediaKind::Series,
+        source: PROVIDER.to_string(),
+        source_id,
+        title,
+        original_title: body.get("original_name").and_then(Value::as_str).map(str::to_string),
+        year: parse_year(body.get("first_air_date").and_then(Value::as_str)),
+        overview: non_empty(body.get("overview").and_then(Value::as_str)),
+        tagline: non_empty(body.get("tagline").and_then(Value::as_str)),
+        genres,
+        runtime_minutes,
+        rating: body.get("vote_average").and_then(Value::as_f64).map(|v| v as f32),
+        vote_count: body.get("vote_count").and_then(Value::as_u64).map(|v| v as u32),
+        popularity: body.get("popularity").and_then(Value::as_f64).map(|v| v as f32),
+        artwork,
+        season_count: body
+            .get("number_of_seasons")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32),
+        episodes: Vec::new(),
+    })
+}
+
+/// Parse a `tv/{id}/season/{n}` body.
+pub fn parse_tv_season(body: &Value, season: u32) -> Result<Vec<EpisodeInfo>, CatalogError> {
+    let episodes = body
+        .get("episodes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CatalogError::Decode("season has no `episodes` array".into()))?;
+
+    Ok(episodes
+        .iter()
+        .filter_map(|value| {
+            let number = value.get("episode_number").and_then(Value::as_u64)? as u32;
+            Some(EpisodeInfo {
+                // The season is taken from the request rather than the body:
+                // some responses omit it per episode.
+                season,
+                number,
+                name: non_empty(value.get("name").and_then(Value::as_str)),
+                overview: non_empty(value.get("overview").and_then(Value::as_str)),
+                still: non_empty(value.get("still_path").and_then(Value::as_str))
+                    .map(ArtworkRef::new),
+                runtime_minutes: value
+                    .get("runtime")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32)
+                    .filter(|v| *v > 0),
+                air_date: non_empty(value.get("air_date").and_then(Value::as_str)),
+            })
+        })
+        .collect())
+}
+
 /// Parse a `movie/{id}` body.
 pub fn parse_movie(body: &Value) -> Result<Metadata, CatalogError> {
     let source_id = body
@@ -309,6 +483,9 @@ pub fn parse_movie(body: &Value) -> Result<Metadata, CatalogError> {
     }
 
     Ok(Metadata {
+        kind: MediaKind::Movie,
+        season_count: None,
+        episodes: Vec::new(),
         source: PROVIDER.to_string(),
         source_id,
         title,

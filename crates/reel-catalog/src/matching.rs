@@ -10,6 +10,7 @@
 //! Everything in this module is pure and unit-tested.
 
 use crate::model::Candidate;
+use crate::release::{MediaKind, Release};
 
 /// Skip a match scoring below this overall score.
 pub const MIN_SCORE: f32 = 0.62;
@@ -21,6 +22,14 @@ pub const MIN_SIMILARITY: f32 = 0.55;
 pub struct LookupQuery {
     pub title: String,
     pub year: Option<u16>,
+    /// Film or series. The provider uses a different endpoint for each, so
+    /// getting this wrong means searching the wrong catalogue entirely.
+    pub kind: MediaKind,
+    /// Which season to fetch episodes for, when it is a series.
+    pub season: Option<u32>,
+    /// Episodes the torrent actually holds. Sent so a provider can fetch only
+    /// the thumbnails that will be shown.
+    pub episodes: Vec<u32>,
 }
 
 impl LookupQuery {
@@ -28,6 +37,21 @@ impl LookupQuery {
         Self {
             title: title.into(),
             year,
+            kind: MediaKind::Unknown,
+            season: None,
+            episodes: Vec::new(),
+        }
+    }
+
+    /// Build from a parsed torrent, so the provider is asked about the right
+    /// kind of thing with the right season.
+    pub fn from_release(release: &Release) -> Self {
+        Self {
+            title: release.title.clone(),
+            year: release.year,
+            kind: release.kind,
+            season: release.season,
+            episodes: release.episode_numbers(),
         }
     }
 
@@ -38,10 +62,13 @@ impl LookupQuery {
     /// swamp the title. This runs the same cleaner the interface uses, so the
     /// two agree on what a title is.
     pub fn from_release_name(name: &str) -> Self {
-        let cleaned = reel_core::title::clean_title(name);
+        let (title, year, kind) = crate::release::parse_one(name);
         Self {
-            title: cleaned.title,
-            year: cleaned.year,
+            title,
+            year,
+            kind,
+            season: None,
+            episodes: Vec::new(),
         }
     }
 }

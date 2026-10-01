@@ -15,6 +15,10 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
+# Release-name parsing: hunch is a pure-Rust guessit descendant that handles
+# films, TV and anime. Chosen over hand-rolling after comparing its output on
+# the cases this app depends on (see docs/ARCHITECTURE.md).
+hunch = { version = "2", default-features = false }
 
 [dev-dependencies]
 axum.workspace = true

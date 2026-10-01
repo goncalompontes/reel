@@ -63,6 +63,7 @@ fn main() {
 
     let info = PlaybackInfo {
         torrent_id: 0,
+        file_id: 0,
         info_hash: "pipeline-test".to_string(),
         title: "pipeline test".to_string(),
         file_name: url.rsplit('/').next().unwrap_or("stream").to_string(),

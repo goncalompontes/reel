@@ -36,6 +36,9 @@ documented, tested extension point: see
 | Title matching that prefers a miss over a wrong match | done |
 | Watch history, "continue watching", resume playback | done |
 | Per-file selection: watch one episode of a season pack | done |
+| Film vs series detection, season/episode parsing | done |
+| Series view with episode list, titles and thumbnails | done |
+| Per-episode resume positions | done |
 | On-disk metadata and artwork cache | done |
 | Search screen + pluggable sources | done |
 | Bundled sources | one: the Internet Archive (public domain / CC film) |
@@ -194,11 +197,61 @@ cargo test -p reel-catalog --test tmdb_stub -- --ignored --nocapture
 REEL_TMDB_API_KEY=... cargo test -p reel-catalog --test tmdb_stub -- --ignored --nocapture
 ```
 
+## Films and series look different
+
+There is no standard for release names, so this is best-effort by construction.
+Parsing is delegated to [`hunch`](https://crates.io/crates/hunch), a pure-Rust
+descendant of `guessit`, after comparing its output against the shapes this app
+meets. Writing that by hand would mean re-deriving a decade of accumulated edge
+cases: `S01E02`, `1x02`, `Season 1 Complete`, `S01E01E02`, anime's absolute
+numbering, daily shows, and the tags that must *not* be mistaken for any of them.
+
+What the app adds on top is the torrent-level judgement, because a torrent is a
+*set* of files:
+
+* **The files are parsed together.** Three names differing only in a digit are a
+  series in a way no single name is — `Some.Show.Disc1/2/3.mkv` parses as a film
+  called "Some Show Disc1" one at a time, and as episodes 1, 2, 3 together.
+* **Series or film?** Numbered episodes decide it. Failing that, one video is a
+  film and several are a series — except for the very common case of a feature
+  plus a sample, which stays a film.
+* **Extras are separated.** Behind-the-scenes and previews are listed, but never
+  numbered alongside episodes.
+* **hunch reports confidence**, and a low-confidence guess is treated as one
+  rather than as fact.
+
+A **series** gets an episode list: thumbnail, `S01E03`, the episode's real title
+from TMDB, its runtime and air date, the file backing it, its size, whether it is
+being fetched, and a Play button. A **film** gets its files, as before. Both show
+the release's own attributes, which are extra information the torrent already
+carried: resolution, source, codec and release group.
+
+Metadata comes from TMDB's **TV endpoints** for a series — search, then the show,
+then the season — and only the thumbnails for episodes the torrent actually holds
+are downloaded, since a season is twenty-odd images and a torrent is usually a
+few.
+
+### What this cannot do
+
+* **Date-based shows.** `The.Daily.Show.2024.01.15.1080p` is recognised as an
+  episode but carries no season or episode number, so it falls back to a file
+  list. Air dates are not yet matched against TMDB's episode list.
+* **Anime absolute numbering.** `[Group] Show - 12` is read as episode 12 with no
+  season, which is usually right but cannot be mapped to a season without
+  knowing the show's cour layout.
+* **Multi-episode files.** `S01E01E02.mkv` is one file; it is treated as the
+  first of the two, because one file cannot be two entries in a list.
+* **A wrong guess is possible.** When parsing fails or the provider disagrees,
+  the file list is the fallback, and it is always accurate.
+
 ## Watching one episode of a season pack
 
-Adding a season pack with the default options selects every playable file, so
-the torrent starts wanting all of it. **Pressing play on one file narrows the
-fetch to that file** and tells you so; the other episodes keep whatever they had
+**A torrent with more than one playable file is added paused**, so a season pack
+waits for you to choose an episode instead of fetching all of it. A film has
+nothing to choose, so it starts on its own. (The CLI keeps pausing off by
+default, because it is also used for seeding.)
+
+Pressing play on one file **narrows the fetch to that file** and tells you so; the other episodes keep whatever they had
 and stop being requested. The detail page shows a checkbox per file, the bytes
 fetched per file, and a *Fetch every file* button, so the choice is visible and
 reversible.
@@ -220,9 +273,10 @@ pretending the effect does not exist.
 
 Two things resume, and they resume independently:
 
-* **Where you were watching.** Positions are stored per torrent info hash, so
-  reopening a film offers *Resume from 56:40*, and seeking there is a range
-  request into the torrent like any other.
+* **Where you were watching, per episode.** Positions are stored per file, not
+  per torrent: a series is one torrent with many episodes, and one position for
+  all of them would resume episode one at episode two's timestamp. Each episode
+  row shows its own resume point, and *Continue watching* points at the newest.
 * **What you had already downloaded.** The session is persisted by default, so a
   part-fetched episode comes back as a part-fetched episode and continues, not
   as an empty file. Verified by stopping a throttled download partway,

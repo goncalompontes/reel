@@ -128,6 +128,7 @@ pub fn build_rows(entries: &[CatalogEntry], limit: usize) -> Vec<Row> {
 mod tests {
     use super::*;
     use crate::model::{Metadata, WatchProgress};
+    use crate::release::Release;
 
     fn entry(id: usize, hash: &str, watch: Option<(f64, f64, i64)>) -> CatalogEntry {
         CatalogEntry {
@@ -148,6 +149,8 @@ mod tests {
                 file_name: None,
                 title: None,
             }),
+            release: Release::default(),
+            watch_by_file: Default::default(),
         }
     }
 

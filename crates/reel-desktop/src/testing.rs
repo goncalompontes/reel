@@ -1,7 +1,9 @@
 //! Test and demo fixtures.
 
+use reel_catalog::model::EpisodeInfo;
 use reel_catalog::{
-    Artwork, ArtworkRef, CatalogEntry, Metadata, SearchHit, WatchProgress,
+    Artwork, ArtworkRef, CatalogEntry, FileInput, MediaKind, Metadata, SearchHit,
+    WatchProgress, analyse,
 };
 use reel_core::model::{FileView, PeerView, StatsView, StreamTarget, TorrentView};
 
@@ -95,6 +97,9 @@ fn now_unix() -> i64 {
 
 fn metadata(id: &str, title: &str, year: u16, overview: &str) -> Metadata {
     Metadata {
+        kind: MediaKind::Movie,
+        season_count: None,
+        episodes: Vec::new(),
         source: "static".into(),
         source_id: id.into(),
         title: title.into(),
@@ -140,6 +145,15 @@ fn item(
 
     let clean = reel_core::title::clean_title(name);
 
+    // Derived from the same names the app would see, so the fixtures exercise
+    // the real parser instead of a hand-written answer.
+    let release = analyse(
+        &files
+            .iter()
+            .map(|f| FileInput::new(f.id, f.path.clone(), f.length))
+            .collect::<Vec<_>>(),
+    );
+
     LibraryItem {
         torrent: TorrentView {
             id,
@@ -177,6 +191,8 @@ fn item(
             year: clean.year,
             metadata: catalog.metadata,
             watch: catalog.watch,
+            release,
+            watch_by_file: Default::default(),
         },
     }
 }
@@ -250,11 +266,22 @@ pub fn sample_season_pack() -> LibraryItem {
         episodes,
         Catalog {
             metadata: Some(Metadata {
+                kind: MediaKind::Series,
+                season_count: Some(1),
+                episodes: (1..=3)
+                    .map(|n| EpisodeInfo {
+                        season: 1,
+                        number: n,
+                        name: Some(format!("Episode {n}")),
+                        runtime_minutes: Some(48),
+                        ..Default::default()
+                    })
+                    .collect(),
                 source: "static".into(),
                 source_id: "season".into(),
                 title: "Some Show".into(),
                 year: Some(2024),
-                overview: Some("Three episodes.".into()),
+                overview: Some("A show with three episodes.".into()),
                 genres: vec!["Drama".into()],
                 runtime_minutes: Some(48),
                 rating: Some(7.9),

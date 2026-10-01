@@ -117,6 +117,9 @@ pub async fn add_torrent(
                 media_only: q.media_only.unwrap_or(true),
                 paused: q.paused.unwrap_or(false),
                 allow_overwrite: q.allow_overwrite.unwrap_or(false),
+                // The HTTP API is also how a scripted seed gets added, so it
+                // does not second-guess the caller by default.
+                pause_multi_file: false,
                 ..Default::default()
             },
         )
@@ -149,6 +152,7 @@ pub async fn add_torrent(
                 upload_limit_bps: req.upload_limit_bps,
                 download_limit_bps: req.download_limit_bps,
                 initial_peers,
+                pause_multi_file: req.pause_multi_file.unwrap_or(false),
             },
         )
     };
@@ -168,6 +172,7 @@ pub async fn add_torrent(
         Json(AddOutcome {
             torrent: view,
             was_new: outcome.was_new,
+            paused_for_selection: outcome.paused_for_selection,
         }),
     )
         .into_response())

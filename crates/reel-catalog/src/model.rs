@@ -4,9 +4,12 @@
 //! A torrent in the library is matched against this metadata so the interface
 //! can show a poster, a synopsis and a rating instead of a release name.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+use crate::release::{MediaKind, Release, ReleaseAttributes};
 
 /// Which image slot an artwork reference fills.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,9 +90,46 @@ impl Artwork {
     }
 }
 
+/// One episode of a series, as a metadata provider describes it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EpisodeInfo {
+    pub season: u32,
+    pub number: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overview: Option<String>,
+    /// Episode still, used as the thumbnail in an episode list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub still: Option<ArtworkRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_minutes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub air_date: Option<String>,
+}
+
+impl EpisodeInfo {
+    /// `S01E03 The One With The Title`, or just `S01E03`.
+    pub fn label(&self) -> String {
+        let code = format!("S{:02}E{:02}", self.season, self.number);
+        match self.name.as_deref().filter(|n| !n.is_empty()) {
+            Some(name) => format!("{code}  {name}"),
+            None => code,
+        }
+    }
+
+    pub fn still_uri(&self) -> Option<String> {
+        self.still.as_ref().and_then(ArtworkRef::local_uri)
+    }
+}
+
 /// Everything a catalog entry knows about a title.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Metadata {
+    /// Film or series. Absent in caches written before this existed, hence the
+    /// default rather than a required field.
+    #[serde(default)]
+    pub kind: MediaKind,
     /// Provider that produced this, e.g. `tmdb`.
     pub source: String,
     /// Provider's own id, as a string so any provider fits.
@@ -117,6 +157,13 @@ pub struct Metadata {
     pub popularity: Option<f32>,
     #[serde(default, skip_serializing_if = "Artwork::is_empty")]
     pub artwork: Artwork,
+
+    /// Number of seasons a series has, when it is a series.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub season_count: Option<u32>,
+    /// Episodes of the season that was looked up, when it is a series.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub episodes: Vec<EpisodeInfo>,
 }
 
 impl Metadata {
@@ -126,6 +173,17 @@ impl Metadata {
             Some(year) => format!("{} ({year})", self.title),
             None => self.title.clone(),
         }
+    }
+
+    pub fn is_series(&self) -> bool {
+        self.kind == MediaKind::Series
+    }
+
+    /// Look up one episode of the fetched season.
+    pub fn episode(&self, season: u32, number: u32) -> Option<&EpisodeInfo> {
+        self.episodes
+            .iter()
+            .find(|e| e.season == season && e.number == number)
     }
 
     /// `1h 52m`.
@@ -220,10 +278,41 @@ pub struct CatalogEntry {
     pub year: Option<u16>,
     /// Metadata, when a provider matched this title.
     pub metadata: Option<Metadata>,
+    /// Most recent watch position for the torrent as a whole, which is what
+    /// "continue watching" needs.
     pub watch: Option<WatchProgress>,
+    /// What the torrent's own names say it is: film or series, which season,
+    /// which episodes, and the release's technical attributes.
+    pub release: Release,
+    /// Watch positions per file, so an episode list can show which ones were
+    /// watched and offer to resume the right one.
+    pub watch_by_file: BTreeMap<usize, WatchProgress>,
 }
 
 impl CatalogEntry {
+    /// Film, series, or not enough to say.
+    pub fn kind(&self) -> MediaKind {
+        match self.metadata.as_ref().map(|m| m.kind) {
+            Some(MediaKind::Unknown) | None => self.release.kind,
+            Some(kind) => kind,
+        }
+    }
+
+    pub fn is_series(&self) -> bool {
+        self.kind() == MediaKind::Series
+    }
+
+    /// Watch position for one file, falling back to the torrent's own record
+    /// so a position saved before per-file tracking is not lost.
+    pub fn watch_for_file(&self, file_id: usize) -> Option<&WatchProgress> {
+        self.watch_by_file.get(&file_id).or(self.watch.as_ref())
+    }
+
+    /// Technical attributes to show as extra information.
+    pub fn attributes(&self) -> &ReleaseAttributes {
+        &self.release.attributes
+    }
+
     /// What to show as the heading: metadata wins, the cleaned name is the
     /// fallback.
     pub fn title(&self) -> String {
@@ -314,6 +403,9 @@ mod tests {
                 ..Default::default()
             }),
             watch: None,
+        
+            release: Release::default(),
+            watch_by_file: Default::default(),
         };
         assert_eq!(entry.heading(), "The Matrix (1999)");
         assert_eq!(entry.resume_position(), None);
@@ -324,6 +416,36 @@ mod tests {
             ..entry
         };
         assert_eq!(bare.heading(), "The Matrix (1999)");
+    }
+
+    #[test]
+    fn episodes_are_addressable_by_number() {
+        let metadata = Metadata {
+            kind: MediaKind::Series,
+            title: "Some Show".into(),
+            episodes: vec![
+                EpisodeInfo {
+                    season: 1,
+                    number: 1,
+                    name: Some("Pilot".into()),
+                    ..Default::default()
+                },
+                EpisodeInfo {
+                    season: 1,
+                    number: 3,
+                    name: None,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(metadata.is_series());
+        assert_eq!(metadata.episode(1, 1).unwrap().label(), "S01E01  Pilot");
+        // An un-named episode still gets a usable label.
+        assert_eq!(metadata.episode(1, 3).unwrap().label(), "S01E03");
+        assert_eq!(metadata.episode(1, 2).map(|e| e.number), None);
+        assert_eq!(metadata.episode(2, 1).map(|e| e.number), None);
     }
 
     #[test]

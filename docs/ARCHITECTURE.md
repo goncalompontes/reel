@@ -228,6 +228,36 @@ ids are session-local and a restart would otherwise lose every position. A
 missing or corrupt file yields an empty history: losing watch positions must
 never stop the app from starting.
 
+### Recognising series from films
+
+`release::analyse` takes a torrent's file names and answers: film or series,
+which season, which episode each file is, and the release's attributes. It
+delegates the name-level parsing to `hunch` and adds the torrent-level judgement
+on top, because several files say things one file cannot:
+
+* `hunch_with_context` is given the sibling names, which recovers numbering from
+  names like `Disc1`, `Disc2`, `Disc3` that parse as a film one at a time;
+* series-versus-film is decided by volume and numbering, with an explicit
+  exception for a feature plus a small sample, which is a film;
+* extras are flagged so they can be listed without being numbered as episodes.
+
+The panel then picks the TMDB endpoint to match: `/search/movie` for a film,
+`/search/tv` plus `/tv/{id}/season/{n}` for a series, so the same title cannot
+match the wrong catalogue. `LookupQuery` carries the kind and season for exactly
+that reason, and the cache key includes them so a film and a series of the same
+name do not collide.
+
+Only the stills for episodes the torrent holds are fetched: a season can be
+twenty-odd images and a torrent is usually a handful.
+
+### Watch positions are per file
+
+`WatchHistory` keys entries as `<info hash>#<file id>`. A series is one torrent
+with many episodes, and a single position per torrent would resume episode one at
+episode two's timestamp. Entries without a `#` are the older format and are still
+read, so an existing history is not lost. `History::recent` collapses to one
+entry per torrent, because "continue watching" is about the show, not the file.
+
 ### Fetching one file at a time
 
 `Engine::set_only_files` narrows a torrent to a set of file ids. Two things make

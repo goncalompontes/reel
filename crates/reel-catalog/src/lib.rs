@@ -30,6 +30,7 @@ pub mod history;
 pub mod matching;
 pub mod model;
 pub mod provider;
+pub mod release;
 pub mod rows;
 pub mod search;
 pub mod tmdb;
@@ -43,6 +44,7 @@ pub use model::{
     Artwork, ArtworkKind, ArtworkRef, ArtworkSize, Candidate, CatalogEntry, Metadata, WatchProgress,
 };
 pub use provider::{MetadataProvider, NullProvider, StaticProvider, TmdbProvider};
+pub use release::{FileInput, MediaKind, Release, ReleaseAttributes, Trust, analyse, parse_one};
 pub use rows::{Row, RowKind, build_rows};
 pub use search::{SearchAggregator, SearchError, SearchHit, SearchQuery, SearchResults};
 pub use tmdb::TmdbClient;
@@ -144,6 +146,8 @@ mod tests {
             year: None,
             metadata: None,
             watch: None,
+            release: Release::default(),
+            watch_by_file: Default::default(),
         }];
         let enriched = enrich_entries(&NullProvider, &entries).await;
         assert_eq!(enriched.len(), 1);

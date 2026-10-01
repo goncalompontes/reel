@@ -16,6 +16,9 @@ use crate::theme;
 #[derive(Debug, Clone)]
 pub struct PlaybackInfo {
     pub torrent_id: usize,
+    /// Which file of the torrent is playing. Watch positions are per file, so a
+    /// series resumes the episode that was actually being watched.
+    pub file_id: usize,
     /// Stable across restarts, and the key watch positions are stored under.
     pub info_hash: String,
     pub title: String,
