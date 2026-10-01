@@ -130,8 +130,12 @@ pub trait Backend {
     fn add(&self, source: &str, media_only: bool);
     fn set_paused(&self, id: usize, paused: bool);
     fn remove(&self, id: usize, delete_files: bool);
-    /// Download only this file of a torrent.
-    fn set_only_file(&self, id: usize, file_id: usize);
+    /// Choose exactly which files of a torrent are fetched.
+    ///
+    /// This is what makes "watch episode 3 of a season pack" fetch only episode
+    /// 3 rather than the whole season. Files left out keep whatever they had and
+    /// stop being requested.
+    fn set_only_files(&self, id: usize, files: &[usize]);
 
     /// Remember how far through a torrent playback got.
     fn record_watch(
@@ -606,10 +610,16 @@ impl Backend for EngineBackend {
         });
     }
 
-    fn set_only_file(&self, id: usize, file_id: usize) {
+    fn set_only_files(&self, id: usize, files: &[usize]) {
+        if files.is_empty() {
+            // An empty selection would leave the torrent with nothing to fetch.
+            tracing::warn!(id, "refusing to select no files");
+            return;
+        }
         let engine = self.engine.clone();
-        self.spawn_result("select file", async move {
-            engine.set_only_files(id, &[file_id]).await
+        let files = files.to_vec();
+        self.spawn_result("select files", async move {
+            engine.set_only_files(id, &files).await
         });
     }
 
@@ -882,11 +892,14 @@ impl Backend for FakeBackend {
         items.retain(|item| item.torrent.id != id);
     }
 
-    fn set_only_file(&self, id: usize, file_id: usize) {
+    fn set_only_files(&self, id: usize, files: &[usize]) {
+        if files.is_empty() {
+            return;
+        }
         let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(item) = items.iter_mut().find(|i| i.torrent.id == id) {
             for file in &mut item.torrent.files {
-                file.included = file.id == file_id;
+                file.included = files.contains(&file.id);
             }
         }
     }

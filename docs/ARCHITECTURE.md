@@ -228,6 +228,29 @@ ids are session-local and a restart would otherwise lose every position. A
 missing or corrupt file yields an empty history: losing watch positions must
 never stop the app from starting.
 
+### Fetching one file at a time
+
+`Engine::set_only_files` narrows a torrent to a set of file ids. Two things make
+this the right primitive for "watch episode 3":
+
+* It is `librqbit`'s own `only_files`, so the pieces of the other episodes stop
+  being requested rather than merely being deprioritised — a season pack does
+  not quietly fill the disk while you watch one episode.
+* File selection is part of the persisted session, so the choice survives a
+  restart along with the data already fetched.
+
+`FileView::progress_bytes` exists to make this observable: it comes from the
+engine's per-file counters, which is how a test can assert that one episode was
+fetched and the other two were not.
+
+The granularity is a piece, not a file, and that is not a limitation we can
+engineer around: a piece spanning a file boundary belongs to both files, so a
+skipped neighbour still picks up the one piece it shares with the file being
+watched. With realistic sizes — gigabytes per episode, 2 MiB pieces — that is
+negligible; the first version of the test used 700 KB fixtures against the 2 MiB
+default, which put the entire torrent in two pieces and made selection look
+broken when it was working exactly as designed.
+
 ## reel-desktop
 
 * **All engine access goes through a `Backend` trait.** `EngineBackend` runs the

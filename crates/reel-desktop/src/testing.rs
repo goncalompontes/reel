@@ -192,6 +192,7 @@ fn file(id: usize, path: &str, length: u64, included: bool) -> FileView {
         is_video: reel_core::is_video_file(&name),
         is_audio: reel_core::media::is_audio_file(&name),
         is_subtitle: reel_core::media::is_subtitle_file(&name),
+        progress_bytes: if included { length / 3 } else { 0 },
         stream: StreamTarget {
             torrent_id: 0,
             file_id: id,
@@ -224,4 +225,45 @@ pub fn sample_search_hits() -> Vec<SearchHit> {
     caligari.detail = Some("archive.org \u{2022} caligari".to_string());
 
     vec![nosferatu, caligari]
+}
+
+/// A season pack: the case where fetching everything is exactly what you do not
+/// want when you sit down to watch one episode.
+pub fn sample_season_pack() -> LibraryItem {
+    let episodes: Vec<FileView> = (0..3)
+        .map(|n| {
+            file(
+                n,
+                &format!("Some.Show.S01E{:02}.1080p.mkv", n + 1),
+                1_500_000_000,
+                true,
+            )
+        })
+        .collect();
+
+    item(
+        9,
+        "Some.Show.S01.1080p.WEB-DL.x264-GROUP",
+        "d0d1d2d3d4d5d6d7d8d9dadbdcdddedf00112233",
+        false,
+        12.0,
+        episodes,
+        Catalog {
+            metadata: Some(Metadata {
+                source: "static".into(),
+                source_id: "season".into(),
+                title: "Some Show".into(),
+                year: Some(2024),
+                overview: Some("Three episodes.".into()),
+                genres: vec!["Drama".into()],
+                runtime_minutes: Some(48),
+                rating: Some(7.9),
+                vote_count: Some(2_000),
+                popularity: Some(20.0),
+                artwork: Artwork::default(),
+                ..Default::default()
+            }),
+            watch: None,
+        },
+    )
 }

@@ -35,6 +35,7 @@ documented, tested extension point: see
 | TMDB metadata: posters, backdrops, synopsis, genres, rating, runtime | done |
 | Title matching that prefers a miss over a wrong match | done |
 | Watch history, "continue watching", resume playback | done |
+| Per-file selection: watch one episode of a season pack | done |
 | On-disk metadata and artwork cache | done |
 | Search screen + pluggable sources | done |
 | Bundled sources | one: the Internet Archive (public domain / CC film) |
@@ -134,7 +135,7 @@ reel play 0          # launches mpv on the stream URL
 
 ```bash
 cargo test --workspace     # 147 tests: engine, ranges, matching, UI, catalog, search, backend
-bash scripts/e2e.sh        # 63 assertions: create, seed, stream, decode, magnet, packaging
+bash scripts/e2e.sh        # 71 assertions: create, seed, stream, decode, magnet, one-episode, packaging
 ```
 
 `scripts/e2e.sh` is the real proof. It generates a video, seeds it from one
@@ -193,6 +194,41 @@ cargo test -p reel-catalog --test tmdb_stub -- --ignored --nocapture
 REEL_TMDB_API_KEY=... cargo test -p reel-catalog --test tmdb_stub -- --ignored --nocapture
 ```
 
+## Watching one episode of a season pack
+
+Adding a season pack with the default options selects every playable file, so
+the torrent starts wanting all of it. **Pressing play on one file narrows the
+fetch to that file** and tells you so; the other episodes keep whatever they had
+and stop being requested. The detail page shows a checkbox per file, the bytes
+fetched per file, and a *Fetch every file* button, so the choice is visible and
+reversible.
+
+Selection is at **piece granularity**, which is a property of BitTorrent, not a
+shortcut: a piece that straddles a file boundary belongs to both files, so a
+neighbour can pick up one piece of bleed. Measured on a three-episode fixture:
+
+```
+S01E02  selected  fetched 719730 of 719730   <- the one being watched
+S01E03  skipped   fetched  15218 of 719730   <- one boundary piece
+S01E01  skipped   fetched   2332 of 719730
+```
+
+A season pack has gigabytes per episode against the same 2 MiB pieces, so the
+same overlap is a rounding error. It only looks large when files are *smaller*
+than a piece, which is why the test sets a 16 KiB piece length rather than
+pretending the effect does not exist.
+
+Two things resume, and they resume independently:
+
+* **Where you were watching.** Positions are stored per torrent info hash, so
+  reopening a film offers *Resume from 56:40*, and seeking there is a range
+  request into the torrent like any other.
+* **What you had already downloaded.** The session is persisted by default, so a
+  part-fetched episode comes back as a part-fetched episode and continues, not
+  as an empty file. Verified by stopping a throttled download partway,
+  restarting, and checking both that progress was retained and that the retained
+  bytes matched the source.
+
 ## Architecture
 
 ```
@@ -248,6 +284,11 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the reasoning.
 * **Faststart.** For instant playback the container should have its index at the
   front (`ffmpeg -movflags +faststart`); otherwise the engine still works, it
   just fetches the index from the end of the file first.
+* **A stream request waits, it does not fail.** If the pieces a player asks for
+  never arrive — a paused torrent, a dead swarm — the HTTP response simply
+  blocks rather than erroring, because that is what a buffering player wants.
+  Clients should set their own timeout; a request can outlive the reason it was
+  made.
 * **Content and sources.** This is a general-purpose BitTorrent client and HTTP
   server. Use it for content you own or are licensed to distribute. Exactly one
   search source is bundled, chosen because it indexes only material anyone may

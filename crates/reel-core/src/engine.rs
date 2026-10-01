@@ -313,11 +313,18 @@ impl Engine {
         let details = self.details(id)?;
         // Stats can be unavailable while a torrent is still initializing; never
         // report an empty state string.
-        let stats = self.stats(id).unwrap_or_else(|| StatsView {
-            state: "unknown".to_string(),
-            ..Default::default()
-        });
-        Ok(self.assemble(id, details, stats))
+        let raw = self.api.api_stats_v1(TorrentIdOrHash::Id(id)).ok();
+        let (stats, file_progress) = match raw {
+            Some(raw) => (stats_to_view(&raw), raw.file_progress.clone()),
+            None => (
+                StatsView {
+                    state: "unknown".to_string(),
+                    ..Default::default()
+                },
+                Vec::new(),
+            ),
+        };
+        Ok(self.assemble(id, details, stats, file_progress))
     }
 
     /// Liveness stats for one torrent.
@@ -476,7 +483,14 @@ impl Engine {
 
     // ---------------------------------------------------------------- mapping
 
-    fn assemble(&self, id: usize, details: TorrentDetailsResponse, stats: StatsView) -> TorrentView {
+    /// `file_progress` is per-file downloaded bytes, indexed like `files`.
+    fn assemble(
+        &self,
+        id: usize,
+        details: TorrentDetailsResponse,
+        stats: StatsView,
+        file_progress: Vec<u64>,
+    ) -> TorrentView {
         let files_meta = details.files.unwrap_or_default();
 
         let candidates: Vec<FileCandidate> = files_meta
@@ -509,6 +523,7 @@ impl Engine {
                     path,
                     name: name.clone(),
                     length: f.length,
+                    progress_bytes: file_progress.get(i).copied().unwrap_or(0),
                     included: f.included,
                     is_video: is_video_file(&name),
                     is_audio: is_audio_file(&name),

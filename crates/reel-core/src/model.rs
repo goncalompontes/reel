@@ -40,6 +40,11 @@ pub struct FileView {
     /// Last path component.
     pub name: String,
     pub length: u64,
+    /// Bytes of this file already downloaded. Zero for files that are not
+    /// being fetched, which is how a caller can tell one episode is being
+    /// streamed and the rest are untouched.
+    #[serde(default)]
+    pub progress_bytes: u64,
     /// Whether the engine is downloading this file.
     pub included: bool,
     pub is_video: bool,

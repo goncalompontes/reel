@@ -361,6 +361,125 @@ else
   bad "the installer wrote no desktop entry"
 fi
 
+echo "== 25. watching one episode fetches only that episode =="
+# The season-pack case. Adding with media_only selects every playable file, so
+# without per-file selection a three-episode pack downloads all three while you
+# watch the first.
+#
+# Added paused, narrowed, then resumed: that makes the "nothing was spent on the
+# others" assertion deterministic. Note what it therefore proves and what it
+# does not - it proves the engine fetches only the selected file once the
+# selection is made, not that no bytes for other files ever arrive in the window
+# between adding and pressing play, which is inherent to the real flow.
+PACK="$ROOT/pack"
+rm -rf "$PACK"
+# The torrent is created from the show directory, so its name is that directory
+# and its content resolves to <output>/<name>/<file>. A seeder must therefore
+# point --dir at the *parent* of the show directory, which is what `reel create`
+# prints as its suggested command.
+mkdir -p "$PACK/library/Some.Show.S01" "$PACK/leech"
+for n in 1 2 3; do
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "testsrc=duration=6:size=640x360:rate=25" \
+    -c:v libx264 -preset ultrafast -pix_fmt yuv420p -b:v 2500k \
+    "$PACK/library/Some.Show.S01/Some.Show.S01E0$n.mp4"
+done
+# A small piece length on purpose. Selection works at piece granularity, so with
+# the 2 MiB default these three 700 KB episodes would share two pieces and
+# fetching one would fetch them all. Real episodes are gigabytes against the
+# same 2 MiB pieces, where the overlap is a rounding error at each boundary.
+PIECE=16384
+"$REEL" create "$PACK/library/Some.Show.S01" -o "$PACK/pack.torrent" \
+  --piece-length "$PIECE" > "$PACK/create.log" 2>&1
+"$REEL" serve --dir "$PACK/library" --api-addr 127.0.0.1:3044 --listen-port 51416 \
+  --no-dht --no-trackers --no-persist --overwrite --add "$PACK/pack.torrent" \
+  > "$PACK/seed.log" 2>&1 &
+PACK_SEED=$!
+
+# A seeder that cannot find its files looks exactly like a broken leecher, and
+# that cost an hour of chasing the wrong thing. Check it first.
+SEEDED=""
+for _ in $(seq 1 60); do
+  SEEDED=$(curl -sf --max-time 5 http://127.0.0.1:3044/api/torrents/0 | jq_ 'd["stats"]["finished"]')
+  [ "$SEEDED" = "True" ] && break
+  sleep 0.5
+done
+check "the seeder actually has the data to serve" "${SEEDED:-None}" "True"
+
+"$REEL" serve --dir "$PACK/leech" --api-addr 127.0.0.1:3045 --listen-port 51417 \
+  --no-dht --no-trackers --no-persist --peer 127.0.0.1:51416 \
+  --paused --add "$PACK/pack.torrent" > "$PACK/leech.log" 2>&1 &
+PACK_LEECH=$!
+cleanup_pack() { kill "$PACK_SEED" "$PACK_LEECH" 2>/dev/null || true; }
+trap 'cleanup_pack; cleanup_magnet; cleanup' EXIT
+
+for _ in $(seq 1 40); do
+  curl -sf -o /dev/null http://127.0.0.1:3044/api/health &&
+    curl -sf -o /dev/null http://127.0.0.1:3045/api/health && break
+  sleep 0.5
+done
+
+DETAIL=$(curl -sf http://127.0.0.1:3045/api/torrents/0)
+COUNT=$(echo "$DETAIL" | jq_ 'len(d["files"])')
+check "a three-episode pack" "$COUNT" "3"
+
+# Everything playable is selected to begin with, which is the problem.
+ALL=$(echo "$DETAIL" | jq_ 'sum(1 for f in d["files"] if f["included"])')
+check "media_only selected every episode" "$ALL" "3"
+
+# Pressing play on one episode narrows the fetch to it. Pick by name: the
+# engine's file order is not the directory order, and episode 2 is neither the
+# first nor the last, so a pass cannot come from fetching from one end.
+TARGET_NAME="Some.Show.S01E02.mp4"
+TARGET=$(echo "$DETAIL" | jq_ '[f["id"] for f in d["files"] if f["name"]=="'"$TARGET_NAME"'"][0]')
+echo "  watching: $TARGET_NAME (file $TARGET)"
+check "found the episode by name" "$(echo "$DETAIL" | jq_ '[f for f in d["files"] if f["name"]=="'"$TARGET_NAME"'"][0]["length"]' | grep -c .)" "1"
+
+curl -sf -X PUT "http://127.0.0.1:3045/api/torrents/0/files" \
+  -H 'content-type: application/json' -d "{\"only_files\":[$TARGET]}" > /dev/null
+curl -sf -X POST "http://127.0.0.1:3045/api/torrents/0/resume" > /dev/null
+
+for _ in $(seq 1 120); do
+  sleep 0.5
+  DETAIL=$(curl -sf http://127.0.0.1:3045/api/torrents/0 || true)
+  [ -n "$DETAIL" ] || continue
+  DONE=$(echo "$DETAIL" | jq_ 'd["files"]['"$TARGET"']["progress_bytes"]')
+  [ "${DONE:-0}" -gt 0 ] && break
+done
+
+DETAIL=$(curl -sf http://127.0.0.1:3045/api/torrents/0)
+echo "$DETAIL" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for f in d['files']:
+    print(f\"    {f['name']:<28} selected={str(f['included']):<5} fetched={f['progress_bytes']} of {f['length']}\")
+"
+
+WATCHED=$(echo "$DETAIL" | jq_ '[f for f in d["files"] if f["id"]=='"$TARGET"'][0]["progress_bytes"]')
+LENGTH=$(echo "$DETAIL" | jq_ '[f for f in d["files"] if f["id"]=='"$TARGET"'][0]["length"]')
+OTHERS=$(echo "$DETAIL" | jq_ 'sum(f["progress_bytes"] for f in d["files"] if f["id"]!='"$TARGET"')')
+
+check "the watched episode was fetched in full" "${WATCHED:-0}" "$LENGTH"
+
+# Not zero, and it should not be: a piece that straddles a file boundary belongs
+# to both files. Two pieces of slack per neighbour is the honest bound.
+OTHER_FILE=$(echo "$DETAIL" | jq_ '[f["length"] for f in d["files"] if f["id"]!='"$TARGET"'][0]')
+if [ "${OTHERS:-0}" -le $((PIECE * 2)) ]; then
+  ok "the other episodes cost only boundary bleed ($OTHERS bytes, under 2 pieces)"
+else
+  bad "the other episodes were downloaded: $OTHERS bytes (a full one is $OTHER_FILE)"
+fi
+
+SELECTED=$(echo "$DETAIL" | jq_ 'sum(1 for f in d["files"] if f["included"])')
+check "exactly one file is selected" "$SELECTED" "1"
+
+# And the selected episode still streams.
+URL="http://127.0.0.1:3045/stream/0/$TARGET/$TARGET_NAME"
+# --max-time matters: a stream request for pieces that never arrive waits
+# forever by design, so an unbounded curl would hang the whole suite.
+curl -s --max-time 60 -o "$PACK/chunk.bin" -r 0-32767 "$URL"
+check "the episode streams" "$(stat -c%s "$PACK/chunk.bin" 2>/dev/null || echo 0)" "32768"
+
 echo
 echo "===== $PASS passed, $FAIL failed ====="
 exit $(( FAIL > 0 ))

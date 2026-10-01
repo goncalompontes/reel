@@ -278,6 +278,23 @@ fn snapshot_library_with_real_artwork() {
     harness.snapshot("library-with-posters");
 }
 
+/// The season-pack state: one episode being fetched, the rest skipped.
+#[test]
+fn snapshot_season_pack() {
+    let mut items = sample_library();
+    items.push(reel_desktop::testing::sample_season_pack());
+
+    let mut harness = harness_with(App::new(Box::new(FakeBackend::new(items))));
+    harness.run_steps(3);
+
+    // What pressing play on episode 2 does.
+    harness.state_mut().select_files(9, &[1]);
+    harness.state_mut().navigate(Screen::Detail(9));
+    harness.run_steps(3);
+
+    harness.snapshot("season-pack");
+}
+
 /// Renders the library to a PNG so the layout can be reviewed by eye.
 #[test]
 fn snapshot_library() {

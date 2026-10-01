@@ -193,6 +193,27 @@ impl App {
             .clone()
             .unwrap_or_else(|| format!("{}{}", self.backend.base_url(), file.stream.path));
 
+        // Watching one episode should fetch one episode. Without this a season
+        // pack pulls down every episode while you watch the first.
+        let others = item
+            .torrent
+            .files
+            .iter()
+            .filter(|f| f.included && f.id != file_id)
+            .count();
+        if others > 0 {
+            self.select_files(torrent_id, &[file_id]);
+            self.set_toast(
+                format!(
+                    "Fetching only {} ({} other file{} paused)",
+                    reel_core::title::truncate(&file.name, 40),
+                    others,
+                    if others == 1 { "" } else { "s" }
+                ),
+                false,
+            );
+        }
+
         let capability = self.backend.capabilities().player.clone();
         self.player_origin = Some(torrent_id);
         self.watch_last_recorded = item.resume_position().unwrap_or(0.0);
@@ -211,6 +232,15 @@ impl App {
                 });
             }
         }
+    }
+
+    /// Mark the cached library stale, so the next frame re-reads the engine.
+    ///
+    /// Engine changes (which files are selected, progress) are applied on the
+    /// runtime, so reading straight back can race them; re-reading on the next
+    /// frame is both simpler and correct.
+    fn invalidate(&mut self) {
+        self.last_refresh = Instant::now() - REFRESH_INTERVAL;
     }
 
     fn refresh(&mut self) {
@@ -317,6 +347,15 @@ impl App {
             peers: item.torrent.stats.peers.live,
             file_percent: item.torrent.stats.percent,
         }
+    }
+
+    /// Fetch exactly these files of a torrent.
+    ///
+    /// Public so the flow the UI reaches by ticking a box can also be driven
+    /// from a test.
+    pub fn select_files(&mut self, torrent_id: usize, files: &[usize]) {
+        self.backend.set_only_files(torrent_id, files);
+        self.invalidate();
     }
 
     /// Persist how far playback has got, but not on every frame.
@@ -1184,6 +1223,37 @@ impl App {
             );
             ui.add_space(6.0);
 
+            // Which files are fetched is the user's choice, and for a season
+            // pack it is the difference between one episode and all of them.
+            let included: Vec<usize> = item
+                .torrent
+                .files
+                .iter()
+                .filter(|f| f.included)
+                .map(|f| f.id)
+                .collect();
+            let narrowed = included.len() < item.torrent.files.len();
+
+            if narrowed {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Fetching {} of {} files",
+                            included.len(),
+                            item.torrent.files.len()
+                        ))
+                        .size(12.0)
+                        .color(theme::ACCENT),
+                    );
+                    if ui.small_button("Fetch every file").clicked() {
+                        action = Some(DetailAction::FetchAll(
+                            item.torrent.files.iter().map(|f| f.id).collect(),
+                        ));
+                    }
+                });
+                ui.add_space(6.0);
+            }
+
             for file in &item.torrent.files {
                 ui.horizontal(|ui| {
                     let icon = if file.is_video {
@@ -1195,9 +1265,28 @@ impl App {
                     } else {
                         "\u{1f4c4}"
                     };
+
+                    // Toggling the last remaining file off would leave the
+                    // torrent with nothing to fetch, so that one is locked.
+                    let mut wanted = file.included;
+                    let response = ui.add_enabled(
+                        !(file.included && included.len() == 1),
+                        egui::Checkbox::without_text(&mut wanted),
+                    );
+                    if response.changed() {
+                        let mut next: Vec<usize> = included.clone();
+                        if wanted {
+                            next.push(file.id);
+                            next.sort_unstable();
+                        } else {
+                            next.retain(|id| *id != file.id);
+                        }
+                        action = Some(DetailAction::SelectFiles(next));
+                    }
+
                     ui.label(icon);
                     ui.label(
-                        egui::RichText::new(reel_core::title::truncate(&file.path, 60)).color(
+                        egui::RichText::new(reel_core::title::truncate(&file.path, 56)).color(
                             if file.included {
                                 theme::TEXT
                             } else {
@@ -1205,6 +1294,7 @@ impl App {
                             },
                         ),
                     );
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if media::is_media_file(&file.name) && ui.small_button("Play").clicked() {
                             action = Some(DetailAction::Play(file.id));
@@ -1213,8 +1303,18 @@ impl App {
                             egui::RichText::new(fmt::human_bytes(file.length))
                                 .color(theme::TEXT_DIM),
                         );
-                        if !file.included {
-                            ui.label(egui::RichText::new("skipped").color(theme::WARN).size(11.0));
+                        // Per-file progress: the reason to show it is that a
+                        // season pack should be fetching exactly one episode.
+                        if file.included && file.progress_bytes > 0 {
+                            let percent =
+                                (file.progress_bytes as f64 / file.length.max(1) as f64) * 100.0;
+                            ui.label(
+                                egui::RichText::new(format!("{percent:.0}%"))
+                                    .size(11.0)
+                                    .color(theme::OK),
+                            );
+                        } else if !file.included {
+                            ui.label(egui::RichText::new("not fetching").color(theme::WARN).size(11.0));
                         }
                     });
                 });
@@ -1241,6 +1341,9 @@ impl App {
             Some(DetailAction::Navigate(screen)) => self.screen = screen,
             Some(DetailAction::SetPaused(paused)) => self.backend.set_paused(item.torrent.id, paused),
             Some(DetailAction::ConfirmRemove) => self.show_delete_confirm = Some(item.torrent.id),
+            Some(DetailAction::SelectFiles(files)) | Some(DetailAction::FetchAll(files)) => {
+                self.select_files(item.torrent.id, &files);
+            }
             Some(DetailAction::MarkWatched(hash)) => {
                 self.backend
                     .mark_finished(&hash, Some(item.entry.title()));
@@ -1276,6 +1379,9 @@ enum DetailAction {
     MarkWatched(String),
     Play(usize),
     PlayFrom(usize, f64),
+    /// Fetch exactly these files.
+    SelectFiles(Vec<usize>),
+    FetchAll(Vec<usize>),
 }
 
 /// The shape providers publish artwork in.
@@ -1990,6 +2096,57 @@ mod tests {
             .map(|item| item.entry.title())
             .collect();
         assert_eq!(matches, ["The Matrix"]);
+    }
+
+    fn app_with_season_pack() -> App {
+        let mut items = sample_library();
+        items.push(crate::testing::sample_season_pack());
+        App::new(Box::new(crate::backend::FakeBackend::new(items)))
+    }
+
+    fn fetching(app: &App, torrent_id: usize) -> Vec<usize> {
+        app.item(torrent_id)
+            .expect("torrent")
+            .torrent
+            .files
+            .iter()
+            .filter(|file| file.included)
+            .map(|file| file.id)
+            .collect()
+    }
+
+    #[test]
+    fn watching_one_episode_stops_fetching_the_rest_of_the_season() {
+        let mut app = app_with_season_pack();
+
+        // Adding with media_only selects every playable file, so a season pack
+        // starts out wanting all three.
+        assert_eq!(fetching(&app, 9), vec![0, 1, 2]);
+
+        // Sitting down to watch episode 2 should fetch episode 2.
+        let ctx = egui::Context::default();
+        app.play_file(&ctx, 9, 1);
+        // The engine applies the change on its own thread, and the app re-reads
+        // its cache on the next frame; this is that frame.
+        app.refresh();
+        assert_eq!(fetching(&app, 9), vec![1], "only the watched episode");
+
+        // And the choice is reversible.
+        app.backend.set_only_files(9, &[0, 1, 2]);
+        app.refresh();
+        assert_eq!(fetching(&app, 9), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn selecting_no_files_is_refused() {
+        let mut app = app_with_season_pack();
+        app.backend.set_only_files(9, &[]);
+        app.refresh();
+        assert_eq!(
+            fetching(&app, 9),
+            vec![0, 1, 2],
+            "an empty selection would leave nothing to fetch"
+        );
     }
 
     #[test]
