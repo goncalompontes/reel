@@ -397,8 +397,10 @@ library, the bytes do not.
   nothing, so it costs no bandwidth, and the buffer *and* the peer connections
   both survive — pressing play again does not have to reconnect. **Settings →
   Playback → Session cache (MB)** bounds how much is kept
-  across titles (default 1 GiB); the least recently watched streams are released
-  when it overflows, and `0` releases each one as soon as playback stops.
+  across titles (default 1 GiB); when it overflows the least recently watched
+  streams are released, but the one you just left is kept even if it alone
+  exceeds the cap — evicting what you are about to resume would be the wrong
+  choice. `0` releases each stream as soon as playback stops.
 * **The library is durable.** Since a streamed torrent is removed when it stops,
   a persisted `library.json` (plus a saved `.torrent` per title) is what makes a
   title stay in the library. Downloads are re-added at startup; streams wait

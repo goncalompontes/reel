@@ -117,13 +117,15 @@ fn a_stream_plays_again_after_leaving() {
             "-f",
             "lavfi",
             "-i",
-            "testsrc=duration=30:size=640x360:rate=24",
+            "testsrc=duration=120:size=1280x720:rate=24",
             "-c:v",
             "libx264",
             "-preset",
             "ultrafast",
             "-pix_fmt",
             "yuv420p",
+            "-b:v",
+            "1M",
             "-movflags",
             "+faststart",
         ])
@@ -165,6 +167,9 @@ fn a_stream_plays_again_after_leaving() {
                 AddOptions {
                     media_only: false,
                     allow_overwrite: true,
+                    // Throttle so the leecher never finishes: this test is about
+                    // a partially buffered stream, not a completed file.
+                    upload_limit_bps: Some(150_000),
                     ..Default::default()
                 },
             )
@@ -227,8 +232,18 @@ fn a_stream_plays_again_after_leaving() {
     let (frames, why) = play(&mut controller, &ctx, &url, None, 10, Duration::from_secs(90));
     assert!(frames >= 10, "first play produced no frames: {why}");
 
-    // Leave: stop the player (as `leave_player` does), then the backend pauses
-    // and keeps the buffer.
+    // The point of the test is a partially buffered stream: if the whole file
+    // arrived, a resume proves nothing.
+    let resume_at = controller.state().position;
+    let progress_before = backend.item(id).expect("the title").torrent.stats.progress_bytes;
+    let length = backend.item(id).expect("the title").torrent.files[0].length;
+    assert!(
+        progress_before < length,
+        "the stream finished ({progress_before}/{length}); throttle the seeder more"
+    );
+
+    // Leave: stop the player (as `leave_player` does); the backend keeps the
+    // buffer and the peers.
     controller.close();
     backend.stop_streaming(id);
     // It stays live (a stream-less torrent fetches nothing); the buffer and the
@@ -247,19 +262,30 @@ fn a_stream_plays_again_after_leaving() {
             .item(id)
             .is_some_and(|item| !item.torrent.stats.is_paused())
     });
+    let progress_cached = backend.item(id).expect("the title").torrent.stats.progress_bytes;
+    assert!(
+        progress_cached >= progress_before,
+        "the cache lost bytes: {progress_cached} < {progress_before}"
+    );
     let url = backend
         .item(id)
         .and_then(|item| item.torrent.files.first().and_then(|f| f.stream.url.clone()))
         .expect("a stream url");
+    let resume_started = Instant::now();
     let (frames, why) = play(
         &mut controller,
         &ctx,
         &url,
-        Some(5.0),
+        Some(resume_at),
         10,
         Duration::from_secs(60),
     );
     assert!(frames >= 10, "second play produced no frames: {why}");
+    println!(
+        "resumed at {resume_at:.2}s with {progress_cached} cached bytes; \
+         first {frames} frames in {} ms",
+        resume_started.elapsed().as_millis()
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&scratch);

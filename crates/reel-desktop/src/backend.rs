@@ -632,7 +632,7 @@ impl EngineBackend {
     /// Release the least recently watched stream buffers once the session cache
     /// is over its limit. Streams with downloads attached are left alone; the
     /// title currently playing is never evicted.
-    fn enforce_stream_cache(&self) {
+    fn enforce_stream_cache(&self, keep: Option<usize>) {
         let cap_mb = self.settings().stream_cache_mb;
         let cap = cap_mb as u64 * 1024 * 1024;
         let store = self.snapshot();
@@ -651,7 +651,11 @@ impl EngineBackend {
             }
             let bytes = view.stats.progress_bytes;
             used += bytes;
-            if Some(entry.id) != playing {
+            // Never evict what is playing, nor what was just watched: a large
+            // episode may exceed the cap on its own, and evicting the title you
+            // are about to resume is exactly the wrong choice. Older streams go
+            // first.
+            if Some(entry.id) != playing && Some(entry.id) != keep {
                 let last = self
                     .stream_cache
                     .lock()
@@ -1368,7 +1372,7 @@ impl Backend for EngineBackend {
             .unwrap_or(0);
         tracing::info!(id, progress, "kept a stream in the session cache");
         self.touch_cache(id);
-        self.enforce_stream_cache();
+        self.enforce_stream_cache(Some(id));
     }
 
     fn is_live(&self, id: usize) -> bool {
