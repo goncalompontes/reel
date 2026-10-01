@@ -107,7 +107,8 @@ fn a_stream_plays_again_after_leaving() {
     }
 
     let dir = scratch("run");
-    let video = dir.join("clip.mp4");
+    // An MKV, like the real releases: the seek index (cues) is at the end.
+    let video = dir.join("clip.mkv");
     let status = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -126,8 +127,6 @@ fn a_stream_plays_again_after_leaving() {
             "yuv420p",
             "-b:v",
             "1M",
-            "-movflags",
-            "+faststart",
         ])
         .arg(&video)
         .status()
@@ -150,7 +149,7 @@ fn a_stream_plays_again_after_leaving() {
     // Uploads are on for it, unlike the app.
     let seed_dir = dir.join("seed");
     std::fs::create_dir_all(&seed_dir).unwrap();
-    std::fs::copy(&video, seed_dir.join("clip.mp4")).unwrap();
+    std::fs::copy(&video, seed_dir.join("clip.mkv")).unwrap();
     let (seed_engine, seed_id) = runtime.block_on(async {
         let engine = Engine::new(EngineConfig {
             disable_dht: true,

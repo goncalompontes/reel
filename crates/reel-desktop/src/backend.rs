@@ -179,6 +179,10 @@ pub trait Backend {
     /// so its temporary storage goes away; a download is left alone.
     fn stop_streaming(&self, id: usize);
 
+    /// Re-add a stream from scratch and start these files. Used when a cached
+    /// resume stalls: a fresh add is the path that is known to play.
+    fn restart_stream(&self, id: usize, files: &[usize]);
+
     /// Whether the title is currently in the session, so it can stream now.
     /// A title that is not live has to be brought back first, which reports
     /// [`BackendEvent::Ready`] when it is done.
@@ -1375,6 +1379,18 @@ impl Backend for EngineBackend {
         self.enforce_stream_cache(Some(id));
     }
 
+    fn restart_stream(&self, id: usize, files: &[usize]) {
+        if files.is_empty() {
+            return;
+        }
+        let Some(entry) = self.snapshot().entry(id).cloned() else {
+            return;
+        };
+        tracing::warn!(id, "restarting a stalled stream from scratch");
+        *self.playing.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
+        self.recycle(entry, false, Some(files.to_vec()), false);
+    }
+
     fn is_live(&self, id: usize) -> bool {
         self.snapshot()
             .entry(id)
@@ -1891,6 +1907,10 @@ impl Backend for FakeBackend {
             item.torrent.stats.state = "paused".to_string();
             item.torrent.state = "paused".to_string();
         }
+    }
+
+    fn restart_stream(&self, id: usize, files: &[usize]) {
+        self.start_files(id, files);
     }
 
     fn is_live(&self, _id: usize) -> bool {

@@ -78,6 +78,10 @@ pub struct App {
     player_origin: Option<usize>,
     /// A play request waiting for its temporary torrent to be brought back.
     pending_play: Option<(usize, usize)>,
+    /// When the current player session opened, to detect a stalled resume.
+    player_opened_at: Option<Instant>,
+    /// Whether this play has already fallen back to a fresh re-add.
+    stream_recovered: bool,
     /// The egui context for the current frame, so UI actions triggered deep in
     /// the widget tree can still start playback.
     pending_ctx: Option<egui::Context>,
@@ -129,6 +133,8 @@ impl App {
             player_controls_hidden: false,
             player_origin: None,
             pending_play: None,
+            player_opened_at: None,
+            stream_recovered: false,
             pending_ctx: None,
             watch_last_recorded: 0.0,
             watch_recording_for: None,
@@ -361,6 +367,7 @@ impl App {
         selection.sort_unstable();
         selection.dedup();
 
+        self.stream_recovered = false;
         self.start_streaming(torrent_id, &selection);
         self.pending_play = Some((torrent_id, file_id));
         self.set_toast("Preparing to stream\u{2026}", false);
@@ -442,6 +449,7 @@ impl App {
 
         let capability = self.backend.capabilities().player.clone();
         self.player_origin = Some(torrent_id);
+        self.player_opened_at = Some(Instant::now());
         self.watch_last_recorded = start_at.unwrap_or(0.0);
         self.watch_recording_for = Some(item.entry.info_hash.clone());
 
@@ -3106,6 +3114,7 @@ impl App {
             self.backend
                 .note_playback(info.torrent_id, info.file_id, state.position, state.duration);
         }
+        self.maybe_recover_stalled_stream();
 
         let Some(info) = self.player.current().cloned() else {
             self.screen = self
@@ -3279,6 +3288,36 @@ impl App {
         }
     }
 
+    /// A resumed stream that never yields a frame is worse than a re-fetch.
+    ///
+    /// The cached-resume path is the one that has been seen to stall; a fresh
+    /// add always plays. So after a few seconds with no frame, re-add the
+    /// stream from scratch once and reopen the player on the new URL.
+    fn maybe_recover_stalled_stream(&mut self) {
+        if self.player.frames_uploaded() > 0 {
+            self.stream_recovered = false;
+            return;
+        }
+        let Some(opened) = self.player_opened_at else {
+            return;
+        };
+        if self.stream_recovered || opened.elapsed() < Duration::from_secs(8) {
+            return;
+        }
+        let Some(info) = self.player.current().cloned() else {
+            return;
+        };
+        self.stream_recovered = true;
+        tracing::warn!(
+            torrent_id = info.torrent_id,
+            file_id = info.file_id,
+            "no frames after 8s; restarting the stream from scratch"
+        );
+        self.pending_play = Some((info.torrent_id, info.file_id));
+        self.backend.restart_stream(info.torrent_id, &[info.file_id]);
+        self.set_toast("Reconnecting the stream\u{2026}", false);
+    }
+
     /// Leave the player, saving where we got to.
     fn leave_player(&mut self) {
         if let (Some(info_hash), true) = (
@@ -3300,6 +3339,8 @@ impl App {
         }
 
         self.player.close();
+        self.player_opened_at = None;
+        self.stream_recovered = false;
         self.watch_recording_for = None;
         self.watch_last_recorded = 0.0;
         self.screen = self
