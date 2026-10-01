@@ -319,8 +319,40 @@ impl App {
         self.refresh();
     }
 
-    /// Start playing a file, resuming from where it was left off.
-    pub fn play_file(&mut self, ctx: &egui::Context, torrent_id: usize, file_id: usize) {
+    /// Prepare to play a file, then open the player once the backend says it is
+    /// ready.
+    ///
+    /// The backend may have to re-add the torrent (a stream that was released,
+    /// or a switch between streaming and downloading), and a re-add gets a new
+    /// engine id. Opening the player immediately would hand mpv the *old*
+    /// stream URL, which then 404s and never plays. So the play is deferred
+    /// until [`crate::backend::BackendEvent::Ready`], and the URL is read from
+    /// the refreshed library at that point.
+    pub fn play_file(&mut self, _ctx: &egui::Context, torrent_id: usize, file_id: usize) {
+        let Some(item) = self.item(torrent_id) else {
+            self.warn("That torrent is no longer in the library");
+            return;
+        };
+        let Some(file) = item.torrent.files.iter().find(|f| f.id == file_id) else {
+            self.warn("That file is no longer in the torrent");
+            return;
+        };
+
+        // Sidecar subtitles ride along with the video, both as files to fetch
+        // and as URLs for mpv to load.
+        let companions = companion_subtitles(&item.torrent.files, file);
+        let mut selection = vec![file_id];
+        selection.extend(companions.iter().copied());
+        selection.sort_unstable();
+        selection.dedup();
+
+        self.start_streaming(torrent_id, &selection);
+        self.pending_play = Some((torrent_id, file_id));
+        self.set_toast("Preparing to stream\u{2026}", false);
+    }
+
+    /// Open the player for a file that the backend has confirmed is ready.
+    fn open_player(&mut self, torrent_id: usize, file_id: usize) {
         let Some(item) = self.item(torrent_id) else {
             self.warn("That torrent is no longer in the library");
             return;
@@ -344,8 +376,6 @@ impl App {
             (playable <= 1).then(|| item.resume_position()).flatten()
         });
 
-        // Sidecar subtitles ride along with the video, both as files to fetch
-        // and as URLs for mpv to load.
         let companions = companion_subtitles(&item.torrent.files, file);
         let subtitles: Vec<(String, String)> = companions
             .iter()
@@ -377,31 +407,12 @@ impl App {
             .clone()
             .unwrap_or_else(|| format!("{}{}", self.backend.base_url(), file.stream.path));
 
-        // Watching one episode should fetch one episode — and the torrent has to
-        // be running. A pack is added paused, so selecting files alone would
-        // leave playback waiting forever.
         let others = item
             .torrent
             .files
             .iter()
             .filter(|f| f.included && f.id != file_id && !companions.contains(&f.id))
             .count();
-        let mut selection = vec![file_id];
-        selection.extend(companions.iter().copied());
-        selection.sort_unstable();
-        selection.dedup();
-
-        // A streamed title is removed when playback stops, so playing it again
-        // means bringing it back first. That is asynchronous, so the play waits
-        // for the Ready event rather than opening a player on a missing torrent.
-        if !self.backend.is_live(torrent_id) {
-            self.start_streaming(torrent_id, &selection);
-            self.pending_play = Some((torrent_id, file_id));
-            self.set_toast("Preparing to stream\u{2026}", false);
-            return;
-        }
-
-        self.start_streaming(torrent_id, &selection);
         if others > 0 {
             self.set_toast(
                 format!(
@@ -419,7 +430,11 @@ impl App {
         self.watch_last_recorded = start_at.unwrap_or(0.0);
         self.watch_recording_for = Some(item.entry.info_hash.clone());
 
-        match self.player.open(ctx, &capability, &url, info) {
+        let ctx = self
+            .pending_ctx
+            .clone()
+            .unwrap_or_else(egui::Context::default);
+        match self.player.open(&ctx, &capability, &url, info) {
             Ok(()) => {
                 self.screen = Screen::Player;
                 self.toast = None;
@@ -520,9 +535,7 @@ impl App {
                             .is_some_and(|item| item.entry.info_hash == info_hash);
                         if matches {
                             self.pending_play = None;
-                            if let Some(ctx) = self.pending_ctx.clone() {
-                                self.play_file(&ctx, torrent_id, file_id);
-                            }
+                            self.open_player(torrent_id, file_id);
                         }
                     }
                 }
@@ -2836,6 +2849,26 @@ impl App {
                     egui::Slider::new(&mut draft.default_volume, 0.0..=130.0).suffix(" %"),
                 );
             });
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    Vec2::new(150.0, 18.0),
+                    egui::Label::new(
+                        egui::RichText::new("Stream buffer").color(theme::TEXT_DIM),
+                    ),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut draft.stream_buffer_mb)
+                        .range(0..=8192)
+                        .suffix(" MB"),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "How far ahead a stream may fetch before it pauses. 0 removes the limit.",
+                    )
+                    .color(theme::TEXT_DIM)
+                    .size(11.0),
+                );
+            });
             match &caps.player {
                 PlayerCapability::Embedded => {
                     row(ui, "Backend", "libmpv (embedded in this window)");
@@ -2965,6 +2998,14 @@ impl App {
         // Repaint continuously so the video keeps advancing without input.
         ctx.request_repaint();
         self.record_watch_progress();
+
+        // Let the backend cap how far ahead the stream fetches.
+        let info = self.player.current().cloned();
+        let state = self.player.state();
+        if let Some(info) = info {
+            self.backend
+                .note_playback(info.torrent_id, info.file_id, state.position, state.duration);
+        }
 
         let Some(info) = self.player.current().cloned() else {
             self.screen = self

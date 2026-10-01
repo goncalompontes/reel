@@ -56,6 +56,12 @@ pub struct CatalogSettings {
     /// Initial player volume, 0–100.
     #[serde(default = "default_volume")]
     pub default_volume: f32,
+
+    /// While streaming, stop fetching once this much is buffered ahead of
+    /// playback, and resume when it drops. `0` disables the limit. librqbit
+    /// only prioritises a window; it will otherwise fetch the whole file.
+    #[serde(default = "default_stream_buffer_mb")]
+    pub stream_buffer_mb: u32,
 }
 
 fn default_true() -> bool {
@@ -64,6 +70,10 @@ fn default_true() -> bool {
 
 fn default_volume() -> f32 {
     100.0
+}
+
+fn default_stream_buffer_mb() -> u32 {
+    256
 }
 
 impl Default for CatalogSettings {
@@ -77,6 +87,7 @@ impl Default for CatalogSettings {
             merge_works: default_true(),
             subtitle_language: None,
             default_volume: default_volume(),
+            stream_buffer_mb: default_stream_buffer_mb(),
         }
     }
 }

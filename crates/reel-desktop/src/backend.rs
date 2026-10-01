@@ -184,6 +184,11 @@ pub trait Backend {
     /// [`BackendEvent::Ready`] when it is done.
     fn is_live(&self, id: usize) -> bool;
 
+    /// Report the player's position so the backend can keep streaming from
+    /// running away: once too much is buffered ahead of playback it pauses the
+    /// fetch, and resumes when playback catches up.
+    fn note_playback(&self, id: usize, file_id: usize, position: f64, duration: Option<f64>);
+
     /// Remember how far through one file of a torrent playback got.
     ///
     /// Per file, not per torrent: a series is one torrent with many episodes,
@@ -271,6 +276,34 @@ pub struct EngineBackend {
     catalog: Arc<CatalogState>,
     /// The durable library, independent of which torrents are in the session.
     library: Arc<Mutex<LibraryStore>>,
+    /// Per-title read-ahead governor state, for bounding a stream.
+    governor: Mutex<HashMap<usize, Governor>>,
+}
+
+/// Whether the read-ahead governor has paused a stream, and when it last
+/// checked. Pausing is how the fetch is capped: librqbit only prioritises a
+/// window and will otherwise fetch the whole file.
+#[derive(Debug, Default)]
+struct Governor {
+    paused: bool,
+    last_check: Option<Instant>,
+}
+
+/// How far ahead of playback the download has run, in bytes.
+///
+/// `progress_bytes` is what has been fetched; `position / duration` is the
+/// fraction already watched; the difference is what is buffered ahead.
+pub(crate) fn readahead_bytes(
+    progress_bytes: u64,
+    length: u64,
+    position: f64,
+    duration: Option<f64>,
+) -> f64 {
+    let Some(duration) = duration.filter(|d| *d > 0.0) else {
+        return progress_bytes as f64;
+    };
+    let watched = (position / duration).clamp(0.0, 1.0) * length as f64;
+    (progress_bytes as f64 - watched).max(0.0)
 }
 
 impl EngineBackend {
@@ -384,6 +417,7 @@ impl EngineBackend {
             shutdown: Mutex::new(Some(shutdown_tx)),
             catalog,
             library,
+            governor: Mutex::new(HashMap::new()),
         };
 
         // Bring back the titles the user asked to keep, then enrich.
@@ -1110,18 +1144,29 @@ impl Backend for EngineBackend {
             .live_map()
             .get(&entry.info_hash.to_ascii_lowercase())
             .copied();
+        let events = self.events.clone();
+        let info_hash = entry.info_hash.clone();
         match live_id {
             // A download is running: leave its storage alone, just make sure
             // the streamed file is fetched too.
             Some(engine_id) if !entry.selected_files.is_empty() => {
                 let engine = self.engine.clone();
-                self.spawn_result("start files", async move {
-                    engine.resume(engine_id).await?;
-                    engine.set_only_files(engine_id, &selection).await
+                self.runtime.spawn(async move {
+                    if let Err(e) = engine.set_only_files(engine_id, &selection).await {
+                        tracing::warn!(error = %e, "could not set the stream selection");
+                    }
+                    if let Err(e) = engine.resume(engine_id).await {
+                        tracing::warn!(error = %e, "could not start the stream");
+                    }
+                    events
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(BackendEvent::Ready { info_hash });
                 });
             }
-            // Pure streaming: recycle with exactly this selection, so nothing
-            // else is fetched and the previous stream's storage is freed.
+            // Pure streaming: re-add with exactly this selection (which also
+            // frees the previous stream's storage). Recycle reports Ready, and
+            // the player opens with the new URL only after that.
             _ => self.recycle(entry, false, Some(selection), false),
         }
     }
@@ -1200,6 +1245,10 @@ impl Backend for EngineBackend {
         if entry.downloading {
             return;
         }
+        self.governor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
         // Free the temporary storage by removing the torrent entirely. It stays
         // in the library, and `start_files` brings it back on demand. Re-adding
         // it here instead would race a quick second Play.
@@ -1216,6 +1265,67 @@ impl Backend for EngineBackend {
             .entry(id)
             .map(|entry| entry.info_hash.to_ascii_lowercase())
             .is_some_and(|hash| self.live_map().contains_key(&hash))
+    }
+
+    fn note_playback(&self, id: usize, file_id: usize, position: f64, duration: Option<f64>) {
+        let cap_mb = self.settings().stream_buffer_mb;
+        if cap_mb == 0 {
+            return;
+        }
+        let cap = cap_mb as f64 * 1024.0 * 1024.0;
+
+        // Called once a frame; two seconds is often enough to react and cheap
+        // enough not to keep re-listing the engine.
+        {
+            let mut governor = self.governor.lock().unwrap_or_else(|e| e.into_inner());
+            let state = governor.entry(id).or_default();
+            let now = Instant::now();
+            if state
+                .last_check
+                .is_some_and(|last| now.duration_since(last) < Duration::from_secs(2))
+            {
+                return;
+            }
+            state.last_check = Some(now);
+        }
+
+        let Some(entry) = self.snapshot().entry(id).cloned() else {
+            return;
+        };
+        // A download runs to completion; only a stream is capped.
+        if !entry.selected_files.is_empty() {
+            return;
+        }
+        if !self
+            .live_map()
+            .contains_key(&entry.info_hash.to_ascii_lowercase())
+        {
+            return;
+        }
+        let Some(item) = self.item(id) else {
+            return;
+        };
+        let Some(file) = item.torrent.files.iter().find(|file| file.id == file_id) else {
+            return;
+        };
+        let readahead = readahead_bytes(file.progress_bytes, file.length, position, duration);
+
+        let paused = {
+            let mut governor = self.governor.lock().unwrap_or_else(|e| e.into_inner());
+            let state = governor.entry(id).or_default();
+            if readahead > cap && !state.paused {
+                state.paused = true;
+                Some(true)
+            } else if readahead < cap * 0.25 && state.paused {
+                state.paused = false;
+                Some(false)
+            } else {
+                None
+            }
+        };
+        if let Some(paused) = paused {
+            self.set_paused(id, paused);
+        }
     }
 
     fn record_watch(
@@ -1655,6 +1765,10 @@ impl Backend for FakeBackend {
         true
     }
 
+    fn note_playback(&self, _id: usize, _file_id: usize, _position: f64, _duration: Option<f64>) {
+        // The demo has no engine to throttle.
+    }
+
     fn record_watch(
         &self,
         info_hash: &str,
@@ -1822,6 +1936,18 @@ mod tests {
             downloading: false,
             added_at: 0,
         }
+    }
+
+    #[test]
+    fn readahead_is_what_is_buffered_past_the_playhead() {
+        // Half of a 1000-byte file fetched, watched half of it: nothing ahead.
+        assert_eq!(readahead_bytes(500, 1000, 50.0, Some(100.0)), 0.0);
+        // Watched a quarter but fetched half: a quarter of the file is ahead.
+        assert_eq!(readahead_bytes(500, 1000, 25.0, Some(100.0)), 250.0);
+        // With no duration known, all progress counts as ahead.
+        assert_eq!(readahead_bytes(500, 1000, 50.0, None), 500.0);
+        // Seeking back grows the read-ahead, which is what triggers a pause.
+        assert_eq!(readahead_bytes(900, 1000, 10.0, Some(100.0)), 800.0);
     }
 
     #[test]

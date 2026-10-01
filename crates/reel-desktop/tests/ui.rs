@@ -149,6 +149,7 @@ fn settings_reports_the_backend_and_catalog() {
         "Stream on demand",
         "Playback",
         "Turn subtitles on",
+        "Stream buffer",
     ] {
         assert!(
             harness.query_all_by_label_contains(label).next().is_some(),
