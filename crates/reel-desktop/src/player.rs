@@ -233,6 +233,12 @@ impl PlayerController {
             player.set_target_size(None);
             let _ = player.stop();
         }
+        // Drop the whole mpv instance rather than reusing it. A reused core
+        // keeps its demuxer cache, decoder and seek index, and after a seeked
+        // HEVC stream it has been seen to wedge: the server has bytes queued and
+        // mpv simply stops reading them. A fresh core per play costs a few tens
+        // of milliseconds and cannot inherit that state.
+        self.player = None;
         self.current = None;
         self.scrub_position = None;
         self.texture = None;

@@ -78,8 +78,10 @@ pub struct App {
     player_origin: Option<usize>,
     /// A play request waiting for its temporary torrent to be brought back.
     pending_play: Option<(usize, usize)>,
-    /// When the current player session opened, to detect a stalled resume.
-    player_opened_at: Option<Instant>,
+    /// Frames seen last frame and when they last advanced, to detect a stall
+    /// (a frozen picture, not only "no frame at all").
+    player_last_frames: u64,
+    player_progress_at: Instant,
     /// Whether this play has already fallen back to a fresh re-add.
     stream_recovered: bool,
     /// The egui context for the current frame, so UI actions triggered deep in
@@ -133,7 +135,8 @@ impl App {
             player_controls_hidden: false,
             player_origin: None,
             pending_play: None,
-            player_opened_at: None,
+            player_last_frames: 0,
+            player_progress_at: Instant::now(),
             stream_recovered: false,
             pending_ctx: None,
             watch_last_recorded: 0.0,
@@ -449,7 +452,8 @@ impl App {
 
         let capability = self.backend.capabilities().player.clone();
         self.player_origin = Some(torrent_id);
-        self.player_opened_at = Some(Instant::now());
+        self.player_last_frames = 0;
+        self.player_progress_at = Instant::now();
         self.watch_last_recorded = start_at.unwrap_or(0.0);
         self.watch_recording_for = Some(item.entry.info_hash.clone());
 
@@ -3294,14 +3298,24 @@ impl App {
     /// add always plays. So after a few seconds with no frame, re-add the
     /// stream from scratch once and reopen the player on the new URL.
     fn maybe_recover_stalled_stream(&mut self) {
-        if self.player.frames_uploaded() > 0 {
+        // A paused player, or one that reached the end, is not stalled.
+        let state = self.player.state();
+        if state.paused || state.eof {
+            self.player_progress_at = Instant::now();
+            return;
+        }
+
+        // Frames advancing means it is playing. No new frames for eight seconds
+        // means it is wedged — which is what the log showed: the server had
+        // megabytes queued and mpv had stopped reading them.
+        let frames = self.player.frames_uploaded();
+        if frames != self.player_last_frames {
+            self.player_last_frames = frames;
+            self.player_progress_at = Instant::now();
             self.stream_recovered = false;
             return;
         }
-        let Some(opened) = self.player_opened_at else {
-            return;
-        };
-        if self.stream_recovered || opened.elapsed() < Duration::from_secs(8) {
+        if self.stream_recovered || self.player_progress_at.elapsed() < Duration::from_secs(8) {
             return;
         }
         let Some(info) = self.player.current().cloned() else {
@@ -3311,7 +3325,8 @@ impl App {
         tracing::warn!(
             torrent_id = info.torrent_id,
             file_id = info.file_id,
-            "no frames after 8s; restarting the stream from scratch"
+            frames,
+            "no new frames for 8s; restarting the stream from scratch"
         );
         self.pending_play = Some((info.torrent_id, info.file_id));
         self.backend.restart_stream(info.torrent_id, &[info.file_id]);
@@ -3339,7 +3354,8 @@ impl App {
         }
 
         self.player.close();
-        self.player_opened_at = None;
+        self.player_last_frames = 0;
+        self.player_progress_at = Instant::now();
         self.stream_recovered = false;
         self.watch_recording_for = None;
         self.watch_last_recorded = 0.0;
