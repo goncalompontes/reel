@@ -278,6 +278,11 @@ pub struct EngineBackend {
     library: Arc<Mutex<LibraryStore>>,
     /// Per-title read-ahead governor state, for bounding a stream.
     governor: Mutex<HashMap<usize, Governor>>,
+    /// Stream-only titles whose buffer is being kept for a fast replay, with
+    /// the last time each was watched (oldest is evicted first).
+    stream_cache: Mutex<HashMap<usize, Instant>>,
+    /// The title currently playing, which is never evicted.
+    playing: Mutex<Option<usize>>,
 }
 
 /// Whether the read-ahead governor has paused a stream, and when it last
@@ -418,6 +423,8 @@ impl EngineBackend {
             catalog,
             library,
             governor: Mutex::new(HashMap::new()),
+            stream_cache: Mutex::new(HashMap::new()),
+            playing: Mutex::new(None),
         };
 
         // Bring back the titles the user asked to keep, then enrich.
@@ -612,6 +619,74 @@ impl EngineBackend {
         let snapshot = store.clone();
         drop(store);
         let _ = snapshot.save(&self.library_path());
+    }
+
+    /// Remember that a stream was watched, for cache eviction order.
+    fn touch_cache(&self, id: usize) {
+        self.stream_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, Instant::now());
+    }
+
+    /// Release the least recently watched stream buffers once the session cache
+    /// is over its limit. Streams with downloads attached are left alone; the
+    /// title currently playing is never evicted.
+    fn enforce_stream_cache(&self) {
+        let cap_mb = self.settings().stream_cache_mb;
+        let cap = cap_mb as u64 * 1024 * 1024;
+        let store = self.snapshot();
+        let playing = *self.playing.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut used = 0u64;
+        let mut candidates: Vec<(Instant, u64, usize, String)> = Vec::new();
+        let oldest = Instant::now() - Duration::from_secs(86_400);
+        for view in self.engine.list() {
+            let Some(entry) = store.by_hash(&view.info_hash) else {
+                continue;
+            };
+            // A download runs to completion; it is not cache-managed.
+            if !entry.selected_files.is_empty() {
+                continue;
+            }
+            let bytes = view.stats.progress_bytes;
+            used += bytes;
+            if Some(entry.id) != playing {
+                let last = self
+                    .stream_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&entry.id)
+                    .copied()
+                    .unwrap_or(oldest);
+                candidates.push((last, bytes, entry.id, entry.info_hash.clone()));
+            }
+        }
+
+        if cap_mb != 0 && used <= cap {
+            return;
+        }
+        candidates.sort_by_key(|(last, ..)| *last);
+        for (_, bytes, store_id, hash) in candidates {
+            if cap_mb != 0 && used <= cap {
+                break;
+            }
+            let engine = self.engine.clone();
+            self.runtime.spawn(async move {
+                if let Some(engine_id) = engine.id_for_hash(&hash) {
+                    let _ = engine.remove(engine_id, false).await;
+                }
+            });
+            self.stream_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&store_id);
+            self.governor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&store_id);
+            used = used.saturating_sub(bytes);
+        }
     }
 
     /// Write back the file list the engine knows, once a magnet has resolved.
@@ -1140,16 +1215,24 @@ impl Backend for EngineBackend {
         selection.sort_unstable();
         selection.dedup();
 
+        // Mark it playing so the session cache never evicts what is on screen.
+        *self.playing.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
+        self.touch_cache(id);
+
         let live_id = self
             .live_map()
             .get(&entry.info_hash.to_ascii_lowercase())
             .copied();
         let events = self.events.clone();
         let info_hash = entry.info_hash.clone();
+        // A cached stream already has bytes on hand and is initialised, so it
+        // can just resume. A freshly added torrent has nothing yet and cannot
+        // accept a selection change while it initialises, so it is re-added.
+        let has_buffer = self
+            .item(id)
+            .is_some_and(|item| item.torrent.stats.progress_bytes > 0);
         match live_id {
-            // A download is running: leave its storage alone, just make sure
-            // the streamed file is fetched too.
-            Some(engine_id) if !entry.selected_files.is_empty() => {
+            Some(engine_id) if has_buffer || !entry.selected_files.is_empty() => {
                 let engine = self.engine.clone();
                 self.runtime.spawn(async move {
                     if let Err(e) = engine.set_only_files(engine_id, &selection).await {
@@ -1164,9 +1247,10 @@ impl Backend for EngineBackend {
                         .push(BackendEvent::Ready { info_hash });
                 });
             }
-            // Pure streaming: re-add with exactly this selection (which also
-            // frees the previous stream's storage). Recycle reports Ready, and
-            // the player opens with the new URL only after that.
+            // In the session but not yet buffered: re-add so the selection is
+            // applied as it initialises. Not in the session (evicted or never
+            // played) is the same path. Recycle reports Ready, and the player
+            // opens with the new URL only after that.
             _ => self.recycle(entry, false, Some(selection), false),
         }
     }
@@ -1245,19 +1329,28 @@ impl Backend for EngineBackend {
         if entry.downloading {
             return;
         }
+        // The read-ahead governor is only for active playback.
         self.governor
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&id);
-        // Free the temporary storage by removing the torrent entirely. It stays
-        // in the library, and `start_files` brings it back on demand. Re-adding
-        // it here instead would race a quick second Play.
-        let engine = self.engine.clone();
-        self.runtime.spawn(async move {
-            if let Some(engine_id) = engine.id_for_hash(&entry.info_hash) {
-                let _ = engine.remove(engine_id, false).await;
+        {
+            let mut playing = self.playing.lock().unwrap_or_else(|e| e.into_inner());
+            if *playing == Some(id) {
+                *playing = None;
             }
-        });
+        }
+
+        // Keep the buffer: pause instead of removing, so a replay in this
+        // session is instant. The session cache bounds how much is kept; the
+        // least recently watched streams are released when it overflows.
+        if let Some(item) = self.item(id) {
+            if !item.torrent.stats.is_paused() {
+                self.set_paused(id, true);
+            }
+        }
+        self.touch_cache(id);
+        self.enforce_stream_cache();
     }
 
     fn is_live(&self, id: usize) -> bool {

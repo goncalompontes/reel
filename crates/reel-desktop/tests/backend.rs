@@ -302,7 +302,12 @@ fn streaming_is_temporary_and_downloading_is_opt_in() {
     wait("the first stream to start", Box::new(|| backend.is_live(id)));
 
     backend.stop_streaming(id);
-    wait("the stream to be released", Box::new(|| !backend.is_live(id)));
+    wait("the stream to be cached", Box::new(|| {
+        backend.is_live(id)
+            && backend
+                .item(id)
+                .is_some_and(|item| item.torrent.stats.is_paused())
+    }));
 
     assert!(
         backend.item(id).is_some(),

@@ -62,6 +62,12 @@ pub struct CatalogSettings {
     /// only prioritises a window; it will otherwise fetch the whole file.
     #[serde(default = "default_stream_buffer_mb")]
     pub stream_buffer_mb: u32,
+
+    /// How much streamed data to keep for the rest of the session so replay is
+    /// instant. When this is exceeded the least recently watched streams are
+    /// released. `0` releases each stream as soon as playback stops.
+    #[serde(default = "default_stream_cache_mb")]
+    pub stream_cache_mb: u32,
 }
 
 fn default_true() -> bool {
@@ -76,6 +82,10 @@ fn default_stream_buffer_mb() -> u32 {
     256
 }
 
+fn default_stream_cache_mb() -> u32 {
+    1024
+}
+
 impl Default for CatalogSettings {
     fn default() -> Self {
         Self {
@@ -88,6 +98,7 @@ impl Default for CatalogSettings {
             subtitle_language: None,
             default_volume: default_volume(),
             stream_buffer_mb: default_stream_buffer_mb(),
+            stream_cache_mb: default_stream_cache_mb(),
         }
     }
 }

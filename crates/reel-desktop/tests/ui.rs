@@ -150,6 +150,7 @@ fn settings_reports_the_backend_and_catalog() {
         "Playback",
         "Turn subtitles on",
         "Stream buffer",
+        "Session cache",
     ] {
         assert!(
             harness.query_all_by_label_contains(label).next().is_some(),

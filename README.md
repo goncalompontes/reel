@@ -392,6 +392,11 @@ library, the bytes do not.
 * **A clear download state.** Each row carries its own progress bar while it
   downloads, and turns into **Downloaded** with a *Remove download* button once
   the file is complete — not a forever "Stop download" at 100%.
+* **Replay is instant in the same session.** Leaving the player pauses the
+  stream instead of discarding it, so pressing play again resumes from the
+  buffer. **Settings → Playback → Session cache (MB)** bounds how much is kept
+  across titles (default 1 GiB); the least recently watched streams are released
+  when it overflows, and `0` releases each one as soon as playback stops.
 * **The library is durable.** Since a streamed torrent is removed when it stops,
   a persisted `library.json` (plus a saved `.torrent` per title) is what makes a
   title stay in the library. Downloads are re-added at startup; streams wait
@@ -494,6 +499,10 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the reasoning.
 * **Logs.** A launcher starts the app with no terminal, so stderr goes nowhere;
   the app also writes `~/.local/share/reel/reel.log` (truncated each start) for
   exactly this reason.
+* **Compressing the stream cache would not pay.** The bytes being cached are
+  already-compressed video; compressing them again costs real CPU and adds
+  latency to the very replay the cache exists to make instant, for almost no
+  space saved. The cache is bounded by size instead (above).
 * **Security.** The streaming API is bound to `127.0.0.1` and CORS is off by
   default; the API can delete files, so do not expose it.
 * **Codecs.** Streaming is byte-exact, it does not transcode. libmpv plays

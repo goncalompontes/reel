@@ -157,6 +157,14 @@ pointer movement.
 > stream fetches only the window around the playhead, not the whole file or the
 > part before a resume point. Download rows show their own progress and a
 > Downloaded/Remove state.
+>
+> Fourth pass: leaving the player no longer releases the stream. It is paused
+> and kept for the session so replay is instant; a `stream_cache_mb` setting
+> (default 1024) bounds the total, evicting the least recently watched streams
+> when it overflows (`0` releases on stop). Replaying a cached stream resumes
+> the existing torrent in place; only a title with no buffer is re-added.
+> Compression is deliberately not applied — the content is already compressed
+> video, so it would cost CPU and latency for no meaningful saving.
 
 ## Implementation notes (streaming pass)
 

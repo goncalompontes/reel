@@ -2933,6 +2933,26 @@ impl App {
                     .size(11.0),
                 );
             });
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    Vec2::new(150.0, 18.0),
+                    egui::Label::new(
+                        egui::RichText::new("Session cache").color(theme::TEXT_DIM),
+                    ),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut draft.stream_cache_mb)
+                        .range(0..=65536)
+                        .suffix(" MB"),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Streamed data kept for instant replay this session. 0 releases it on stop.",
+                    )
+                    .color(theme::TEXT_DIM)
+                    .size(11.0),
+                );
+            });
             match &caps.player {
                 PlayerCapability::Embedded => {
                     row(ui, "Backend", "libmpv (embedded in this window)");
