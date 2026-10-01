@@ -302,6 +302,17 @@ pub fn sample_season_pack() -> LibraryItem {
     )
 }
 
+/// A season pack exactly as the engine leaves it right after a stream-only add:
+/// paused, with every episode in the fetch plan but nothing being fetched.
+///
+/// This is the state that made every episode look downloaded.
+pub fn sample_paused_season_pack() -> LibraryItem {
+    let mut item = sample_season_pack();
+    item.torrent.state = "paused".to_string();
+    item.torrent.stats.state = "paused".to_string();
+    item
+}
+
 /// A pack holding two seasons, which is the case a single-season view cannot
 /// describe: the file names say which season each episode belongs to, and the
 /// interface has to keep them apart.

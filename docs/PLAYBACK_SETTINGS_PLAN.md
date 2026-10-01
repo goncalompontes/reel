@@ -131,6 +131,13 @@ pointer movement.
 > live, so a temporary stream can be released on stop and brought back on
 > demand. `tests/backend.rs` exercises add → stream → keep → stop against the
 > real engine.
+>
+> Follow-up from a real season pack test: a paused pack no longer shows every
+> episode as downloading (a `pause_notice` and an explicit Download/Stop toggle
+> replace that), selecting files no longer resumes the torrent, and releasing a
+> stream removes the torrent instead of racing a re-add. These are pinned by
+> `tests/ui_scenarios.rs`, a headless harness that drives the real widget tree
+> with synthetic input — see `docs/DEBUGGING_UI.md`.
 
 ## Implementation notes (streaming pass)
 

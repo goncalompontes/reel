@@ -174,7 +174,10 @@ fetch the data from the first. It asserts, among other things, that:
 * the full download is byte-identical to the source.
 
 The desktop app is verified separately, without a display server, by
-`crates/reel-desktop/tests/`:
+`crates/reel-desktop/tests/`. `ui_scenarios.rs` drives the **real widget tree**
+through AccessKit — find a button by label, click it, type, press keys, step
+frames — which is how interaction bugs become scripted tests; see
+[`docs/DEBUGGING_UI.md`](docs/DEBUGGING_UI.md) for how to write one. The rest:
 
 * `ui.rs` drives the real widget tree through AccessKit (`egui_kittest`) and
   renders the library and detail pages to PNG snapshots in

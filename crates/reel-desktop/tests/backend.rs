@@ -185,6 +185,32 @@ fn streaming_is_temporary_and_downloading_is_opt_in() {
     // The title is still in the library even though the torrent was recycled.
     assert!(backend.item(id).is_some(), "the library outlives the torrent");
 
+    // Stream, release, and stream again. The second play is what used to get
+    // stuck: the torrent has to be brought back from the saved .torrent first.
+    backend.start_files(id, &[0]);
+    wait("the first stream to start", Box::new(|| backend.is_live(id)));
+
+    backend.stop_streaming(id);
+    wait("the stream to be released", Box::new(|| !backend.is_live(id)));
+
+    assert!(
+        backend.item(id).is_some(),
+        "releasing a stream must not remove the title from the library"
+    );
+
+    backend.start_files(id, &[0]);
+    wait("the second stream to start", Box::new(|| backend.is_live(id)));
+    let selected: Vec<usize> = backend
+        .item(id)
+        .expect("the title")
+        .torrent
+        .files
+        .iter()
+        .filter(|file| file.included)
+        .map(|file| file.id)
+        .collect();
+    assert_eq!(selected, vec![0], "the played file is selected again");
+
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&scratch);
 }

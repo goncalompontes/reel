@@ -1125,9 +1125,15 @@ impl Backend for EngineBackend {
         if entry.downloading {
             return;
         }
-        // Free the temporary storage: remove the live torrent and re-add it
-        // paused, still in the library.
-        self.recycle(entry, false, None, false);
+        // Free the temporary storage by removing the torrent entirely. It stays
+        // in the library, and `start_files` brings it back on demand. Re-adding
+        // it here instead would race a quick second Play.
+        let engine = self.engine.clone();
+        self.runtime.spawn(async move {
+            if let Some(engine_id) = engine.id_for_hash(&entry.info_hash) {
+                let _ = engine.remove(engine_id, false).await;
+            }
+        });
     }
 
     fn is_live(&self, id: usize) -> bool {
@@ -1525,11 +1531,16 @@ impl Backend for FakeBackend {
 
     fn download_files(&self, id: usize, files: &[usize]) {
         self.start_files(id, files);
+        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(item) = items.iter_mut().find(|i| i.torrent.id == id) {
+            item.downloading = true;
+        }
     }
 
     fn stop_download(&self, id: usize) {
         let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(item) = items.iter_mut().find(|i| i.torrent.id == id) {
+            item.downloading = false;
             item.torrent.stats.state = "paused".to_string();
             item.torrent.state = "paused".to_string();
         }

@@ -581,13 +581,18 @@ impl App {
         }
     }
 
-    /// Fetch exactly these files of a torrent, and make sure it is running.
+    /// Change which files a torrent is set to fetch, without starting it.
     ///
-    /// Public so the flow the UI reaches by ticking a box can also be driven
-    /// from a test. Resuming matters: a multi-file torrent is added paused, so
-    /// without it a checked box would never actually download.
+    /// A checkbox is a plan, not a command: ticking one on a paused pack must
+    /// not quietly resume the whole torrent. Play and Download are what start
+    /// fetching; this only edits the selection.
     pub fn select_files(&mut self, torrent_id: usize, files: &[usize]) {
-        self.start_streaming(torrent_id, files);
+        if files.is_empty() {
+            self.warn("Choose at least one file to fetch");
+            return;
+        }
+        self.backend.set_only_files(torrent_id, files);
+        self.invalidate();
     }
 
     /// The one place the app starts fetching a selection.
@@ -1786,10 +1791,12 @@ impl App {
             .size(11.0),
         );
         ui.add_space(6.0);
+        self.pause_notice(ui, work);
 
         for (index, version) in versions.iter().enumerate() {
-            let included = self
-                .item(version.torrent_id)
+            let item = self.item(version.torrent_id);
+            let included = item
+                .as_ref()
                 .and_then(|item| {
                     item.torrent
                         .files
@@ -1798,6 +1805,7 @@ impl App {
                         .map(|file| file.included)
                 })
                 .unwrap_or(false);
+            let title_downloading = item.as_ref().is_some_and(|item| item.downloading);
 
             egui::Frame::NONE
                 .fill(theme::SURFACE)
@@ -1828,7 +1836,7 @@ impl App {
                                 *action =
                                     Some(DetailAction::Play(version.torrent_id, version.file_id));
                             }
-                            if included {
+                            if title_downloading && included {
                                 if ui
                                     .small_button("Stop download")
                                     .on_hover_text("Stop keeping this download")
@@ -1861,6 +1869,28 @@ impl App {
         }
 
         self.extras_list(ui, work);
+    }
+
+    /// Explain the paused-on-add state: the engine holds a fetch plan but is
+    /// not fetching, so nothing should look like it is downloading.
+    fn pause_notice(&self, ui: &mut egui::Ui, work: &Work) {
+        let downloading = work
+            .members
+            .iter()
+            .any(|member| self.item(member.torrent_id()).is_some_and(|item| item.downloading));
+        let paused = self
+            .lead_item(work)
+            .is_some_and(|item| item.torrent.stats.is_paused());
+        if paused && !downloading {
+            ui.label(
+                egui::RichText::new(
+                    "Paused \u{2014} nothing is being fetched yet. Press Play to stream a copy, \
+                     or Download one to keep it.",
+                )
+                .size(11.5)
+                .color(theme::WARN),
+            );
+        }
     }
 
     /// Bonus material, shared by the film and series views.
@@ -1933,6 +1963,7 @@ impl App {
                     .color(theme::TEXT_DIM),
             );
         }
+        self.pause_notice(ui, work);
         ui.add_space(8.0);
 
         if ui
@@ -2013,6 +2044,13 @@ impl App {
             self.item(variant.torrent_id)
                 .and_then(|item| item.entry.watch_for_file(variant.file_id).cloned())
         });
+        // Being *selected* is not the same as being *kept*: a stream pack is
+        // paused, so every episode is in the fetch plan but nothing is
+        // downloading. Only a title the user asked to keep shows Stop download.
+        let title_downloading = chosen
+            .as_ref()
+            .and_then(|variant| self.item(variant.torrent_id))
+            .is_some_and(|item| item.downloading);
 
         let key = episode_choice_key(work, episode);
         let code = episode.code();
@@ -2101,7 +2139,7 @@ impl App {
                             if ui.small_button("Play").clicked() {
                                 *action = Some(DetailAction::Play(torrent_id, file_id));
                             }
-                            if included {
+                            if title_downloading && included {
                                 if ui
                                     .small_button("Stop download")
                                     .on_hover_text("Stop keeping this download")
@@ -2110,7 +2148,11 @@ impl App {
                                     *action =
                                         Some(DetailAction::CancelDownload(torrent_id, file_id));
                                 }
-                            } else if ui.small_button("Download").clicked() {
+                            } else if ui
+                                .small_button("Download")
+                                .on_hover_text("Keep this episode on disk")
+                                .clicked()
+                            {
                                 *action = Some(DetailAction::Download(torrent_id, file_id));
                             }
                         }
