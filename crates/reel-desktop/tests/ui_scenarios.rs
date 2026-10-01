@@ -219,6 +219,35 @@ fn a_title_streams_again_after_stopping_a_download() {
     );
 }
 
+#[test]
+fn the_remove_dialog_closes_when_you_navigate_away() {
+    let mut harness = with_paused_pack();
+
+    {
+        harness
+            .get_by_label("\u{1f5d1}  Remove")
+            .click();
+    }
+    harness.run_steps(3);
+    assert!(
+        harness
+            .query_all_by_label_contains("Which copies")
+            .next()
+            .is_some(),
+        "Remove should open the source dialog"
+    );
+
+    harness.state_mut().navigate(Screen::Settings);
+    harness.run_steps(3);
+    assert!(
+        harness
+            .query_all_by_label_contains("Which copies")
+            .next()
+            .is_none(),
+        "the dialog belongs to the detail page and should not follow you"
+    );
+}
+
 /// Renders the paused-pack detail page so the "not downloading" state can be
 /// reviewed by eye.
 #[test]

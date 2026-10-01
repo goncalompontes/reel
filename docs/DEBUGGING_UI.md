@@ -19,6 +19,37 @@ UPDATE_SNAPSHOTS=1 cargo test -p reel-desktop --test ui_scenarios   # rewrite PN
 A failing query prints the entire AccessKit tree, so a wrong selector shows you
 what is actually on screen.
 
+## An interactive control channel
+
+For poking at the UI without writing a test first, there is a small socket
+server around the same harness: `examples/ui_debug.rs`.
+
+```bash
+# start it (background); it keeps running
+cargo run -p reel-desktop --example ui_debug -- serve /tmp/opencode/reel-ui.sock /tmp/opencode/reel-ui
+
+# then, from another shell
+cargo run -p reel-desktop --example ui_debug -- send /tmp/opencode/reel-ui.sock "dump"
+cargo run -p reel-desktop --example ui_debug -- send /tmp/opencode/reel-ui.sock "click Play"
+cargo run -p reel-desktop --example ui_debug -- send /tmp/opencode/reel-ui.sock "state"
+cargo run -p reel-desktop --example ui_debug -- send /tmp/opencode/reel-ui.sock "snapshot home"
+```
+
+Commands: `state` (a text summary of the library and every torrent's selection,
+pause and download flags), `dump` (every labelled node on screen),
+`navigate <library|add|search|settings|detail <id>>`, `click <label>`,
+`click_contains <substr>`, `click_role <role> <n>`,
+`type_role <role> <n> <text>`, `key <name>`, `step [n]`, `snapshot <name>`,
+`reset <sample|season|paused|duplicates|two_seasons>`, `quit`.
+
+`click` prefers an actionable node when several share a label, so a page title
+"Search" and the "Search" button do not confuse it. `snapshot` renders the frame
+to `<dir>/<name>.png`, which can be opened directly.
+
+This is how the season-pack bugs were found: `reset paused` then `navigate detail
+9` shows every episode in the fetch plan but `state` reports `paused=true`, and
+`click Play` narrows the selection to one file.
+
 ## Writing a scenario
 
 `crates/reel-desktop/tests/ui_scenarios.rs` is the place. The shape is:

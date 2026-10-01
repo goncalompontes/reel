@@ -879,6 +879,11 @@ impl App {
         let Some(work_id) = self.show_remove else {
             return;
         };
+        // Navigating away dismisses the dialog; it belongs to one detail page.
+        if self.screen != Screen::Detail(work_id) {
+            self.show_remove = None;
+            return;
+        }
         let Some(work) = self.work(work_id) else {
             self.show_remove = None;
             return;
