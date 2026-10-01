@@ -1308,22 +1308,40 @@ impl Backend for EngineBackend {
         let Some(file) = item.torrent.files.iter().find(|file| file.id == file_id) else {
             return;
         };
-        let readahead = readahead_bytes(file.progress_bytes, file.length, position, duration);
 
-        let paused = {
+        // Only cap when the numbers are trustworthy. With no duration, or before
+        // the first frame, "how far ahead are we" has no answer, and pausing then
+        // can stall startup with nothing to resume it. A fully fetched file has
+        // nothing left to cap either.
+        let fully_downloaded = file.length > 0 && file.progress_bytes >= file.length;
+        let desired = if fully_downloaded {
+            false
+        } else if position > 0.0 && duration.is_some_and(|d| d > 0.0) {
+            let readahead = readahead_bytes(file.progress_bytes, file.length, position, duration);
+            if readahead > cap {
+                true
+            } else if readahead < cap * 0.25 {
+                false
+            } else {
+                // Between the marks: hold whatever we have.
+                return;
+            }
+        } else {
+            // Not enough information: never keep a pause.
+            false
+        };
+
+        let change = {
             let mut governor = self.governor.lock().unwrap_or_else(|e| e.into_inner());
             let state = governor.entry(id).or_default();
-            if readahead > cap && !state.paused {
-                state.paused = true;
-                Some(true)
-            } else if readahead < cap * 0.25 && state.paused {
-                state.paused = false;
-                Some(false)
-            } else {
+            if state.paused == desired {
                 None
+            } else {
+                state.paused = desired;
+                Some(desired)
             }
         };
-        if let Some(paused) = paused {
+        if let Some(paused) = change {
             self.set_paused(id, paused);
         }
     }

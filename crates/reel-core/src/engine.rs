@@ -184,7 +184,18 @@ impl Engine {
             format!("creating download dir {}", config.download_dir.display())
         })?;
 
+        // Clear streaming scratch left behind by a previous run that was killed
+        // before it could clean up.
+        if config.stream_scratch_dir.is_none() {
+            crate::streaming::sweep_stale_scratch();
+        }
+
         let mut opts = SessionOptions::default();
+
+        // Never seed unless the caller deliberately asks to (the CLI's seeding
+        // mode). Not a preference for the app: a client that streams content it
+        // was not licensed to distribute must not become a distributor.
+        opts.disable_upload = config.disable_upload;
 
         if config.disable_dht {
             opts.dht = None;
@@ -265,6 +276,9 @@ impl Engine {
 
         AddTorrentOptions {
             paused: opts.paused,
+            // A temporary stream fetches only around the playhead; a download
+            // fetches everything it selected.
+            streaming_only: opts.ephemeral,
             output_folder: opts.output_folder.clone(),
             // An explicit selection wins: it is applied as the torrent
             // initialises, so nothing else is ever briefly selected.

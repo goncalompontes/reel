@@ -40,6 +40,11 @@ pub struct EngineConfig {
     /// Reported to peers and trackers as the client name.
     pub client_name: String,
 
+    /// Refuse to upload. On by default: a client that streams content it does
+    /// not own must not become a distributor. Only the CLI's seeding mode turns
+    /// it off, deliberately.
+    pub disable_upload: bool,
+
     /// How much RAM a stream-only torrent may use before spilling to scratch.
     pub stream_memory_budget: usize,
 
@@ -62,6 +67,7 @@ impl EngineConfig {
             peer_limit: None,
             ipv4_only: false,
             client_name: format!("reel/{}", env!("CARGO_PKG_VERSION")),
+            disable_upload: true,
             stream_memory_budget: crate::streaming::DEFAULT_MEMORY_BUDGET,
             stream_scratch_dir: None,
         }

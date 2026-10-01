@@ -28,7 +28,28 @@ struct Args {
     verbose: u8,
 }
 
+/// A writer that appends to a shared log file.
+struct FileWriter(std::sync::Arc<std::sync::Mutex<std::fs::File>>);
+
+impl std::io::Write for FileWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .flush()
+    }
+}
+
 fn init_tracing(verbosity: u8) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
     let level = match verbosity {
         0 => "info",
         1 => "debug",
@@ -38,13 +59,42 @@ fn init_tracing(verbosity: u8) {
     let filter = format!(
         "{level},librqbit=warn,librqbit_dht=warn,librqbit_utp=warn,reel_player=warn"
     );
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
-        )
-        .with_target(false)
-        .try_init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter));
+
+    // Log to a file as well as stderr. A desktop app is started by a launcher
+    // with no terminal, so without this there is nothing to inspect after a
+    // problem; the file is truncated on each start.
+    let data_dir = default_data_dir();
+    let _ = std::fs::create_dir_all(&data_dir);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(data_dir.join("reel.log"))
+        .ok()
+        .map(|file| std::sync::Arc::new(std::sync::Mutex::new(file)));
+
+    let stderr_layer = tracing_subscriber::fmt::layer().with_target(false);
+    match file {
+        Some(file) => {
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(move || FileWriter(file.clone()));
+            let _ = tracing_subscriber::registry()
+                .with(filter)
+                .with(stderr_layer)
+                .with(file_layer)
+                .try_init();
+        }
+        None => {
+            let _ = tracing_subscriber::registry()
+                .with(filter)
+                .with(stderr_layer)
+                .try_init();
+        }
+    }
 }
 
 fn default_download_dir() -> PathBuf {

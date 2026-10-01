@@ -51,6 +51,48 @@ impl StreamingStorageFactory {
     }
 }
 
+/// The scratch root this process uses: one directory per PID, under the temp
+/// dir, so a crashed run's leftovers are identifiable.
+pub fn scratch_root() -> PathBuf {
+    std::env::temp_dir().join(format!("reel-stream-{}", std::process::id()))
+}
+
+/// Remove scratch directories left by processes that are no longer running.
+///
+/// Spill files are unlinked as soon as they are created, so on Unix a crash
+/// frees their space immediately. This clears the empty directories, and covers
+/// platforms where a file cannot be unlinked while open.
+pub fn sweep_stale_scratch() {
+    let parent = std::env::temp_dir();
+    let current = format!("reel-stream-{}", std::process::id());
+    let Ok(entries) = std::fs::read_dir(&parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name.strip_prefix("reel-stream-").and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if name == current || pid_alive(pid) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
+}
+
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 impl StorageFactory for StreamingStorageFactory {
     type Storage = StreamingStorage;
 
@@ -188,6 +230,13 @@ impl StreamingStorage {
                 .create(true)
                 .truncate(true)
                 .open(&path)?;
+            // Unlink the file but keep the handle. On Unix the data lives only
+            // as long as the descriptor, so even `kill -9` cannot leave it on
+            // disk: process death closes the descriptor and the kernel reclaims
+            // it. On Windows the name stays and is removed on drop or by the
+            // startup sweep.
+            #[cfg(unix)]
+            let _ = std::fs::remove_file(&path);
             state.scratch.insert(file_id, Scratch { file });
         }
         Ok(state
@@ -386,6 +435,43 @@ mod tests {
         storage.pread_exact(0, 0, &mut out).unwrap();
         assert_eq!(out, [9, 9, 9, 1, 2, 3]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_spilled_file_is_unlinked_while_still_readable() {
+        let dir = scratch_dir("unlink");
+        let storage = storage(&dir, 100, &[400]);
+        storage.pwrite_all(0, 0, &[5u8; 400]).unwrap();
+
+        // The name is gone, so a crash cannot leave the bytes on disk...
+        let names: Vec<String> = std::fs::read_dir(&storage.inner.dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.is_empty(),
+            "the spill file must be unlinked, found {names:?}"
+        );
+
+        // ...but the open handle still serves the data.
+        let mut out = [0u8; 400];
+        storage.pread_exact(0, 0, &mut out).unwrap();
+        assert!(out.iter().all(|byte| *byte == 5));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_scratch_from_a_dead_process_is_swept() {
+        let parent = std::env::temp_dir();
+        // A PID that cannot be running.
+        let stale = parent.join("reel-stream-4294967294");
+        let _ = std::fs::create_dir_all(&stale);
+        assert!(stale.exists());
+
+        sweep_stale_scratch();
+        assert!(!stale.exists(), "a dead process's scratch should be removed");
     }
 
     #[test]

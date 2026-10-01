@@ -94,6 +94,11 @@ struct ServeArgs {
     #[arg(long)]
     upnp: bool,
 
+    /// Seed: serve pieces to other peers. Off by default — reel never uploads
+    /// unless you are deliberately seeding content you own.
+    #[arg(long)]
+    seed: bool,
+
     /// Connect to this peer immediately. Repeatable, e.g. --peer 10.0.0.5:51413.
     #[arg(long = "peer", value_name = "ADDR")]
     peers: Vec<SocketAddr>,
@@ -273,6 +278,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     config.disable_dht = args.no_dht;
     config.disable_trackers = args.no_trackers;
     config.enable_upnp = args.upnp;
+    // Never upload unless asked to seed.
+    config.disable_upload = !args.seed;
 
     tracing::info!(dir = %download_dir.display(), "starting engine");
     let engine = reel_core::Engine::new(config).await?;

@@ -40,3 +40,10 @@ reqwest = { version = "0.13", features = ["json", "blocking", "query"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# A small patch to librqbit: reel must be able to fetch only the window around
+# the playhead while streaming, instead of the whole selected file. Selection is
+# file-granular upstream, so the piece picker is patched to skip the ordered
+# queue when a torrent is stream-only. See vendor/librqbit.
+[patch.crates-io]
+librqbit = { path = "vendor/librqbit" }

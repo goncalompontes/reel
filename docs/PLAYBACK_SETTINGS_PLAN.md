@@ -148,6 +148,15 @@ pointer movement.
 > for a stream, the chosen episodes/versions for a download) and the backend
 > owns storage, re-adding and cleanup. See
 > `tests/backend.rs::a_pack_streams_and_downloads_only_the_chosen_episode`.
+>
+> Third pass: the read-ahead governor could pause during startup (no duration
+> yet) and deadlock playback, so it now only acts with a known duration and a
+> started playhead. reel never seeds: `disable-upload` is compiled in, the
+> session flag defaults on, and only `reel serve --seed` turns it off. A
+> vendored librqbit (`vendor/librqbit`) adds a `streaming_only` option so a
+> stream fetches only the window around the playhead, not the whole file or the
+> part before a resume point. Download rows show their own progress and a
+> Downloaded/Remove state.
 
 ## Implementation notes (streaming pass)
 

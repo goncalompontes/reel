@@ -1668,17 +1668,12 @@ impl App {
             }
 
             if let Some(item) = lead.as_ref() {
-                ui.add(
-                    egui::ProgressBar::new((item.torrent.stats.percent / 100.0) as f32)
-                        .desired_width(440.0)
-                        .fill(theme::ACCENT)
-                        .text(format!("{:.1}%", item.torrent.stats.percent)),
-                );
-                ui.add_space(8.0);
+                // No title-level progress bar: a title can hold several
+                // downloads at once, so progress lives on each row. (There is no
+                // "up" stat either — reel never seeds.)
                 ui.horizontal(|ui| {
                     stat(ui, "downloaded", &fmt::human_bytes(item.torrent.stats.progress_bytes));
                     stat(ui, "down", &fmt::human_rate(item.torrent.stats.download_bps));
-                    stat(ui, "up", &fmt::human_rate(item.torrent.stats.upload_bps));
                     stat(ui, "peers", &item.torrent.stats.peers.live.to_string());
                     stat(ui, "eta", &fmt::human_eta(item.torrent.stats.eta_seconds));
                 });
@@ -1771,9 +1766,14 @@ impl App {
         for (index, version) in versions.iter().enumerate() {
             // A copy is "kept" because the user asked for that copy, not because
             // the title as a whole is a download.
-            let kept = self
+            let state = self
                 .item(version.torrent_id)
-                .is_some_and(|item| item.kept_files.contains(&version.file_id));
+                .map(|item| download_state(&item, version.file_id))
+                .unwrap_or(DownloadState {
+                    kept: false,
+                    done: false,
+                    fraction: 0.0,
+                });
 
             egui::Frame::NONE
                 .fill(theme::SURFACE)
@@ -1797,6 +1797,17 @@ impl App {
                                 .size(11.0)
                                 .color(theme::TEXT_DIM),
                             );
+                            // The progress belongs to this download, not the
+                            // title as a whole.
+                            if state.kept && !state.done {
+                                ui.add_space(3.0);
+                                ui.add(
+                                    egui::ProgressBar::new(state.fraction)
+                                        .desired_width(240.0)
+                                        .fill(theme::ACCENT)
+                                        .text(format!("{:.0}%", state.fraction * 100.0)),
+                                );
+                            }
                         });
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1804,25 +1815,13 @@ impl App {
                                 *action =
                                     Some(DetailAction::Play(version.torrent_id, version.file_id));
                             }
-                            if kept {
-                                if ui
-                                    .small_button("Stop download")
-                                    .on_hover_text("Stop keeping this copy")
-                                    .clicked()
-                                {
-                                    *action = Some(DetailAction::CancelDownload(
-                                        version.torrent_id,
-                                        version.file_id,
-                                    ));
-                                }
-                            } else if ui
-                                .small_button("Download")
-                                .on_hover_text("Keep this copy on disk")
-                                .clicked()
-                            {
-                                *action =
-                                    Some(DetailAction::Download(version.torrent_id, version.file_id));
-                            }
+                            download_buttons(
+                                ui,
+                                version.torrent_id,
+                                version.file_id,
+                                state,
+                                action,
+                            );
                             if ui
                                 .small_button("Remove")
                                 .on_hover_text("Remove this source")
@@ -2002,10 +2001,17 @@ impl App {
         });
         // Kept is per episode, not per title: downloading one episode of a
         // pack keeps that episode and nothing else.
-        let kept = chosen.as_ref().is_some_and(|variant| {
-            self.item(variant.torrent_id)
-                .is_some_and(|item| item.kept_files.contains(&variant.file_id))
-        });
+        let state = chosen
+            .as_ref()
+            .and_then(|variant| {
+                self.item(variant.torrent_id)
+                    .map(|item| download_state(&item, variant.file_id))
+            })
+            .unwrap_or(DownloadState {
+                kept: false,
+                done: false,
+                fraction: 0.0,
+            });
 
         let key = episode_choice_key(work, episode);
         let code = episode.code();
@@ -2087,6 +2093,15 @@ impl App {
                                 .size(11.0)
                                 .color(theme::TEXT_DIM),
                         );
+                        if state.kept && !state.done {
+                            ui.add_space(3.0);
+                            ui.add(
+                                egui::ProgressBar::new(state.fraction)
+                                    .desired_width(240.0)
+                                    .fill(theme::ACCENT)
+                                    .text(format!("{:.0}%", state.fraction * 100.0)),
+                            );
+                        }
                     });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2094,22 +2109,7 @@ impl App {
                             if ui.small_button("Play").clicked() {
                                 *action = Some(DetailAction::Play(torrent_id, file_id));
                             }
-                            if kept {
-                                if ui
-                                    .small_button("Stop download")
-                                    .on_hover_text("Stop keeping this episode")
-                                    .clicked()
-                                {
-                                    *action =
-                                        Some(DetailAction::CancelDownload(torrent_id, file_id));
-                                }
-                            } else if ui
-                                .small_button("Download")
-                                .on_hover_text("Keep this episode on disk")
-                                .clicked()
-                            {
-                                *action = Some(DetailAction::Download(torrent_id, file_id));
-                            }
+                            download_buttons(ui, torrent_id, file_id, state, action);
                         }
 
                         if variants.len() > 1 {
@@ -2402,6 +2402,70 @@ fn plural(count: usize, singular: &str) -> String {
         format!("1 {singular}")
     } else {
         format!("{count} {singular}s")
+    }
+}
+
+/// What a single file's download is doing, for one row.
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadState {
+    pub kept: bool,
+    pub done: bool,
+    pub fraction: f32,
+}
+
+/// The download state of one file of a title.
+pub fn download_state(item: &LibraryItem, file_id: usize) -> DownloadState {
+    let kept = item.kept_files.contains(&file_id);
+    let file = item.torrent.files.iter().find(|file| file.id == file_id);
+    let progress = file.map(|file| file.progress_bytes).unwrap_or(0);
+    let length = file.map(|file| file.length).unwrap_or(0);
+    DownloadState {
+        kept,
+        done: length > 0 && progress >= length,
+        fraction: if length > 0 {
+            (progress as f32 / length as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        },
+    }
+}
+
+/// The Download control for one file: Download, cancel, or — when it is fully
+/// on disk — a plain "Downloaded" with a way to remove it.
+fn download_buttons(
+    ui: &mut egui::Ui,
+    torrent_id: usize,
+    file_id: usize,
+    state: DownloadState,
+    action: &mut Option<DetailAction>,
+) {
+    if state.kept {
+        if state.done {
+            ui.label(
+                egui::RichText::new("Downloaded")
+                    .color(theme::OK)
+                    .size(11.5),
+            );
+            if ui
+                .small_button("Remove download")
+                .on_hover_text("Delete the downloaded file")
+                .clicked()
+            {
+                *action = Some(DetailAction::CancelDownload(torrent_id, file_id));
+            }
+        } else if ui
+            .small_button("Stop download")
+            .on_hover_text("Cancel this download")
+            .clicked()
+        {
+            *action = Some(DetailAction::CancelDownload(torrent_id, file_id));
+        }
+    } else if ui
+        .small_button("Download")
+        .on_hover_text("Keep this on disk")
+        .clicked()
+    {
+        *action = Some(DetailAction::Download(torrent_id, file_id));
     }
 }
 
@@ -3417,6 +3481,23 @@ mod tests {
         let item = app.item(9).expect("the pack");
         assert!(!item.downloading);
         assert!(item.kept_files.is_empty());
+    }
+
+    #[test]
+    fn a_fully_downloaded_file_reads_as_downloaded() {
+        let mut item = crate::testing::sample_season_pack();
+        item.kept_files = vec![0];
+
+        item.torrent.files[0].progress_bytes = item.torrent.files[0].length;
+        let state = download_state(&item, 0);
+        assert!(state.kept);
+        assert!(state.done, "a fully fetched file is downloaded, not 99%");
+        assert!((state.fraction - 1.0).abs() < 0.001);
+
+        item.torrent.files[0].progress_bytes = item.torrent.files[0].length / 4;
+        let state = download_state(&item, 0);
+        assert!(state.kept && !state.done);
+        assert!(state.fraction < 0.3);
     }
 
     #[test]

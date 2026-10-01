@@ -47,7 +47,9 @@ documented, tested extension point: see
 | Settings file as the canonical configuration (not env) | done |
 | Merge copies of a film or show into one title | done |
 | Temporary streaming: memory first, spills to scratch, freed on stop | done |
-| Downloads are opt-in and toggle to cancel/remove | done |
+| Streams only the window around the playhead (patched librqbit) | done |
+| Never seeds — upload is compiled out and the session flag is set | done |
+| Downloads are per item, with a Downloaded state and removal | done |
 | Library survives independently of the torrent session | done |
 | Subtitles: embedded tracks, sidecar files, track and delay controls | done |
 | Audio track, speed and aspect controls; fullscreen + shortcuts | done |
@@ -139,7 +141,9 @@ The CLI ships alongside it and shares the same engine:
 ```bash
 # Turn a file you own into a torrent, then seed it.
 reel create ~/Videos/holiday.mp4
-reel serve --dir ~/Videos --overwrite --add ~/Videos/holiday.mp4.torrent
+# `--seed` is required to upload; without it reel never serves pieces. The
+# desktop app always runs without it.
+reel serve --seed --dir ~/Videos --overwrite --add ~/Videos/holiday.mp4.torrent
 
 # Or just play something.
 reel add 'magnet:?xt=urn:btih:...'
@@ -355,10 +359,22 @@ Two things resume, and they resume independently:
 Pressing **Play** streams the file without keeping it. The title lands in the
 library, the bytes do not.
 
+* **It never seeds.** Uploading is compiled out of the engine and the session
+  flag is set, so reel cannot serve pieces to anyone. Only the CLI's explicit
+  `reel serve --seed` turns it on, for content you own.
+* **Only the window around the playhead.** librqbit selects files, not byte
+  ranges, so upstream would fetch a whole episode even for a stream. A small
+  vendored patch (`vendor/librqbit`) makes a stream-only torrent fetch **only the
+  window around the playhead** — never the beginning of a file you resumed
+  halfway through, and never the whole file. Seeking moves the window.
 * **Storage.** A streamed torrent uses temporary storage: pieces stay in RAM up
   to a budget (512 MiB by default) and spill, whole files at a time, to a scratch
   directory under the system temp dir. Nothing is written to your download
   folder, and the scratch is deleted when the stream is released.
+* **Nothing survives a crash either.** Spill files are unlinked as soon as they
+  are created, so the bytes live only while the process holds them: even
+  `kill -9` frees the space. Empty scratch directories left by a dead process are
+  swept on the next start.
 * **Why not a pure RAM cache.** librqbit's reader trusts the chunk tracker's
   have-bit and reads storage directly, so an evicted piece is a hard stream
   error; a bounded cache that evicts is unsafe for a seeker. Keeping whole files
@@ -373,6 +389,9 @@ library, the bytes do not.
   storage, re-adding and cleanup behind that. Downloading one episode of a pack
   keeps that episode and nothing else; playing another episode does not cancel
   what is already being kept.
+* **A clear download state.** Each row carries its own progress bar while it
+  downloads, and turns into **Downloaded** with a *Remove download* button once
+  the file is complete — not a forever "Stop download" at 100%.
 * **The library is durable.** Since a streamed torrent is removed when it stops,
   a persisted `library.json` (plus a saved `.torrent` per title) is what makes a
   title stay in the library. Downloads are re-added at startup; streams wait
@@ -472,6 +491,9 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the reasoning.
 
 ## Notes and caveats
 
+* **Logs.** A launcher starts the app with no terminal, so stderr goes nowhere;
+  the app also writes `~/.local/share/reel/reel.log` (truncated each start) for
+  exactly this reason.
 * **Security.** The streaming API is bound to `127.0.0.1` and CORS is off by
   default; the API can delete files, so do not expose it.
 * **Codecs.** Streaming is byte-exact, it does not transcode. libmpv plays

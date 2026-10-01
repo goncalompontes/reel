@@ -54,7 +54,7 @@ INFO_HASH=$(grep -oE 'info hash +[0-9a-f]{40}' "$ROOT/logs/create.log" | awk '{p
 [ -n "$INFO_HASH" ] || { echo "could not read the info hash"; exit 1; }
 
 echo "== 3. start seeder (api 3041, peer port 51413, upload capped at 400 KiB/s) =="
-"$REEL" serve \
+"$REEL" serve --seed \
   --dir "$ROOT/seed" --api-addr 127.0.0.1:3041 --listen-port 51413 \
   --no-dht --no-trackers --no-persist --overwrite --upload-limit 409600 \
   --add "$ROOT/test.torrent" > "$ROOT/logs/seed.log" 2>&1 &
@@ -391,7 +391,7 @@ done
 PIECE=16384
 "$REEL" create "$PACK/library/Some.Show.S01" -o "$PACK/pack.torrent" \
   --piece-length "$PIECE" > "$PACK/create.log" 2>&1
-"$REEL" serve --dir "$PACK/library" --api-addr 127.0.0.1:3044 --listen-port 51416 \
+"$REEL" serve --seed --dir "$PACK/library" --api-addr 127.0.0.1:3044 --listen-port 51416 \
   --no-dht --no-trackers --no-persist --overwrite --add "$PACK/pack.torrent" \
   > "$PACK/seed.log" 2>&1 &
 PACK_SEED=$!

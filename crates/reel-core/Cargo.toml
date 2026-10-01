@@ -15,4 +15,6 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
-librqbit.workspace = true
+# `disable-upload` is a hard guarantee: reel must never seed what it holds,
+# however briefly, so the capability is compiled out and the session flag set.
+librqbit = { workspace = true, features = ["disable-upload"] }
