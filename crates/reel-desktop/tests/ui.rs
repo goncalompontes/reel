@@ -139,7 +139,16 @@ fn settings_reports_the_backend_and_catalog() {
     harness.run_steps(3);
 
     assert_eq!(harness.state().screen(), &Screen::Settings);
-    for label in ["Download folder", "Metadata and artwork", "Search sources", "Playback"] {
+    for label in [
+        "Download folder",
+        "Metadata API key",
+        "Metadata and artwork",
+        "Search sources",
+        "Streaming and downloads",
+        "Stream on demand",
+        "Playback",
+        "Turn subtitles on",
+    ] {
         assert!(
             harness.query_all_by_label_contains(label).next().is_some(),
             "settings should show {label:?}"

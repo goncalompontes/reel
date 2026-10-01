@@ -69,6 +69,7 @@ fn main() {
         file_name: url.rsplit('/').next().unwrap_or("stream").to_string(),
         fallback_duration: None,
         start_at: None,
+        subtitles: Vec::new(),
     };
 
     if let Err(e) = controller.open(&ctx, &capability, &url, info) {

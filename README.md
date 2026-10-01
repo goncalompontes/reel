@@ -44,7 +44,11 @@ documented, tested extension point: see
 | On-disk metadata and artwork cache | done |
 | Search screen + pluggable sources | done |
 | Bundled sources | one: the Internet Archive (public domain / CC film) |
-| In-window subtitles, transcoding for odd codecs | not yet |
+| Settings file as the canonical configuration (not env) | done |
+| Stream on demand; per-file / per-episode / per-season downloads | done |
+| Subtitles: embedded tracks, sidecar files, track and delay controls | done |
+| Audio track, speed and aspect controls; fullscreen + shortcuts | done |
+| Transcoding for odd codecs | not yet |
 
 ## Install
 
@@ -103,12 +107,16 @@ silently — no window, no message, nothing in the journal. `scripts/e2e.sh` ste
 ## Try it
 
 ```bash
-# Optional: real posters and synopses. Both a v3 API key and a v4 API token work.
-export REEL_TMDB_API_KEY=...
-
 reel-desktop            # engine + streaming server + player + catalog, one process
 reel-desktop --demo     # sample library, no engine and no network
 ```
+
+Everything is configured in **Settings**, which is saved to
+`~/.local/share/reel/settings.json` and is the canonical source of truth. The
+metadata key, download folder, streaming-vs-downloading default, subtitle
+preferences and volume all live there and take effect without a restart (the
+download folder on the next start). `REEL_TMDB_API_KEY` still works as a
+first-run fallback, but a saved key always wins.
 
 Without the script, `cargo build --release` and `./target/release/reel-desktop`
 work exactly the same.
@@ -139,7 +147,7 @@ reel play 0          # launches mpv on the stream URL
 ## Verify it
 
 ```bash
-cargo test --workspace     # 147 tests: engine, ranges, matching, UI, catalog, search, backend
+cargo test --workspace     # ~190 tests: engine, ranges, matching, UI, catalog, search, backend, player tracks
 bash scripts/e2e.sh        # 71 assertions: create, seed, stream, decode, magnet, one-episode, packaging
 ```
 
@@ -213,17 +221,19 @@ downloads or for the bundled Internet Archive search source.
    * a **v3 API key** — a short hex string, sent as `?api_key=`;
    * a **v4 API Read Access Token** — a JWT starting with `eyJ`, sent as a
      `Bearer` header. The app detects which you pasted.
-3. Put it in the app: **Settings → TMDB API key**, then **Check**.
+3. Put it in the app: **Settings → Metadata API key**, then **Check**.
 
 The key is stored in `~/.local/share/reel/settings.json` with mode `600` (it is a
 credential), and takes effect immediately — no restart.
 
-`REEL_TMDB_API_KEY` also works and **overrides** the stored key, for scripts and
-one-off runs. It is not the recommended route for normal use, and the reason is
-worth knowing: a desktop app is started by a launcher, and a launcher does not
-read shell rc files, so a variable exported from `.zshrc` is simply absent for
-anyone clicking an icon. That is the same trap as a launcher entry that depends on
-`PATH`.
+`REEL_TMDB_API_KEY` also works, but only as a **first-run fallback**: once a key is
+saved in Settings it wins. That is deliberate, and the reason is worth knowing: a
+desktop app is started by a launcher, and a launcher does not read shell rc files,
+so a variable exported from `.zshrc` is simply absent for anyone clicking an icon.
+That is the same trap as a launcher entry that depends on `PATH`.
+
+The metadata provider is TMDB. IMDb has no official public API, so "the IMDb
+key" is the TMDB key this app uses; the Settings label says so.
 
 If you use your own key, note TMDB's terms ask for attribution: *"This product
 uses the TMDB API but is not endorsed or certified by TMDB."*
@@ -292,10 +302,17 @@ waits for you to choose an episode instead of fetching all of it. A film has
 nothing to choose, so it starts on its own. (The CLI keeps pausing off by
 default, because it is also used for seeding.)
 
-Pressing play on one file **narrows the fetch to that file** and tells you so; the other episodes keep whatever they had
-and stop being requested. The detail page shows a checkbox per file, the bytes
-fetched per file, and a *Fetch every file* button, so the choice is visible and
-reversible.
+Pressing play on one file **resumes the torrent and narrows the fetch to that
+file**; the other episodes keep whatever they had and stop being requested, and
+matching sidecar subtitles come along. The detail page shows a checkbox per file,
+the bytes fetched per file, a **Download** button per file or episode, a
+**Download season** button per season, and a *Fetch every file* button, so the
+choice is visible and reversible.
+
+Downloading is **optional**. The default, set in **Settings → Streaming and
+downloads → Stream on demand**, is to fetch a file only while you watch it. Turn
+that off to download every playable file of a new torrent in the background, or
+use the per-file/per-season Download buttons to keep specific things.
 
 Selection is at **piece granularity**, which is a property of BitTorrent, not a
 shortcut: a piece that straddles a file boundary belongs to both files, so a
@@ -323,6 +340,26 @@ Two things resume, and they resume independently:
   as an empty file. Verified by stopping a throttled download partway,
   restarting, and checking both that progress was retained and that the retained
   bytes matched the source.
+
+## Subtitles and player controls
+
+The player reads the current file's track list from libmpv. Embedded subtitles
+work out of the box; sidecar files (`.srt`, `.ass`, `.vtt`, …) that the torrent
+holds next to the video are matched by episode code or name, added to the fetch
+selection, and registered with the player automatically. **Settings → Playback**
+turns subtitles on by default and sets a preferred language.
+
+In the player, the second control row has:
+
+* a **CC** menu — subtitles on/off, every subtitle track, and `±0.1s` timing;
+* an **audio** menu when the file has more than one track;
+* a **speed** menu (0.5×–2×) and an **aspect** menu (auto, 16:9, 4:3, 21:9, 1:1);
+* a **fullscreen** button.
+
+Keyboard shortcuts: `space` play/pause, `←`/`→` back 10s / forward 30s,
+`↑`/`↓` volume, `F` fullscreen, `Esc` leave fullscreen (or the player). In
+fullscreen the chrome fades out after two seconds without input and returns as
+soon as the pointer or a key moves.
 
 ## Architecture
 

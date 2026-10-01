@@ -1,12 +1,15 @@
 //! Settings that have to survive a restart.
 //!
-//! The API key is the reason this exists. An environment variable is fine for a
-//! terminal, but a desktop app is normally started by a launcher, and a launcher
-//! does not read shell rc files — so `REEL_TMDB_API_KEY` in `.zshrc` is simply
-//! absent for anyone clicking an icon. That is the same trap as a launcher entry
-//! that depends on `PATH`, and the fix is the same: read it from disk.
+//! This file is the **canonical** way to configure the app. Environment
+//! variables are a terminal convenience, but a desktop app is normally started
+//! by a launcher, and a launcher does not read shell rc files — so
+//! `REEL_TMDB_API_KEY` in `.zshrc` is simply absent for anyone clicking an
+//! icon. That is the same trap as a launcher entry that depends on `PATH`, and
+//! the fix is the same: read it from disk.
 //!
-//! The environment still wins when it is set, so scripts and CI are unaffected.
+//! The stored value therefore wins. The environment is only consulted as a
+//! first-run fallback when nothing has been saved yet, so scripts keep working
+//! but saving in the app always takes effect.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -16,11 +19,61 @@ use serde::{Deserialize, Serialize};
 pub const API_KEY_ENV: &str = "REEL_TMDB_API_KEY";
 const FILE_NAME: &str = "settings.json";
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Everything the app remembers between runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogSettings {
     /// TMDB key: a v3 API key or a v4 read access token. Both work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmdb_api_key: Option<String>,
+
+    /// Where torrent data is written. `None` means the platform default
+    /// (`~/Downloads/reel`). Takes effect on the next start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_dir: Option<String>,
+
+    /// Fetch files only while they are being watched, rather than downloading
+    /// everything in the background. Streaming is the primary way to use the
+    /// app, so this is on by default.
+    #[serde(default = "default_true")]
+    pub stream_only: bool,
+
+    /// Turn subtitles on automatically when a file has them.
+    #[serde(default = "default_true")]
+    pub subtitles_enabled: bool,
+
+    /// Register the bundled search sources (the Internet Archive).
+    #[serde(default = "default_true")]
+    pub enable_bundled_sources: bool,
+
+    /// Preferred subtitle language, e.g. `en`. `None` lets mpv choose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle_language: Option<String>,
+
+    /// Initial player volume, 0–100.
+    #[serde(default = "default_volume")]
+    pub default_volume: f32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_volume() -> f32 {
+    100.0
+}
+
+impl Default for CatalogSettings {
+    fn default() -> Self {
+        Self {
+            tmdb_api_key: None,
+            download_dir: None,
+            stream_only: default_true(),
+            subtitles_enabled: default_true(),
+            enable_bundled_sources: default_true(),
+            subtitle_language: None,
+            default_volume: default_volume(),
+        }
+    }
 }
 
 impl CatalogSettings {
@@ -46,8 +99,8 @@ impl CatalogSettings {
         let path = Self::path(data_dir);
         let bytes = serde_json::to_vec_pretty(self)?;
 
-        // The key is a credential: create it private rather than writing it
-        // world-readable and narrowing afterwards.
+        // The file can hold a credential: create it private rather than writing
+        // it world-readable and narrowing afterwards.
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -67,7 +120,7 @@ impl CatalogSettings {
     }
 
     /// The stored key, with whitespace and blanks treated as absent.
-    fn stored_key(&self) -> Option<String> {
+    pub fn stored_key(&self) -> Option<String> {
         self.tmdb_api_key
             .as_deref()
             .map(str::trim)
@@ -75,29 +128,57 @@ impl CatalogSettings {
             .map(str::to_string)
     }
 
-    /// The key to actually use: the environment overrides the stored one.
+    /// The key to actually use.
+    ///
+    /// A stored key is canonical and always wins. The environment is only used
+    /// when nothing has been saved, so a shell variable can bootstrap a run
+    /// without preventing the user from changing the key in Settings later.
     pub fn api_key(&self) -> Option<String> {
-        api_key_from_env().or_else(|| self.stored_key())
+        self.stored_key().or_else(api_key_from_env)
     }
 
     /// Where the key in use came from, for the settings page.
     pub fn key_source(&self) -> KeySource {
-        if api_key_from_env().is_some() {
-            KeySource::Environment
-        } else if self.stored_key().is_some() {
+        if self.stored_key().is_some() {
             KeySource::Stored
+        } else if api_key_from_env().is_some() {
+            KeySource::Environment
         } else {
             KeySource::None
         }
+    }
+
+    /// The configured download directory, if the user set one.
+    pub fn download_dir_path(&self) -> Option<PathBuf> {
+        self.download_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+    }
+
+    /// Clamp fields whose range is not enforced by the type system.
+    pub fn normalise(&mut self) {
+        self.default_volume = self.default_volume.clamp(0.0, 130.0);
+        self.subtitle_language = self
+            .subtitle_language
+            .take()
+            .map(|lang| lang.trim().to_string())
+            .filter(|lang| !lang.is_empty());
+        self.download_dir = self
+            .download_dir
+            .take()
+            .map(|dir| dir.trim().to_string())
+            .filter(|dir| !dir.is_empty());
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeySource {
     None,
-    /// From the settings file.
+    /// From the settings file, which is canonical.
     Stored,
-    /// From an environment variable, which wins.
+    /// From an environment variable, used only when nothing is stored.
     Environment,
 }
 
@@ -106,7 +187,7 @@ impl KeySource {
         match self {
             KeySource::None => "not set",
             KeySource::Stored => "set in settings",
-            KeySource::Environment => "set in the environment (overrides settings)",
+            KeySource::Environment => "set in the environment (fallback; save a key to override)",
         }
     }
 }
@@ -135,20 +216,35 @@ mod tests {
 
         let settings = CatalogSettings {
             tmdb_api_key: Some("abc123".into()),
+            download_dir: Some("/tmp/downloads".into()),
+            stream_only: false,
+            ..Default::default()
         };
         settings.save(&dir).unwrap();
 
-        assert_eq!(CatalogSettings::load(&dir).tmdb_api_key.as_deref(), Some("abc123"));
+        let loaded = CatalogSettings::load(&dir);
+        assert_eq!(loaded.tmdb_api_key.as_deref(), Some("abc123"));
+        assert_eq!(loaded.download_dir.as_deref(), Some("/tmp/downloads"));
+        assert!(!loaded.stream_only);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn defaults_are_streaming_first() {
+        let settings = CatalogSettings::default();
+        assert!(settings.stream_only, "streaming is the primary way to use the app");
+        assert!(settings.subtitles_enabled);
+        assert_eq!(settings.default_volume, 100.0);
     }
 
     #[cfg(unix)]
     #[test]
-    fn the_key_file_is_private() {
+    fn the_settings_file_is_private() {
         use std::os::unix::fs::PermissionsExt;
         let dir = scratch("mode");
         CatalogSettings {
             tmdb_api_key: Some("secret".into()),
+            ..Default::default()
         }
         .save(&dir)
         .unwrap();
@@ -172,20 +268,26 @@ mod tests {
     }
 
     #[test]
-    fn the_environment_wins_over_the_stored_key() {
+    fn the_stored_key_wins_over_the_environment() {
         // SAFETY: single-threaded within this test; the variable is removed again.
         unsafe { std::env::set_var(API_KEY_ENV, "from-env") };
+
+        // Nothing stored: the environment bootstraps a run.
+        let empty = CatalogSettings::default();
+        assert_eq!(empty.api_key().as_deref(), Some("from-env"));
+        assert_eq!(empty.key_source(), KeySource::Environment);
+
+        // Once saved, the stored key is canonical and the environment no longer
+        // overrides it. This is the whole point: Settings, not the shell.
         let stored = CatalogSettings {
             tmdb_api_key: Some("from-disk".into()),
+            ..Default::default()
         };
-        assert_eq!(stored.api_key().as_deref(), Some("from-env"));
-        assert_eq!(stored.key_source(), KeySource::Environment);
-
-        unsafe { std::env::remove_var(API_KEY_ENV) };
         assert_eq!(stored.api_key().as_deref(), Some("from-disk"));
         assert_eq!(stored.key_source(), KeySource::Stored);
 
-        let empty = CatalogSettings::default();
+        unsafe { std::env::remove_var(API_KEY_ENV) };
+        assert_eq!(stored.api_key().as_deref(), Some("from-disk"));
         assert_eq!(empty.api_key(), None);
         assert_eq!(empty.key_source(), KeySource::None);
     }
@@ -194,9 +296,24 @@ mod tests {
     fn a_blank_stored_key_counts_as_absent() {
         let settings = CatalogSettings {
             tmdb_api_key: Some("   ".into()),
+            ..Default::default()
         };
         unsafe { std::env::remove_var(API_KEY_ENV) };
         assert_eq!(settings.api_key(), None);
         assert_eq!(settings.key_source(), KeySource::None);
+    }
+
+    #[test]
+    fn normalise_trims_and_clamps() {
+        let mut settings = CatalogSettings {
+            download_dir: Some("  /tmp/x  ".into()),
+            subtitle_language: Some("  en ".into()),
+            default_volume: 999.0,
+            ..Default::default()
+        };
+        settings.normalise();
+        assert_eq!(settings.download_dir.as_deref(), Some("/tmp/x"));
+        assert_eq!(settings.subtitle_language.as_deref(), Some("en"));
+        assert_eq!(settings.default_volume, 130.0);
     }
 }

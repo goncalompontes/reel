@@ -19,9 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use reel_catalog::{
-    ArchiveOrgBackend, CatalogCache, CatalogEntry, CatalogSettings, FileInput, KeySource,
-    LookupQuery, Metadata, MetadataProvider, Release, SearchAggregator, SearchResults, TmdbClient,
-    WatchHistory, WatchProgress, analyse, default_data_dir, provider_from_key,
+    ArchiveOrgBackend, CatalogCache, CatalogEntry, CatalogSettings, FileInput, LookupQuery,
+    Metadata, MetadataProvider, Release, SearchAggregator, SearchResults, TmdbClient, WatchHistory,
+    WatchProgress, analyse, default_data_dir, provider_from_key,
 };
 use reel_core::model::TorrentView;
 use reel_core::title::clean_title;
@@ -144,6 +144,13 @@ pub trait Backend {
     /// stop being requested.
     fn set_only_files(&self, id: usize, files: &[usize]);
 
+    /// Fetch exactly these files *and* make sure the torrent is running.
+    ///
+    /// This is what pressing Play (or Download) uses. A multi-file torrent is
+    /// added paused, so narrowing the selection alone would leave the stream
+    /// request waiting forever: the torrent has to be unpaused too.
+    fn start_files(&self, id: usize, files: &[usize]);
+
     /// Remember how far through one file of a torrent playback got.
     ///
     /// Per file, not per torrent: a series is one torrent with many episodes,
@@ -167,6 +174,11 @@ pub trait Backend {
     fn search_sources(&self) -> Vec<SourceInfo>;
 
     fn catalog_status(&self) -> CatalogStatus;
+    /// The persisted settings, the canonical configuration.
+    fn settings(&self) -> CatalogSettings;
+    /// Persist settings and apply what can be applied immediately. A changed
+    /// download directory takes effect on the next start.
+    fn save_settings(&self, settings: CatalogSettings);
     /// Store a TMDB key and use it immediately. `None` clears it.
     fn set_api_key(&self, key: Option<String>);
     /// Check a key against the provider and report back as an event.
@@ -230,7 +242,7 @@ impl EngineBackend {
     /// Start the engine, serve the streaming API on an ephemeral localhost port,
     /// and build the metadata provider.
     pub fn start(config: EngineConfig) -> anyhow::Result<Self> {
-        Self::start_with_options(config, CatalogOptions::from_env())
+        Self::start_with_options(config, CatalogOptions::from_settings())
     }
 
     pub fn start_with_options(
@@ -537,7 +549,8 @@ pub(crate) fn display_title_for(torrent: &TorrentView) -> (String, Option<u16>) 
 /// Where the metadata key and cache live. Read once at startup.
 #[derive(Debug, Clone)]
 pub struct CatalogOptions {
-    /// The key to use, already resolved: environment over settings file.
+    /// The key to use, already resolved from settings (the environment is only
+    /// a first-run fallback).
     pub api_key: Option<String>,
     /// The stored settings, so the app can show and change them.
     pub settings: CatalogSettings,
@@ -547,26 +560,21 @@ pub struct CatalogOptions {
 }
 
 impl CatalogOptions {
-    /// `REEL_TMDB_API_KEY` overrides the stored key, which is convenient for
-    /// running without writing anything to disk.
-    pub fn from_env() -> Self {
+    /// Load settings from the default data directory.
+    pub fn from_settings() -> Self {
         Self::load(default_data_dir())
     }
 
-    /// Read the settings file and let the environment override it.
-    ///
-    /// The file matters: a desktop app is started by a launcher, and a launcher
-    /// does not read shell rc files, so an environment variable set in `.zshrc`
-    /// is simply absent for anyone clicking an icon.
+    /// Read the settings file. This is the canonical configuration: there is no
+    /// environment override here any more, because a launcher does not read
+    /// shell rc files and a saved setting must always take effect.
     pub fn load(data_dir: std::path::PathBuf) -> Self {
         let settings = CatalogSettings::load(&data_dir);
         Self {
             api_key: settings.api_key(),
+            disable_bundled_sources: !settings.enable_bundled_sources,
             settings,
             data_dir,
-            disable_bundled_sources: std::env::var("REEL_NO_BUNDLED_SOURCES")
-                .map(|value| value != "0")
-                .unwrap_or(false),
         }
     }
 }
@@ -602,13 +610,17 @@ impl Backend for EngineBackend {
         let engine = self.engine.clone();
         let events = self.events.clone();
         let source = source.to_string();
+        // Streaming is the primary way to use the app: by default a multi-file
+        // torrent waits until something is chosen, rather than fetching the
+        // whole pack. Turning `stream_only` off restores background download.
+        let stream_only = self.settings().stream_only;
 
         self.runtime.spawn(async move {
             let options = AddOptions {
                 media_only,
                 // A season pack should wait until an episode is chosen; a film
                 // has nothing to choose, so it starts on its own.
-                pause_multi_file: true,
+                pause_multi_file: stream_only,
                 ..Default::default()
             };
             let result = match AddSource::detect(&source) {
@@ -683,6 +695,19 @@ impl Backend for EngineBackend {
         let files = files.to_vec();
         self.spawn_result("select files", async move {
             engine.set_only_files(id, &files).await
+        });
+    }
+
+    fn start_files(&self, id: usize, files: &[usize]) {
+        if files.is_empty() {
+            tracing::warn!(id, "refusing to start an empty selection");
+            return;
+        }
+        let engine = self.engine.clone();
+        let files = files.to_vec();
+        self.spawn_result("start files", async move {
+            engine.set_only_files(id, &files).await?;
+            engine.resume(id).await
         });
     }
 
@@ -799,7 +824,9 @@ impl Backend for EngineBackend {
             provider: self.catalog.provider().name().to_string(),
             configured: self.catalog.provider().is_configured(),
             key_source: source.describe().to_string(),
-            can_set_key: source != KeySource::Environment,
+            // Settings are canonical now, so the key can always be changed here
+            // even when the environment supplied the current one.
+            can_set_key: true,
             note: self.catalog.note(),
             cached_metadata: self.catalog.cache.metadata_count(),
             cache_bytes: self.catalog.cache.total_bytes(),
@@ -809,45 +836,61 @@ impl Backend for EngineBackend {
         }
     }
 
-    fn set_api_key(&self, key: Option<String>) {
-        let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+    fn settings(&self) -> CatalogSettings {
+        self.catalog
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn save_settings(&self, mut settings: CatalogSettings) {
+        settings.normalise();
+
+        let previous = self.settings();
+        let key_changed = previous.stored_key() != settings.stored_key();
 
         {
-            let mut settings = self.catalog.settings.lock().unwrap_or_else(|e| e.into_inner());
-            settings.tmdb_api_key = key.clone();
+            let mut current = self.catalog.settings.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(e) = settings.save(&self.catalog.data_dir) {
                 self.push(BackendEvent::Error(format!(
-                    "could not save the API key: {e}"
+                    "could not save settings: {e}"
                 )));
+                return;
             }
+            *current = settings.clone();
         }
 
-        let provider = provider_from_key(key.as_deref(), self.catalog.cache.clone());
-        let configured = provider.is_configured();
-        *self
-            .catalog
-            .provider
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = provider;
+        if key_changed {
+            let provider =
+                provider_from_key(settings.stored_key().as_deref(), self.catalog.cache.clone());
+            *self
+                .catalog
+                .provider
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = provider;
 
-        // A new key means the answers change, so ask again.
-        self.catalog
-            .attempted
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.catalog
-            .metadata
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.enrich_library();
+            // A new key means the answers change, so ask again.
+            self.catalog
+                .attempted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            self.catalog
+                .metadata
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            self.enrich_library();
+        }
 
-        self.push(BackendEvent::Info(if configured {
-            "Metadata key saved; looking titles up again".to_string()
-        } else {
-            "Metadata key cleared".to_string()
-        }));
+        self.push(BackendEvent::Info("Settings saved".to_string()));
+    }
+
+    fn set_api_key(&self, key: Option<String>) {
+        let mut settings = self.settings();
+        settings.tmdb_api_key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+        self.save_settings(settings);
     }
 
     fn test_api_key(&self, key: String) {
@@ -947,6 +990,7 @@ pub struct FakeBackend {
     capabilities: BackendCapabilities,
     base_url: String,
     catalog_status: CatalogStatus,
+    settings: Mutex<CatalogSettings>,
 }
 
 impl FakeBackend {
@@ -954,6 +998,7 @@ impl FakeBackend {
         Self {
             items: Mutex::new(items),
             events: Mutex::new(Vec::new()),
+            settings: Mutex::new(CatalogSettings::default()),
             capabilities: BackendCapabilities {
                 download_dir: "/tmp/reel-demo".to_string(),
                 client_name: "reel-demo".to_string(),
@@ -1033,6 +1078,22 @@ impl Backend for FakeBackend {
             for file in &mut item.torrent.files {
                 file.included = files.contains(&file.id);
             }
+        }
+    }
+
+    fn start_files(&self, id: usize, files: &[usize]) {
+        if files.is_empty() {
+            return;
+        }
+        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(item) = items.iter_mut().find(|i| i.torrent.id == id) {
+            for file in &mut item.torrent.files {
+                file.included = files.contains(&file.id);
+            }
+            // The real backend resumes the torrent; mirror that so the UI can
+            // be tested against the paused-on-add behaviour.
+            item.torrent.stats.state = "live".to_string();
+            item.torrent.state = "live".to_string();
         }
     }
 
@@ -1126,11 +1187,26 @@ impl Backend for FakeBackend {
         status
     }
 
-    fn set_api_key(&self, _key: Option<String>) {
+    fn settings(&self) -> CatalogSettings {
+        self.settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn save_settings(&self, mut settings: CatalogSettings) {
+        settings.normalise();
+        *self.settings.lock().unwrap_or_else(|e| e.into_inner()) = settings;
         self.events
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(BackendEvent::Info("key saved (demo)".to_string()));
+            .push(BackendEvent::Info("settings saved (demo)".to_string()));
+    }
+
+    fn set_api_key(&self, key: Option<String>) {
+        let mut settings = self.settings();
+        settings.tmdb_api_key = key;
+        self.save_settings(settings);
     }
 
     fn test_api_key(&self, _key: String) {

@@ -8,7 +8,7 @@
 use std::time::{Duration, Instant};
 
 use egui::{Color32, CornerRadius, Rect, Sense, Vec2};
-use reel_catalog::{ArtworkKind, RowKind, SearchHit};
+use reel_catalog::{ArtworkKind, CatalogSettings, RowKind, SearchHit};
 use reel_core::fmt;
 use reel_core::media;
 
@@ -57,7 +57,12 @@ pub struct App {
     /// The API key being typed on the settings page. Never filled in from
     /// storage: a credential is written, not displayed.
     api_key_input: String,
+    /// Editable copy of the canonical settings while the Settings page is open.
+    settings_draft: Option<CatalogSettings>,
     player: PlayerController,
+    /// Last time the mouse or a key moved, for hiding the chrome in fullscreen.
+    player_last_activity: Instant,
+    player_controls_hidden: bool,
     /// Torrent id the player was started from, to return to.
     player_origin: Option<usize>,
     show_delete_confirm: Option<usize>,
@@ -101,13 +106,24 @@ impl App {
             search_note: None,
             searching: false,
             api_key_input: String::new(),
+            settings_draft: None,
             player: PlayerController::new(),
+            player_last_activity: Instant::now(),
+            player_controls_hidden: false,
             player_origin: None,
             show_delete_confirm: None,
             pending_ctx: None,
             watch_last_recorded: 0.0,
             watch_recording_for: None,
         };
+        // Saved settings are canonical: apply playback preferences immediately.
+        let settings = app.backend.settings();
+        app.player.set_volume(settings.default_volume);
+        app.player.set_preferences(crate::player::PlaybackPreferences {
+            subtitles_enabled: settings.subtitles_enabled,
+            subtitle_language: settings.subtitle_language.clone(),
+            volume: settings.default_volume,
+        });
         app.refresh();
         app
     }
@@ -182,6 +198,36 @@ impl App {
             return;
         };
 
+        // Resume the *file* that was actually being watched, not the torrent as
+        // a whole: a series is one torrent with many episodes. The torrent-level
+        // record is only a fallback for a single-file title.
+        let per_file = item
+            .entry
+            .watch_by_file
+            .get(&file_id)
+            .filter(|progress| progress.is_resumable())
+            .map(|progress| progress.position);
+        let start_at = per_file.or_else(|| {
+            let playable = item.torrent.files.iter().filter(|f| f.included).count();
+            (playable <= 1).then(|| item.resume_position()).flatten()
+        });
+
+        // Sidecar subtitles ride along with the video, both as files to fetch
+        // and as URLs for mpv to load.
+        let companions = companion_subtitles(&item.torrent.files, file);
+        let subtitles: Vec<(String, String)> = companions
+            .iter()
+            .filter_map(|id| item.torrent.files.iter().find(|f| f.id == *id))
+            .map(|sub| {
+                let url = sub
+                    .stream
+                    .url
+                    .clone()
+                    .unwrap_or_else(|| format!("{}{}", self.backend.base_url(), sub.stream.path));
+                (url, sub.name.clone())
+            })
+            .collect();
+
         let info = PlaybackInfo {
             torrent_id,
             file_id,
@@ -189,7 +235,8 @@ impl App {
             title: item.heading(),
             file_name: file.name.clone(),
             fallback_duration: None,
-            start_at: item.resume_position(),
+            start_at,
+            subtitles,
         };
 
         let url = file
@@ -198,19 +245,24 @@ impl App {
             .clone()
             .unwrap_or_else(|| format!("{}{}", self.backend.base_url(), file.stream.path));
 
-        // Watching one episode should fetch one episode. Without this a season
-        // pack pulls down every episode while you watch the first.
+        // Watching one episode should fetch one episode — and the torrent has to
+        // be running. A pack is added paused, so selecting files alone would
+        // leave playback waiting forever.
         let others = item
             .torrent
             .files
             .iter()
-            .filter(|f| f.included && f.id != file_id)
+            .filter(|f| f.included && f.id != file_id && !companions.contains(&f.id))
             .count();
+        let mut selection = vec![file_id];
+        selection.extend(companions.iter().copied());
+        selection.sort_unstable();
+        selection.dedup();
+        self.start_streaming(torrent_id, &selection);
         if others > 0 {
-            self.select_files(torrent_id, &[file_id]);
             self.set_toast(
                 format!(
-                    "Fetching only {} ({} other file{} paused)",
+                    "Streaming {} ({} other file{} not fetched)",
                     reel_core::title::truncate(&file.name, 40),
                     others,
                     if others == 1 { "" } else { "s" }
@@ -221,7 +273,7 @@ impl App {
 
         let capability = self.backend.capabilities().player.clone();
         self.player_origin = Some(torrent_id);
-        self.watch_last_recorded = item.resume_position().unwrap_or(0.0);
+        self.watch_last_recorded = start_at.unwrap_or(0.0);
         self.watch_recording_for = Some(item.entry.info_hash.clone());
 
         match self.player.open(ctx, &capability, &url, info) {
@@ -357,12 +409,22 @@ impl App {
         }
     }
 
-    /// Fetch exactly these files of a torrent.
+    /// Fetch exactly these files of a torrent, and make sure it is running.
     ///
     /// Public so the flow the UI reaches by ticking a box can also be driven
-    /// from a test.
+    /// from a test. Resuming matters: a multi-file torrent is added paused, so
+    /// without it a checked box would never actually download.
     pub fn select_files(&mut self, torrent_id: usize, files: &[usize]) {
-        self.backend.set_only_files(torrent_id, files);
+        self.start_streaming(torrent_id, files);
+    }
+
+    /// The one place the app starts fetching a selection.
+    pub fn start_streaming(&mut self, torrent_id: usize, files: &[usize]) {
+        if files.is_empty() {
+            self.warn("Choose at least one file to fetch");
+            return;
+        }
+        self.backend.start_files(torrent_id, files);
         self.invalidate();
     }
 
@@ -1355,6 +1417,19 @@ impl App {
                     if media::is_media_file(&file.name) && ui.small_button("Play").clicked() {
                         *action = Some(DetailAction::Play(file.id));
                     }
+                    if !file.included
+                        && ui
+                            .small_button("Download")
+                            .on_hover_text("Fetch and keep this file as well")
+                            .clicked()
+                    {
+                        let mut next = included.clone();
+                        if !next.contains(&file.id) {
+                            next.push(file.id);
+                            next.sort_unstable();
+                        }
+                        *action = Some(DetailAction::SelectFiles(next));
+                    }
                     ui.label(
                         egui::RichText::new(fmt::human_bytes(file.length)).color(theme::TEXT_DIM),
                     );
@@ -1522,6 +1597,16 @@ impl App {
             ui.add_space(6.0);
         }
 
+        // File ids per season, so a season heading can offer a one-click
+        // download without walking the rows again.
+        let mut season_files: std::collections::BTreeMap<u32, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for row in &rows {
+            if let Some(season) = row.season {
+                season_files.entry(season).or_default().push(row.file.file_id);
+            }
+        }
+
         let mut current_season: Option<u32> = None;
         for row in rows {
             // A season heading, but only when there is more than one to tell
@@ -1529,12 +1614,30 @@ impl App {
             if seasons.len() > 1 && row.season != current_season {
                 if let Some(season) = row.season {
                     ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(format!("Season {season}"))
-                            .size(13.0)
-                            .strong()
-                            .color(theme::ACCENT),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("Season {season}"))
+                                .size(13.0)
+                                .strong()
+                                .color(theme::ACCENT),
+                        );
+                        if ui
+                            .small_button("Download season")
+                            .on_hover_text("Fetch and keep every episode in this season")
+                            .clicked()
+                        {
+                            let mut next = included.clone();
+                            if let Some(ids) = season_files.get(&season) {
+                                for id in ids {
+                                    if !next.contains(id) {
+                                        next.push(*id);
+                                    }
+                                }
+                            }
+                            next.sort_unstable();
+                            *action = Some(DetailAction::SelectFiles(next));
+                        }
+                    });
                 }
                 current_season = row.season;
             }
@@ -1633,6 +1736,19 @@ impl App {
                             if ui.small_button("Play").clicked() {
                                 *action = Some(DetailAction::Play(row.file.file_id));
                             }
+                            if !is_included
+                                && ui
+                                    .small_button("Download")
+                                    .on_hover_text("Fetch and keep this episode as well")
+                                    .clicked()
+                            {
+                                let mut next = included.clone();
+                                if !next.contains(&row.file.file_id) {
+                                    next.push(row.file.file_id);
+                                    next.sort_unstable();
+                                }
+                                *action = Some(DetailAction::SelectFiles(next));
+                            }
                             if is_included && progress > 0 {
                                 let percent = (progress as f64 / length.max(1) as f64) * 100.0;
                                 ui.label(
@@ -1722,6 +1838,110 @@ enum DetailAction {
     /// Fetch exactly these files.
     SelectFiles(Vec<usize>),
     FetchAll(Vec<usize>),
+}
+
+/// Subtitle files that belong to a video file.
+///
+/// A sidecar is matched either by episode code (`Show.S01E02.en.srt` for
+/// `Show.S01E02.mkv`, even in a separate `Subs/` folder) or, when the names
+/// carry no code, by sitting beside the video and sharing its stem
+/// (`Movie.en.srt` for `Movie.mkv`).
+pub fn companion_subtitles(
+    files: &[reel_core::model::FileView],
+    video: &reel_core::model::FileView,
+) -> Vec<usize> {
+    let video_token = episode_token(&video.name);
+    let video_stem = file_stem(&video.name);
+    let video_dir = dir_of(&video.path);
+
+    files
+        .iter()
+        .filter(|file| file.is_subtitle)
+        .filter(|file| match (episode_token(&file.name), video_token.as_deref()) {
+            // The episode code is the strongest signal: it keeps S01E03's
+            // subtitles away from S01E02 even in a shared folder.
+            (Some(sub), Some(token)) => sub == token,
+            _ => {
+                dir_of(&file.path) == video_dir
+                    && shares_title_prefix(&file_stem(&file.name), &video_stem)
+            }
+        })
+        .map(|file| file.id)
+        .collect()
+}
+
+/// The `SxxEyy` episode code in a name, lowercased, if there is one.
+fn episode_token(name: &str) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b's' {
+            i += 1;
+            continue;
+        }
+        let season_start = i + 1;
+        let mut j = season_start;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j == season_start || j >= bytes.len() || bytes[j] != b'e' {
+            i += 1;
+            continue;
+        }
+        let episode_start = j + 1;
+        let mut k = episode_start;
+        while k < bytes.len() && bytes[k].is_ascii_digit() {
+            k += 1;
+        }
+        if k == episode_start {
+            i += 1;
+            continue;
+        }
+        return Some(format!(
+            "s{}e{}",
+            &lower[season_start..j],
+            &lower[episode_start..k]
+        ));
+    }
+    None
+}
+
+/// Lowercased file name without its directory or extension.
+fn file_stem(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    match base.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem.to_ascii_lowercase(),
+        _ => base.to_ascii_lowercase(),
+    }
+}
+
+/// Whether two file stems name the same title.
+///
+/// Subtitle names are usually a prefix of the video's (`the.matrix` versus
+/// `the.matrix.1999.1080p`), so matching on a shared leading run of dot-separated
+/// tokens handles both that and a plain `movie.mkv` / `movie.srt` pair. A single
+/// shared token like `the` is not enough, so unrelated films do not collide.
+fn shares_title_prefix(a: &str, b: &str) -> bool {
+    let a_tokens: Vec<&str> = a.split('.').filter(|token| !token.is_empty()).collect();
+    let b_tokens: Vec<&str> = b.split('.').filter(|token| !token.is_empty()).collect();
+    if a_tokens.is_empty() || b_tokens.is_empty() {
+        return false;
+    }
+    let common = a_tokens
+        .iter()
+        .zip(b_tokens.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    common >= a_tokens.len().min(b_tokens.len()) || common >= 2
+}
+
+/// Lowercased directory portion of a `/`-separated path.
+fn dir_of(path: &str) -> String {
+    match path.rsplit_once(['/', '\\']) {
+        Some((dir, _)) => dir.to_ascii_lowercase(),
+        None => String::new(),
+    }
 }
 
 /// The shape providers publish artwork in.
@@ -2018,16 +2238,56 @@ impl App {
         let caps = self.backend.capabilities().clone();
         let catalog = self.backend.catalog_status();
         let mut action: Option<SettingsAction> = None;
-        let mut save_key: Option<Option<String>> = None;
         let mut check_key: Option<String> = None;
+        let mut persist = false;
+        let mut remove_key = false;
+
+        // A local draft so edits are explicit and only written on Save.
+        let mut draft = self
+            .settings_draft
+            .take()
+            .unwrap_or_else(|| self.backend.settings());
 
         ui.add_space(16.0);
         ui.label(egui::RichText::new("Settings").size(22.0).strong());
-        ui.add_space(12.0);
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(
+                "These are saved to disk and are the way this app is configured. Environment \
+                 variables are only a first-run fallback.",
+            )
+            .color(theme::TEXT_DIM)
+            .size(11.5),
+        );
+        ui.add_space(10.0);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.label(egui::RichText::new("Library").size(16.0).strong());
-            row(ui, "Download folder", &caps.download_dir);
+            row(ui, "Active folder", &caps.download_dir);
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    Vec2::new(150.0, 18.0),
+                    egui::Label::new(
+                        egui::RichText::new("Download folder").color(theme::TEXT_DIM),
+                    ),
+                );
+                let mut dir = draft.download_dir.clone().unwrap_or_default();
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut dir)
+                            .hint_text("default: ~/Downloads/reel")
+                            .desired_width(360.0),
+                    )
+                    .changed()
+                {
+                    draft.download_dir = Some(dir).filter(|d| !d.trim().is_empty());
+                }
+            });
+            ui.label(
+                egui::RichText::new("Changes to the download folder take effect next start.")
+                    .color(theme::TEXT_DIM)
+                    .size(11.0),
+            );
             row(ui, "Streaming API", self.backend.base_url());
             row(ui, "Client name", &caps.client_name);
             ui.add_space(14.0);
@@ -2057,59 +2317,39 @@ impl App {
                 ),
             );
 
-            if let Some(note) = catalog.note.as_deref() {
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(note).color(theme::WARN).size(12.0));
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(
-                        "Set REEL_TMDB_API_KEY, or start the app with it in the environment. \
-                         Both a v3 API key and a v4 API token are accepted.",
-                    )
-                    .color(theme::TEXT_DIM)
-                    .size(11.0),
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    Vec2::new(150.0, 18.0),
+                    egui::Label::new(
+                        egui::RichText::new("Metadata API key").color(theme::TEXT_DIM),
+                    ),
                 );
-            }
-
-            if catalog.can_set_key {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        Vec2::new(150.0, 18.0),
-                        egui::Label::new(egui::RichText::new("TMDB API key").color(theme::TEXT_DIM)),
-                    );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.api_key_input)
-                            .password(true)
-                            .hint_text("v3 key or v4 token")
-                            .desired_width(300.0),
-                    );
-                    let typed = !self.api_key_input.trim().is_empty();
-                    if ui.add_enabled(typed, egui::Button::new("Save")).clicked() {
-                        save_key = Some(Some(self.api_key_input.clone()));
-                    }
-                    if ui.add_enabled(typed, egui::Button::new("Check")).clicked() {
-                        check_key = Some(self.api_key_input.clone());
-                    }
-                });
-                ui.label(
-                    egui::RichText::new(
-                        "A TMDB account is free. Either key type works: a v3 API key, or a v4 \
-                         API Read Access Token which starts with eyJ.",
-                    )
-                    .color(theme::TEXT_DIM)
-                    .size(11.0),
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.api_key_input)
+                        .password(true)
+                        .hint_text("TMDB v3 key or v4 token")
+                        .desired_width(300.0),
                 );
-            } else {
-                ui.label(
-                    egui::RichText::new(
-                        "The key is coming from REEL_TMDB_API_KEY, which overrides anything \
-                         stored here. Unset it to manage the key in this window.",
-                    )
-                    .color(theme::TEXT_DIM)
-                    .size(11.0),
-                );
-            }
+                let typed = !self.api_key_input.trim().is_empty();
+                if ui.add_enabled(typed, egui::Button::new("Save")).clicked() {
+                    draft.tmdb_api_key = Some(self.api_key_input.trim().to_string());
+                    persist = true;
+                }
+                if ui.add_enabled(typed, egui::Button::new("Check")).clicked() {
+                    check_key = Some(self.api_key_input.clone());
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "The metadata provider is TMDB (themoviedb.org); IMDb has no official \
+                     public API. A free TMDB account gives you a v3 key or a v4 read access \
+                     token starting with eyJ. Either works. A saved key always wins over \
+                     REEL_TMDB_API_KEY.",
+                )
+                .color(theme::TEXT_DIM)
+                .size(11.0),
+            );
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -2119,16 +2359,97 @@ impl App {
                 if ui.button("Clear poster and metadata cache").clicked() {
                     action = Some(SettingsAction::ClearCache);
                 }
-                if catalog.can_set_key
-                    && catalog.key_source != "not set"
-                    && ui.button("Remove stored key").clicked()
+                let has_key = draft.stored_key().is_some();
+                if ui
+                    .add_enabled(has_key, egui::Button::new("Remove stored key"))
+                    .clicked()
                 {
-                    save_key = Some(None);
+                    remove_key = true;
                 }
             });
+            if let Some(note) = catalog.note.as_deref() {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(note).color(theme::WARN).size(12.0));
+            }
+            ui.add_space(14.0);
+
+            ui.label(egui::RichText::new("Streaming and downloads").size(16.0).strong());
+            ui.checkbox(
+                &mut draft.stream_only,
+                "Stream on demand (new multi-file torrents wait until you pick something)",
+            );
+            ui.label(
+                egui::RichText::new(
+                    "With this on, watching a file fetches only that file (and its subtitles). \
+                     Use the Download buttons on a title to keep individual files, episodes or \
+                     a whole season. With it off, new torrents download every playable file \
+                     in the background.",
+                )
+                .color(theme::TEXT_DIM)
+                .size(11.0),
+            );
+            ui.add_space(10.0);
+
+            ui.label(egui::RichText::new("Playback").size(16.0).strong());
+            ui.checkbox(&mut draft.subtitles_enabled, "Turn subtitles on when a file has them");
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    Vec2::new(150.0, 18.0),
+                    egui::Label::new(
+                        egui::RichText::new("Subtitle language").color(theme::TEXT_DIM),
+                    ),
+                );
+                let mut language = draft.subtitle_language.clone().unwrap_or_default();
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut language)
+                            .hint_text("auto")
+                            .desired_width(100.0),
+                    )
+                    .changed()
+                {
+                    draft.subtitle_language = Some(language).filter(|l| !l.trim().is_empty());
+                }
+                ui.label(
+                    egui::RichText::new("e.g. en. Blank lets the player choose.")
+                        .color(theme::TEXT_DIM)
+                        .size(11.0),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    Vec2::new(150.0, 18.0),
+                    egui::Label::new(egui::RichText::new("Default volume").color(theme::TEXT_DIM)),
+                );
+                ui.add(
+                    egui::Slider::new(&mut draft.default_volume, 0.0..=130.0).suffix(" %"),
+                );
+            });
+            match &caps.player {
+                PlayerCapability::Embedded => {
+                    row(ui, "Backend", "libmpv (embedded in this window)");
+                    if let Some((major, minor)) = caps.mpv_api {
+                        row(ui, "mpv client API", &format!("{major}.{minor}"));
+                    }
+                }
+                PlayerCapability::External { program } => {
+                    row(ui, "Backend", &format!("external player ({program})"));
+                    if let Some(note) = caps.player_note.as_deref() {
+                        ui.label(egui::RichText::new(note).color(theme::WARN).size(12.0));
+                    }
+                }
+                PlayerCapability::Unavailable { reason } => {
+                    row(ui, "Backend", "unavailable");
+                    ui.label(egui::RichText::new(reason).color(theme::DANGER).size(12.0));
+                }
+            }
             ui.add_space(14.0);
 
             ui.label(egui::RichText::new("Search sources").size(16.0).strong());
+            ui.checkbox(
+                &mut draft.enable_bundled_sources,
+                "Use the bundled source (Internet Archive)",
+            );
             let sources = self.backend.search_sources();
             if sources.is_empty() {
                 row(ui, "Sources", "none");
@@ -2147,64 +2468,14 @@ impl App {
             }
             ui.label(
                 egui::RichText::new(
-                    "reel bundles one source, the Internet Archive, which serves public-\
-                     domain and Creative Commons film. A search backend is anything \
-                     implementing the SearchBackend trait; add your own in \
-                     docs/ADDING_A_SOURCE.md.",
+                    "A search backend is anything implementing the SearchBackend trait; add \
+                     your own in docs/ADDING_A_SOURCE.md.",
                 )
                 .color(theme::TEXT_DIM)
                 .size(12.0),
             );
             ui.add_space(14.0);
 
-            ui.label(egui::RichText::new("Playback").size(16.0).strong());
-            match &caps.player {
-                PlayerCapability::Embedded => {
-                    row(ui, "Backend", "libmpv (embedded in this window)");
-                    if let Some((major, minor)) = caps.mpv_api {
-                        row(ui, "mpv client API", &format!("{major}.{minor}"));
-                    }
-                    ui.label(
-                        egui::RichText::new(
-                            "Video is decoded by libmpv and rendered into the app window. \
-                             No browser, no webview.",
-                        )
-                        .color(theme::TEXT_DIM)
-                        .size(12.0),
-                    );
-                }
-                PlayerCapability::External { program } => {
-                    row(ui, "Backend", &format!("external player ({program})"));
-                    if let Some(note) = caps.player_note.as_deref() {
-                        ui.label(egui::RichText::new(note).color(theme::WARN).size(12.0));
-                    }
-                    ui.label(
-                        egui::RichText::new(
-                            "Embedded playback is unavailable, so video opens in a separate \
-                             player window.",
-                        )
-                        .color(theme::TEXT_DIM)
-                        .size(12.0),
-                    );
-                }
-                PlayerCapability::Unavailable { reason } => {
-                    row(ui, "Backend", "unavailable");
-                    ui.label(egui::RichText::new(reason).color(theme::DANGER).size(12.0));
-                }
-            }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let mut volume = self.player.volume();
-                ui.label("Volume");
-                if ui
-                    .add(egui::Slider::new(&mut volume, 0.0..=130.0).suffix(" %"))
-                    .changed()
-                {
-                    self.player.set_volume(volume);
-                }
-            });
-
-            ui.add_space(14.0);
             ui.label(egui::RichText::new("About").size(16.0).strong());
             row(ui, "Version", env!("CARGO_PKG_VERSION"));
             ui.label(
@@ -2218,8 +2489,34 @@ impl App {
             );
         });
 
-        if let Some(key) = save_key {
-            self.backend.set_api_key(key);
+        ui.add_space(10.0);
+        if ui
+            .add(egui::Button::new(
+                egui::RichText::new("Save settings").size(14.0),
+            ))
+            .clicked()
+        {
+            persist = true;
+        }
+
+        if remove_key {
+            draft.tmdb_api_key = None;
+            persist = true;
+        }
+
+        self.settings_draft = Some(draft.clone());
+
+        if persist {
+            draft.normalise();
+            self.backend.save_settings(draft.clone());
+            self.settings_draft = Some(draft.clone());
+            // Apply playback preferences to the running controller.
+            self.player
+                .set_preferences(crate::player::PlaybackPreferences {
+                    subtitles_enabled: draft.subtitles_enabled,
+                    subtitle_language: draft.subtitle_language.clone(),
+                    volume: draft.default_volume,
+                });
             self.api_key_input.clear();
         }
         if let Some(key) = check_key {
@@ -2266,29 +2563,99 @@ impl App {
             return;
         };
 
-        egui::Panel::top("player-bar")
-            .frame(
-                egui::Frame::NONE
-                    .fill(theme::SURFACE)
-                    .inner_margin(egui::Margin::symmetric(14, 8)),
+        // Keyboard shortcuts. The player has no text fields, so plain keys are
+        // unambiguous here.
+        let (space, escape, fullscreen, left, right, up, down) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Space),
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::F),
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
             )
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("\u{2b05}  Back").clicked() {
-                        self.leave_player();
-                    }
-                    ui.label(egui::RichText::new(&info.title).size(15.0).strong());
+        });
+        let activity = ctx.input(|i| {
+            i.pointer.delta() != Vec2::ZERO || i.pointer.any_down() || i.pointer.any_click()
+        }) || space
+            || fullscreen
+            || left
+            || right
+            || up
+            || down;
+        if activity {
+            self.player_last_activity = Instant::now();
+            self.player_controls_hidden = false;
+        }
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let label = match self.player.backend() {
-                            Some(reel_player::Backend::Embedded) => "libmpv (embedded)",
-                            Some(reel_player::Backend::External) => "external player",
-                            _ => "unknown backend",
-                        };
-                        ui.label(egui::RichText::new(label).size(11.0).color(theme::TEXT_DIM));
+        if fullscreen {
+            self.player.toggle_fullscreen(ctx);
+        }
+        if escape {
+            if self.player.is_fullscreen() {
+                self.player.set_fullscreen(ctx, false);
+            } else {
+                self.leave_player();
+                return;
+            }
+        }
+        if space {
+            self.player.toggle_pause();
+        }
+        if left {
+            self.player.seek_relative(-10.0);
+        }
+        if right {
+            self.player.seek_relative(30.0);
+        }
+        if up {
+            let volume = (self.player.volume() + 5.0).min(130.0);
+            self.player.set_volume(volume);
+        }
+        if down {
+            let volume = (self.player.volume() - 5.0).max(0.0);
+            self.player.set_volume(volume);
+        }
+
+        // In fullscreen the chrome fades out when nothing is happening, and
+        // comes back the moment the pointer or a key moves.
+        if self.player.is_fullscreen() {
+            if self.player_last_activity.elapsed() > Duration::from_secs(2) {
+                self.player_controls_hidden = true;
+            }
+        } else {
+            self.player_controls_hidden = false;
+        }
+        let show_chrome = !self.player_controls_hidden;
+
+        if show_chrome {
+            egui::Panel::top("player-bar")
+                .frame(
+                    egui::Frame::NONE
+                        .fill(theme::SURFACE)
+                        .inner_margin(egui::Margin::symmetric(14, 8)),
+                )
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("\u{2b05}  Back").clicked() {
+                            self.leave_player();
+                        }
+                        ui.label(egui::RichText::new(&info.title).size(15.0).strong());
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let label = match self.player.backend() {
+                                Some(reel_player::Backend::Embedded) => "libmpv (embedded)",
+                                Some(reel_player::Backend::External) => "external player",
+                                _ => "unknown backend",
+                            };
+                            ui.label(
+                                egui::RichText::new(label).size(11.0).color(theme::TEXT_DIM),
+                            );
+                        });
                     });
                 });
-            });
+        }
 
         // External players own their window: explain rather than show a void.
         if self.player.backend() == Some(reel_player::Backend::External) {
@@ -2327,17 +2694,19 @@ impl App {
             return;
         }
 
-        egui::Panel::bottom("player-controls")
-            .frame(
-                egui::Frame::NONE
-                    .fill(theme::SURFACE)
-                    .inner_margin(egui::Margin::symmetric(16, 10)),
-            )
-            .show(ui, |ui| {
-                let stats = self.playback_stats(info.torrent_id);
-                ui.set_min_width(ui.available_width());
-                self.player.controls_ui(ui, &stats);
-            });
+        if show_chrome {
+            egui::Panel::bottom("player-controls")
+                .frame(
+                    egui::Frame::NONE
+                        .fill(theme::SURFACE)
+                        .inner_margin(egui::Margin::symmetric(16, 10)),
+                )
+                .show(ui, |ui| {
+                    let stats = self.playback_stats(info.torrent_id);
+                    ui.set_min_width(ui.available_width());
+                    self.player.controls_ui(ui, &stats);
+                });
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(Color32::BLACK))
@@ -2545,6 +2914,44 @@ mod tests {
             vec![0, 1, 2],
             "an empty selection would leave nothing to fetch"
         );
+    }
+
+    #[test]
+    fn playing_a_paused_pack_resumes_it_and_fetches_only_that_episode() {
+        let mut app = app_with_season_pack();
+        // This is exactly what adding a season pack produces.
+        app.backend.set_paused(9, true);
+        app.refresh();
+        assert!(app.item(9).expect("pack").torrent.stats.is_paused());
+
+        let ctx = egui::Context::default();
+        app.play_file(&ctx, 9, 1);
+        app.refresh();
+
+        let item = app.item(9).expect("pack");
+        assert!(
+            !item.torrent.stats.is_paused(),
+            "pressing play has to resume the torrent or the stream never starts"
+        );
+        assert_eq!(fetching(&app, 9), vec![1], "only the episode being watched");
+    }
+
+    #[test]
+    fn sidecar_subtitles_are_matched_to_their_video() {
+        let item = sample_library()
+            .into_iter()
+            .find(|item| item.torrent.id == 1)
+            .expect("the matrix");
+        let video = item.torrent.files.iter().find(|f| f.id == 0).expect("video");
+        let subs = companion_subtitles(&item.torrent.files, video);
+        assert_eq!(subs, vec![2], "The.Matrix.en.srt belongs to the film");
+    }
+
+    #[test]
+    fn episode_codes_are_read_from_names() {
+        assert_eq!(episode_token("Show.S01E02.1080p.mkv").as_deref(), Some("s01e02"));
+        assert_eq!(episode_token("Show.S1E2.srt").as_deref(), Some("s1e2"));
+        assert_eq!(episode_token("The.Matrix.1999.mkv"), None);
     }
 
     #[test]

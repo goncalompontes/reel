@@ -27,6 +27,19 @@ pub struct PlaybackInfo {
     pub fallback_duration: Option<f64>,
     /// Resume from here rather than the beginning.
     pub start_at: Option<f64>,
+    /// Sidecar subtitle files to register with the player, as `(url, title)`.
+    pub subtitles: Vec<(String, String)>,
+}
+
+/// Playback preferences read from the canonical settings.
+#[derive(Debug, Clone, Default)]
+pub struct PlaybackPreferences {
+    /// Turn subtitles on when a file has them.
+    pub subtitles_enabled: bool,
+    /// Preferred subtitle language (`slang`), e.g. `en`.
+    pub subtitle_language: Option<String>,
+    /// Starting volume, 0–130.
+    pub volume: f32,
 }
 
 /// Engine numbers the controls display alongside the player's own state.
@@ -50,6 +63,9 @@ pub struct PlayerController {
     /// does not fight the drag.
     scrub_position: Option<f64>,
     created_with: Option<PlayerCapability>,
+    preferences: PlaybackPreferences,
+    /// Whether the window is currently fullscreen.
+    fullscreen: bool,
 }
 
 impl Default for PlayerController {
@@ -69,7 +85,28 @@ impl PlayerController {
             volume: 100.0,
             scrub_position: None,
             created_with: None,
+            preferences: PlaybackPreferences {
+                subtitles_enabled: true,
+                subtitle_language: None,
+                volume: 100.0,
+            },
+            fullscreen: false,
         }
+    }
+
+    /// Apply settings-derived preferences. The next player created picks them
+    /// up; the volume applies to a running player immediately.
+    pub fn set_preferences(&mut self, preferences: PlaybackPreferences) {
+        self.volume = preferences.volume.clamp(0.0, 130.0);
+        if let Some(player) = self.player.as_ref() {
+            let _ = player.set_volume(self.volume as f64);
+            let _ = player.set_subtitles_visible(preferences.subtitles_enabled);
+        }
+        self.preferences = preferences;
+    }
+
+    pub fn preferences(&self) -> &PlaybackPreferences {
+        &self.preferences
     }
 
     pub fn is_active(&self) -> bool {
@@ -128,6 +165,16 @@ impl PlayerController {
         let player = self.player.as_ref().expect("player created above");
         player.set_target_size(Some((640, 360)));
         let _ = player.set_volume(self.volume as f64);
+        let _ = player.set_subtitles_visible(self.preferences.subtitles_enabled);
+
+        // Sidecar subtitles are registered now and loaded once the file is
+        // ready; mpv ignores `sub-add` before then, so the player queues them.
+        let subtitles = self
+            .current
+            .as_ref()
+            .map(|info| info.subtitles.clone())
+            .unwrap_or_default();
+        let _ = player.set_subtitles(subtitles);
 
         match start_at.filter(|start| *start > 1.0) {
             Some(start) => {
@@ -160,6 +207,9 @@ impl PlayerController {
 
         let config = PlayerConfig {
             prefer_embedded: matches!(capability, PlayerCapability::Embedded),
+            volume: self.preferences.volume as f64,
+            subtitles_enabled: self.preferences.subtitles_enabled,
+            subtitle_language: self.preferences.subtitle_language.clone(),
             ..Default::default()
         };
         let player = Player::new(config).map_err(|e| e.to_string())?;
@@ -210,6 +260,57 @@ impl PlayerController {
 
     pub fn volume(&self) -> f32 {
         self.volume
+    }
+
+    pub fn is_fullscreen(&self) -> bool {
+        self.fullscreen
+    }
+
+    /// Toggle the OS window's fullscreen state.
+    pub fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
+        self.set_fullscreen(ctx, !self.fullscreen);
+    }
+
+    pub fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
+        self.fullscreen = on;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+    }
+
+    /// Select a subtitle track, or turn subtitles off.
+    pub fn set_subtitle(&self, id: Option<i64>) {
+        if let Some(player) = self.player.as_ref() {
+            let _ = player.set_subtitle(id);
+        }
+    }
+
+    pub fn set_audio(&self, id: Option<i64>) {
+        if let Some(player) = self.player.as_ref() {
+            let _ = player.set_audio(id);
+        }
+    }
+
+    pub fn set_subtitles_visible(&self, visible: bool) {
+        if let Some(player) = self.player.as_ref() {
+            let _ = player.set_subtitles_visible(visible);
+        }
+    }
+
+    pub fn set_subtitle_delay(&self, seconds: f64) {
+        if let Some(player) = self.player.as_ref() {
+            let _ = player.set_subtitle_delay(seconds);
+        }
+    }
+
+    pub fn set_speed(&self, speed: f64) {
+        if let Some(player) = self.player.as_ref() {
+            let _ = player.set_speed(speed);
+        }
+    }
+
+    pub fn set_aspect_override(&self, aspect: Option<String>) {
+        if let Some(player) = self.player.as_ref() {
+            let _ = player.set_aspect_override(aspect);
+        }
     }
 
     /// How many frames have been uploaded as textures. Used by tests to tell
@@ -306,6 +407,17 @@ impl PlayerController {
 
         self.seek_bar(ui, duration, display_position);
 
+        // Choices are collected and applied after the rows, so the menu closures
+        // never borrow the controller mutably at the same time as the UI does.
+        let mut set_volume: Option<f32> = None;
+        let mut set_speed: Option<f64> = None;
+        let mut set_subtitle: Option<Option<i64>> = None;
+        let mut toggle_subtitles: Option<bool> = None;
+        let mut set_audio: Option<Option<i64>> = None;
+        let mut set_delay: Option<f64> = None;
+        let mut set_aspect: Option<Option<String>> = None;
+        let mut toggle_fullscreen = false;
+
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let play_label = if state.paused {
@@ -338,6 +450,21 @@ impl PlayerController {
             );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.player.is_some() {
+                    let icon = if self.fullscreen {
+                        "\u{1f5d7}"
+                    } else {
+                        "\u{26f6}"
+                    };
+                    if ui
+                        .button(icon)
+                        .on_hover_text("Fullscreen (F)")
+                        .clicked()
+                    {
+                        toggle_fullscreen = true;
+                    }
+                }
+
                 let mut volume = self.volume;
                 if ui
                     .add(
@@ -347,7 +474,7 @@ impl PlayerController {
                     )
                     .changed()
                 {
-                    self.set_volume(volume);
+                    set_volume = Some(volume);
                 }
 
                 if state.paused_for_cache {
@@ -374,6 +501,139 @@ impl PlayerController {
                 );
             });
         });
+
+        // Second row: tracks and speed.
+        ui.horizontal(|ui| {
+            let subtitle_label = if state.subtitles_visible && state.active_subtitle.is_some() {
+                "CC  on"
+            } else {
+                "CC  off"
+            };
+            ui.menu_button(subtitle_label, |ui| {
+                if ui
+                    .selectable_label(state.subtitles_visible, "Subtitles on")
+                    .clicked()
+                {
+                    toggle_subtitles = Some(true);
+                    ui.close();
+                }
+                if ui
+                    .selectable_label(!state.subtitles_visible, "Subtitles off")
+                    .clicked()
+                {
+                    toggle_subtitles = Some(false);
+                    ui.close();
+                }
+                if !state.subtitle_tracks.is_empty() {
+                    ui.separator();
+                    for track in &state.subtitle_tracks {
+                        let selected =
+                            state.subtitles_visible && state.active_subtitle == Some(track.id);
+                        if ui.selectable_label(selected, track.label()).clicked() {
+                            set_subtitle = Some(Some(track.id));
+                            ui.close();
+                        }
+                    }
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.small_button("-0.1s").clicked() {
+                        set_delay = Some(state.subtitle_delay - 0.1);
+                    }
+                    if ui.small_button("+0.1s").clicked() {
+                        set_delay = Some(state.subtitle_delay + 0.1);
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("delay {:+0.1}s", state.subtitle_delay))
+                            .color(theme::TEXT_DIM),
+                    );
+                });
+                if state.subtitle_tracks.is_empty() {
+                    ui.label(
+                        egui::RichText::new("No subtitle tracks in this file")
+                            .color(theme::TEXT_DIM)
+                            .size(11.0),
+                    );
+                }
+            });
+
+            if !state.audio_tracks.is_empty() {
+                let label = state
+                    .audio_tracks
+                    .iter()
+                    .find(|track| state.active_audio == Some(track.id))
+                    .map(|track| track.label())
+                    .unwrap_or_else(|| "Audio".to_string());
+                ui.menu_button(format!("\u{1f50a} {label}"), |ui| {
+                    for track in &state.audio_tracks {
+                        let selected = state.active_audio == Some(track.id);
+                        if ui.selectable_label(selected, track.label()).clicked() {
+                            set_audio = Some(Some(track.id));
+                            ui.close();
+                        }
+                    }
+                });
+            }
+
+            let speed = if state.speed > 0.0 { state.speed } else { 1.0 };
+            ui.menu_button(format!("{speed:.2}x"), |ui| {
+                for option in [0.5_f64, 0.75, 1.0, 1.25, 1.5, 2.0] {
+                    if ui
+                        .selectable_label((speed - option).abs() < 0.01, format!("{option}x"))
+                        .clicked()
+                    {
+                        set_speed = Some(option);
+                        ui.close();
+                    }
+                }
+            });
+
+            ui.menu_button("Aspect", |ui| {
+                if ui.selectable_label(state.aspect_override.is_none(), "Auto").clicked() {
+                    set_aspect = Some(None);
+                    ui.close();
+                }
+                for option in ["16:9", "4:3", "21:9", "1:1"] {
+                    if ui
+                        .selectable_label(state.aspect_override.as_deref() == Some(option), option)
+                        .clicked()
+                    {
+                        set_aspect = Some(Some(option.to_string()));
+                        ui.close();
+                    }
+                }
+            });
+        });
+
+        if let Some(volume) = set_volume {
+            self.set_volume(volume);
+        }
+        if let Some(speed) = set_speed {
+            self.set_speed(speed);
+        }
+        if let Some(id) = set_subtitle {
+            // Picking a track implies you want to see it.
+            if id.is_some() {
+                self.set_subtitles_visible(true);
+            }
+            self.set_subtitle(id);
+        }
+        if let Some(visible) = toggle_subtitles {
+            self.set_subtitles_visible(visible);
+        }
+        if let Some(id) = set_audio {
+            self.set_audio(id);
+        }
+        if let Some(delay) = set_delay {
+            self.set_subtitle_delay(delay);
+        }
+        if let Some(aspect) = set_aspect {
+            self.set_aspect_override(aspect);
+        }
+        if toggle_fullscreen {
+            let ctx = ui.ctx().clone();
+            self.toggle_fullscreen(&ctx);
+        }
     }
 
     fn seek_bar(&mut self, ui: &mut egui::Ui, duration: f64, position: f64) {

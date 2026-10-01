@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use reel_catalog::{CatalogSettings, default_data_dir};
 use reel_core::EngineConfig;
 use reel_desktop::backend::{Backend, EngineBackend, FakeBackend};
 use reel_desktop::{App, testing};
@@ -14,8 +15,8 @@ use reel_desktop::{App, testing};
     about = "Native reel desktop app: catalogue, library and player"
 )]
 struct Args {
-    /// Where torrent data is stored.
-    #[arg(long, env = "REEL_DOWNLOAD_DIR", value_name = "DIR")]
+    /// Where torrent data is stored. Overrides the saved setting for this run.
+    #[arg(long, value_name = "DIR")]
     dir: Option<PathBuf>,
 
     /// Run with a built-in sample library and no engine or network at all.
@@ -57,12 +58,19 @@ fn main() -> eframe::Result<()> {
     let args = Args::parse();
     init_tracing(args.verbose);
 
+    // Settings are canonical: the saved download directory is used unless the
+    // user passes an explicit `--dir` for this run.
+    let saved = CatalogSettings::load(&default_data_dir());
+
     let backend: Box<dyn Backend> = if args.demo {
         let library = testing::sample_library();
         tracing::info!(count = library.len(), "running with a sample library");
         Box::new(FakeBackend::new(library))
     } else {
-        let dir = args.dir.unwrap_or_else(default_download_dir);
+        let dir = args
+            .dir
+            .or_else(|| saved.download_dir_path())
+            .unwrap_or_else(default_download_dir);
         tracing::info!(dir = %dir.display(), "starting engine");
         match EngineBackend::start(EngineConfig::new(&dir)) {
             Ok(backend) => Box::new(backend),

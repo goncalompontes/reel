@@ -29,7 +29,7 @@ mod player;
 
 pub use error::PlayerError;
 pub use player::{
-    Backend, FrameSnapshot, Player, PlayerConfig, PlayerState, VideoFrame,
+    Backend, FrameSnapshot, Player, PlayerConfig, PlayerState, Track, VideoFrame,
 };
 
 /// Check whether embedded (libmpv) playback is usable on this machine, and

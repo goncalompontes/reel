@@ -25,7 +25,9 @@ use std::time::Duration;
 
 use crate::error::PlayerError;
 use crate::ffi::{self, MpvHandle, MpvLib, MpvRenderContext, mpv_render_param};
-use crate::player::{lock_shared, Command, Notify, PlayerConfig, PlayerState, Shared, VideoFrame};
+use crate::player::{
+    lock_shared, Command, Notify, PlayerConfig, PlayerState, Shared, Track, VideoFrame,
+};
 
 /// How long the worker sleeps when nothing signals it.
 ///
@@ -52,6 +54,9 @@ const PROP_VOLUME: u64 = 8;
 const PROP_SPEED: u64 = 9;
 const PROP_BUFFERING: u64 = 10;
 const PROP_PAUSED_FOR_CACHE: u64 = 11;
+const PROP_TRACK_COUNT: u64 = 12;
+const PROP_SUB_VISIBILITY: u64 = 13;
+const PROP_SUB_DELAY: u64 = 14;
 
 /// mpv objects, created **and** destroyed on the player worker thread.
 ///
@@ -125,6 +130,10 @@ impl EmbeddedCore {
         core.observe_properties();
         core.install_callbacks();
 
+        // A property rather than an option, so it has to wait until mpv is up.
+        core.lib
+            .set_flag(core.handle, "sub-visibility", config.subtitles_enabled)?;
+
         Ok(core)
     }
 
@@ -166,6 +175,14 @@ impl EmbeddedCore {
         if !config.no_audio && !config.mute {
             self.lib
                 .set_option(self.handle, "volume", &config.volume.to_string())?;
+        }
+
+        // Language preferences let mpv auto-pick the right embedded track.
+        if let Some(language) = config.subtitle_language.as_deref().filter(|l| !l.is_empty()) {
+            self.lib.set_option(self.handle, "slang", language)?;
+        }
+        if let Some(language) = config.audio_language.as_deref().filter(|l| !l.is_empty()) {
+            self.lib.set_option(self.handle, "alang", language)?;
         }
 
         for (name, value) in &config.mpv_options {
@@ -212,6 +229,9 @@ impl EmbeddedCore {
             (PROP_SPEED, "speed", MPV_FORMAT_DOUBLE),
             (PROP_BUFFERING, "cache-buffering-state", MPV_FORMAT_INT64),
             (PROP_PAUSED_FOR_CACHE, "paused-for-cache", MPV_FORMAT_FLAG),
+            (PROP_TRACK_COUNT, "track-list/count", MPV_FORMAT_INT64),
+            (PROP_SUB_VISIBILITY, "sub-visibility", MPV_FORMAT_FLAG),
+            (PROP_SUB_DELAY, "sub-delay", MPV_FORMAT_DOUBLE),
         ];
         for (id, name, format) in props {
             self.lib.observe(self.handle, *id, name, *format);
@@ -241,6 +261,10 @@ struct Worker {
     last_size: Option<(u32, u32)>,
     /// Applied once, after the first file loads.
     pending_start: Option<f64>,
+    /// Sidecar subtitles to add once the current file has loaded.
+    pending_subtitles: Vec<(String, String)>,
+    /// Whether a file is loaded, so `sub-add` has something to attach to.
+    file_loaded: bool,
     seen_generation: u64,
     shutdown: bool,
     /// Avoids logging the same render error at 60 Hz.
@@ -267,6 +291,8 @@ pub(crate) fn run_worker(
 
     let mut worker = Worker {
         pending_start: core.default_start,
+        pending_subtitles: Vec::new(),
+        file_loaded: false,
         core,
         shared,
         pool: Vec::new(),
@@ -313,6 +339,37 @@ impl Worker {
                 Ok(Command::SeekAbsolute(seconds)) => self.seek(seconds, "absolute"),
                 Ok(Command::SeekRelative(delta)) => self.seek(delta, "relative"),
                 Ok(Command::SetVolume(volume)) => self.set_volume(volume),
+                Ok(Command::SetSubtitle(id)) => self.set_track("sid", id),
+                Ok(Command::SetAudio(id)) => self.set_track("aid", id),
+                Ok(Command::SetSubtitleVisible(visible)) => {
+                    self.set_flag("sub-visibility", visible)
+                }
+                Ok(Command::SetSubtitleDelay(seconds)) => {
+                    if let Err(e) = self.core.lib.set_double(self.core.handle, "sub-delay", seconds) {
+                        tracing::warn!(error = %e, "failed to set subtitle delay");
+                    } else {
+                        lock_shared(&self.shared).state.subtitle_delay = seconds;
+                    }
+                }
+                Ok(Command::SetSpeed(speed)) => {
+                    if let Err(e) = self.core.lib.set_double(self.core.handle, "speed", speed) {
+                        tracing::warn!(error = %e, "failed to set speed");
+                    }
+                }
+                Ok(Command::SetAspectOverride(aspect)) => {
+                    let value = aspect.as_deref().unwrap_or("-1");
+                    if let Err(e) = self
+                        .core
+                        .lib
+                        .command(self.core.handle, &["set", "video-aspect-override", value])
+                    {
+                        tracing::warn!(error = %e, "failed to set aspect override");
+                    }
+                }
+                Ok(Command::SetSubtitles(subtitles)) => {
+                    self.pending_subtitles = subtitles;
+                    self.apply_pending_subtitles();
+                }
                 Ok(Command::Stop) => self.stop(),
                 Ok(Command::Shutdown) => self.shutdown = true,
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -331,6 +388,7 @@ impl Worker {
         }
         // Seek once the file has actually loaded; seeking earlier is a no-op.
         self.pending_start = start_position.or(self.pending_start.take());
+        self.file_loaded = false;
 
         let mut guard = lock_shared(&self.shared);
         let volume = guard.state.volume;
@@ -358,6 +416,75 @@ impl Worker {
         }
     }
 
+    /// Select a track by mpv property name (`sid`/`aid`); `None` means off.
+    fn set_track(&mut self, name: &str, id: Option<i64>) {
+        let value = match id {
+            Some(id) => id.to_string(),
+            None => "no".to_string(),
+        };
+        if let Err(e) = self
+            .core
+            .lib
+            .command(self.core.handle, &["set", name, value.as_str()])
+        {
+            tracing::warn!(error = %e, name, "failed to select track");
+            return;
+        }
+        // Reflect the choice immediately; the property observer confirms it.
+        let mut guard = lock_shared(&self.shared);
+        match name {
+            "sid" => guard.state.active_subtitle = id,
+            "aid" => guard.state.active_audio = id,
+            _ => {}
+        }
+    }
+
+    /// Add sidecar subtitles once a file is loaded, then refresh the track list.
+    fn apply_pending_subtitles(&mut self) {
+        if !self.file_loaded || self.pending_subtitles.is_empty() {
+            return;
+        }
+        let subtitles = std::mem::take(&mut self.pending_subtitles);
+        for (url, title) in subtitles {
+            if let Err(e) = self.core.lib.command(
+                self.core.handle,
+                &["sub-add", url.as_str(), "auto", title.as_str()],
+            ) {
+                tracing::warn!(error = %e, %url, "failed to add sidecar subtitle");
+            }
+        }
+        self.refresh_track_list();
+    }
+
+    /// Read mpv's full track list and publish the audio/subtitle subsets.
+    fn refresh_track_list(&mut self) {
+        let Some(json) = self.core.lib.get_string(self.core.handle, "track-list") else {
+            return;
+        };
+        let tracks = parse_tracks(&json);
+        let mut guard = lock_shared(&self.shared);
+        guard.state.subtitle_tracks = tracks
+            .iter()
+            .filter(|track| track.kind == "sub")
+            .cloned()
+            .collect();
+        guard.state.audio_tracks = tracks
+            .iter()
+            .filter(|track| track.kind == "audio")
+            .cloned()
+            .collect();
+        guard.state.active_subtitle = tracks
+            .iter()
+            .find(|track| track.kind == "sub" && track.selected)
+            .map(|track| track.id);
+        guard.state.active_audio = tracks
+            .iter()
+            .find(|track| track.kind == "audio" && track.selected)
+            .map(|track| track.id);
+        drop(guard);
+        self.request_repaint();
+    }
+
     fn seek(&mut self, amount: f64, mode: &str) {
         let amount = amount.to_string();
         if let Err(e) = self
@@ -373,6 +500,8 @@ impl Worker {
         if let Err(e) = self.core.lib.command(self.core.handle, &["stop"]) {
             tracing::warn!(error = %e, "stop failed");
         }
+        self.file_loaded = false;
+        self.pending_subtitles.clear();
         let mut guard = lock_shared(&self.shared);
         guard.state.loaded = false;
         guard.state.paused = false;
@@ -405,12 +534,15 @@ impl Worker {
             ffi::MPV_EVENT_PROPERTY_CHANGE => self.handle_property_change(event),
             ffi::MPV_EVENT_FILE_LOADED => {
                 lock_shared(&self.shared).state.loaded = true;
+                self.file_loaded = true;
                 if let Some(position) = self.pending_start.take() {
                     if position > 0.0 {
                         self.seek(position, "absolute");
                     }
                 }
                 self.last_size = None;
+                self.refresh_track_list();
+                self.apply_pending_subtitles();
                 self.request_repaint();
             }
             ffi::MPV_EVENT_END_FILE => {
@@ -438,6 +570,14 @@ impl Worker {
     }
 
     fn handle_property_change(&mut self, event: &ffi::mpv_event) {
+        // The full track list is a complex property; the count is what is
+        // observable, so re-read the list whenever it changes. This has to
+        // happen before the shared lock is taken below, or refreshing would
+        // deadlock on itself.
+        if event.reply_userdata == PROP_TRACK_COUNT {
+            self.refresh_track_list();
+            return;
+        }
         if event.data.is_null() {
             return;
         }
@@ -505,6 +645,16 @@ impl Worker {
             PROP_PAUSED_FOR_CACHE => {
                 if let Some(v) = flag() {
                     guard.state.paused_for_cache = v;
+                }
+            }
+            PROP_SUB_VISIBILITY => {
+                if let Some(v) = flag() {
+                    guard.state.subtitles_visible = v;
+                }
+            }
+            PROP_SUB_DELAY => {
+                if let Some(v) = double() {
+                    guard.state.subtitle_delay = v;
                 }
             }
             _ => {}
@@ -656,6 +806,50 @@ fn matcher_changed(id: u64) -> bool {
     )
 }
 
+/// Parse mpv's JSON `track-list` into [`Track`] values.
+///
+/// Kept pure and tested: mpv reports this as JSON through
+/// `mpv_get_property_string("track-list")`, and the shape is stable.
+fn parse_tracks(json: &str) -> Vec<Track> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    value
+        .as_array()
+        .map(|tracks| {
+            tracks
+                .iter()
+                .filter_map(|track| {
+                    let id = track.get("id")?.as_i64()?;
+                    let kind = track.get("type")?.as_str()?.to_string();
+                    let text = |key: &str| {
+                        track
+                            .get(key)
+                            .and_then(|value| value.as_str())
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string)
+                    };
+                    Some(Track {
+                        id,
+                        kind,
+                        title: text("title"),
+                        lang: text("lang"),
+                        external: track
+                            .get("external")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false),
+                        selected: track
+                            .get("selected")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn prop_double(prop: &ffi::mpv_event_property) -> Option<f64> {
     (prop.format == ffi::MPV_FORMAT_DOUBLE && !prop.data.is_null())
         .then(|| unsafe { *(prop.data as *const f64) })
@@ -669,4 +863,39 @@ fn prop_flag(prop: &ffi::mpv_event_property) -> Option<bool> {
 fn prop_int(prop: &ffi::mpv_event_property) -> Option<i64> {
     (prop.format == ffi::MPV_FORMAT_INT64 && !prop.data.is_null())
         .then(|| unsafe { *(prop.data as *const i64) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_subtitle_and_audio_tracks() {
+        let json = r#"[
+            {"id":1,"type":"video","selected":true},
+            {"id":2,"type":"audio","lang":"eng","selected":true},
+            {"id":3,"type":"audio","title":"Director commentary","lang":"eng"},
+            {"id":4,"type":"sub","lang":"eng","selected":true},
+            {"id":5,"type":"sub","title":"Forced","external":true}
+        ]"#;
+        let tracks = parse_tracks(json);
+
+        let audio: Vec<_> = tracks.iter().filter(|t| t.kind == "audio").collect();
+        assert_eq!(audio.len(), 2);
+        assert_eq!(audio[0].lang.as_deref(), Some("eng"));
+        assert!(audio[0].selected);
+
+        let subs: Vec<_> = tracks.iter().filter(|t| t.kind == "sub").collect();
+        assert_eq!(subs.len(), 2);
+        assert!(subs[0].selected, "embedded subtitle is the active one");
+        assert!(subs[1].external, "a sidecar is marked external");
+        assert_eq!(subs[1].label(), "Forced");
+    }
+
+    #[test]
+    fn a_non_array_or_garbage_track_list_is_empty_not_a_panic() {
+        assert!(parse_tracks("null").is_empty());
+        assert!(parse_tracks("not json").is_empty());
+        assert!(parse_tracks(r#"[{"type":"sub"}]"#).is_empty(), "no id");
+    }
 }

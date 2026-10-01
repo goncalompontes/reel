@@ -27,6 +27,32 @@ pub struct FrameSnapshot {
     pub frame: Arc<VideoFrame>,
 }
 
+/// One selectable track (audio or subtitle) reported by the player.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Track {
+    /// mpv's track id, used with `sid`/`aid`.
+    pub id: i64,
+    /// `audio`, `sub` or `video`.
+    pub kind: String,
+    pub title: Option<String>,
+    pub lang: Option<String>,
+    /// True for a file added with `sub-add`, rather than embedded in the video.
+    pub external: bool,
+    pub selected: bool,
+}
+
+impl Track {
+    /// A short human label: title, language, or the id.
+    pub fn label(&self) -> String {
+        match (self.title.as_deref(), self.lang.as_deref()) {
+            (Some(title), Some(lang)) if !title.is_empty() => format!("{title} ({lang})"),
+            (Some(title), _) if !title.is_empty() => title.to_string(),
+            (_, Some(lang)) => lang.to_string(),
+            _ => format!("track {}", self.id),
+        }
+    }
+}
+
 /// Snapshot of the player's transport state.
 #[derive(Debug, Clone, Default)]
 pub struct PlayerState {
@@ -50,6 +76,20 @@ pub struct PlayerState {
     /// Human readable failure, surfaced from mpv.
     pub error: Option<String>,
     pub url: Option<String>,
+    /// Subtitle tracks the current file offers (embedded and sidecar).
+    pub subtitle_tracks: Vec<Track>,
+    /// Audio tracks the current file offers.
+    pub audio_tracks: Vec<Track>,
+    /// Whether subtitles are currently displayed.
+    pub subtitles_visible: bool,
+    /// Subtitle timing offset in seconds.
+    pub subtitle_delay: f64,
+    /// Selected subtitle track id, if any.
+    pub active_subtitle: Option<i64>,
+    /// Selected audio track id, if any.
+    pub active_audio: Option<i64>,
+    /// Video aspect override, e.g. `16:9`, or `None` for the source aspect.
+    pub aspect_override: Option<String>,
 }
 
 impl PlayerState {
@@ -102,6 +142,12 @@ pub struct PlayerConfig {
     pub no_audio: bool,
     /// Hardware decoding mode passed to mpv (`auto-safe`, `no`, `auto`, ...).
     pub hwdec: String,
+    /// Turn subtitles on when the file has them.
+    pub subtitles_enabled: bool,
+    /// Preferred subtitle language, passed to mpv as `slang`.
+    pub subtitle_language: Option<String>,
+    /// Preferred audio language, passed to mpv as `alang`.
+    pub audio_language: Option<String>,
 }
 
 impl Default for PlayerConfig {
@@ -115,6 +161,9 @@ impl Default for PlayerConfig {
             mute: false,
             no_audio: false,
             hwdec: "auto-safe".to_string(),
+            subtitles_enabled: true,
+            subtitle_language: None,
+            audio_language: None,
         }
     }
 }
@@ -194,6 +243,14 @@ pub(crate) enum Command {
     SeekAbsolute(f64),
     SeekRelative(f64),
     SetVolume(f64),
+    SetSubtitle(Option<i64>),
+    SetAudio(Option<i64>),
+    SetSubtitleVisible(bool),
+    SetSubtitleDelay(f64),
+    SetSpeed(f64),
+    SetAspectOverride(Option<String>),
+    /// Replace the sidecar subtitles to load once the file is ready.
+    SetSubtitles(Vec<(String, String)>),
     Stop,
     Shutdown,
 }
@@ -420,6 +477,69 @@ impl Player {
         let volume = volume.clamp(0.0, 130.0);
         match self.backend {
             Backend::Embedded => self.send(Command::SetVolume(volume)),
+            Backend::External => Err(PlayerError::ExternalControl),
+            Backend::Unavailable => Err(PlayerError::NoBackend),
+        }
+    }
+
+    /// Select a subtitle track by id, or `None` to turn subtitles off.
+    pub fn set_subtitle(&self, id: Option<i64>) -> Result<(), PlayerError> {
+        match self.backend {
+            Backend::Embedded => self.send(Command::SetSubtitle(id)),
+            Backend::External => Err(PlayerError::ExternalControl),
+            Backend::Unavailable => Err(PlayerError::NoBackend),
+        }
+    }
+
+    /// Select an audio track by id, or `None` to let the player choose.
+    pub fn set_audio(&self, id: Option<i64>) -> Result<(), PlayerError> {
+        match self.backend {
+            Backend::Embedded => self.send(Command::SetAudio(id)),
+            Backend::External => Err(PlayerError::ExternalControl),
+            Backend::Unavailable => Err(PlayerError::NoBackend),
+        }
+    }
+
+    pub fn set_subtitles_visible(&self, visible: bool) -> Result<(), PlayerError> {
+        match self.backend {
+            Backend::Embedded => self.send(Command::SetSubtitleVisible(visible)),
+            Backend::External => Err(PlayerError::ExternalControl),
+            Backend::Unavailable => Err(PlayerError::NoBackend),
+        }
+    }
+
+    /// Shift subtitle timing by `seconds` (positive is later).
+    pub fn set_subtitle_delay(&self, seconds: f64) -> Result<(), PlayerError> {
+        match self.backend {
+            Backend::Embedded => self.send(Command::SetSubtitleDelay(seconds)),
+            Backend::External => Err(PlayerError::ExternalControl),
+            Backend::Unavailable => Err(PlayerError::NoBackend),
+        }
+    }
+
+    pub fn set_speed(&self, speed: f64) -> Result<(), PlayerError> {
+        let speed = speed.clamp(0.1, 8.0);
+        match self.backend {
+            Backend::Embedded => self.send(Command::SetSpeed(speed)),
+            Backend::External => Err(PlayerError::ExternalControl),
+            Backend::Unavailable => Err(PlayerError::NoBackend),
+        }
+    }
+
+    /// Override the displayed aspect ratio, or `None` to use the source's.
+    pub fn set_aspect_override(&self, aspect: Option<String>) -> Result<(), PlayerError> {
+        match self.backend {
+            Backend::Embedded => self.send(Command::SetAspectOverride(aspect)),
+            Backend::External => Err(PlayerError::ExternalControl),
+            Backend::Unavailable => Err(PlayerError::NoBackend),
+        }
+    }
+
+    /// Register sidecar subtitle files as `(url, title)`. They are loaded once
+    /// the video is ready.
+    pub fn set_subtitles(&self, subtitles: Vec<(String, String)>) -> Result<(), PlayerError> {
+        match self.backend {
+            Backend::Embedded => self.send(Command::SetSubtitles(subtitles)),
             Backend::External => Err(PlayerError::ExternalControl),
             Backend::Unavailable => Err(PlayerError::NoBackend),
         }
