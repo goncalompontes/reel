@@ -138,6 +138,16 @@ pointer movement.
 > stream removes the torrent instead of racing a re-add. These are pinned by
 > `tests/ui_scenarios.rs`, a headless harness that drives the real widget tree
 > with synthetic input — see `docs/DEBUGGING_UI.md`.
+>
+> Second follow-up: the real bug behind both symptoms was that `add` returns
+> before librqbit will accept a file-selection change, so the post-add
+> `set_only_files` failed and the media-only regex (every episode) stayed in
+> force; and a just-added paused torrent could not be un-paused. The engine now
+> takes the selection in `AddOptions::only_files` and adds a torrent directly in
+> the state it should end in. The library keeps a per-file *keep set* (nothing
+> for a stream, the chosen episodes/versions for a download) and the backend
+> owns storage, re-adding and cleanup. See
+> `tests/backend.rs::a_pack_streams_and_downloads_only_the_chosen_episode`.
 
 ## Implementation notes (streaming pass)
 

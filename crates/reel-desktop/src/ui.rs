@@ -630,28 +630,6 @@ impl App {
         self.invalidate();
     }
 
-    /// Stop fetching one file. When it is the torrent's last file, the torrent
-    /// is paused instead, because an empty selection is refused.
-    pub fn cancel_file(&mut self, torrent_id: usize, file_id: usize) {
-        let Some(item) = self.item(torrent_id) else {
-            return;
-        };
-        let remaining: Vec<usize> = item
-            .torrent
-            .files
-            .iter()
-            .filter(|file| file.included && file.id != file_id)
-            .map(|file| file.id)
-            .collect();
-        if remaining.is_empty() {
-            self.backend.set_paused(torrent_id, true);
-            self.set_toast("Download cancelled", false);
-        } else {
-            self.backend.set_only_files(torrent_id, &remaining);
-        }
-        self.invalidate();
-    }
-
     /// The episodes of a season as `(torrent, files)` batches, using the chosen
     /// copy of each episode (or the best one).
     fn season_selection(&self, work: &Work, season: Option<u32>) -> Vec<(usize, Vec<usize>)> {
@@ -1647,19 +1625,6 @@ impl App {
                     action = Some(DetailAction::MarkWatched);
                 }
 
-                let any_downloading = work.members.iter().any(|member| {
-                    self.item(member.torrent_id())
-                        .is_some_and(|item| item.downloading)
-                });
-                if any_downloading
-                    && ui
-                        .button("Stop download")
-                        .on_hover_text("Delete the kept files and go back to streaming only")
-                        .clicked()
-                {
-                    action = Some(DetailAction::StopDownload);
-                }
-
                 if ui.button("\u{1f5d1}  Remove").clicked() {
                     action = Some(DetailAction::OpenRemove);
                 }
@@ -1752,20 +1717,12 @@ impl App {
                 self.invalidate();
             }
             Some(DetailAction::CancelDownload(torrent_id, file_id)) => {
-                self.cancel_file(torrent_id, file_id);
+                self.backend.stop_download_files(torrent_id, &[file_id]);
+                self.invalidate();
             }
             Some(DetailAction::DownloadEpisodes(selections)) => {
                 for (torrent_id, files) in &selections {
                     self.backend.download_files(*torrent_id, files);
-                }
-                self.invalidate();
-            }
-            Some(DetailAction::StopDownload) => {
-                for member in &work.members {
-                    let torrent_id = member.torrent_id();
-                    if self.item(torrent_id).is_some_and(|item| item.downloading) {
-                        self.backend.stop_download(torrent_id);
-                    }
                 }
                 self.invalidate();
             }
@@ -1799,18 +1756,11 @@ impl App {
         self.pause_notice(ui, work);
 
         for (index, version) in versions.iter().enumerate() {
-            let item = self.item(version.torrent_id);
-            let included = item
-                .as_ref()
-                .and_then(|item| {
-                    item.torrent
-                        .files
-                        .iter()
-                        .find(|file| file.id == version.file_id)
-                        .map(|file| file.included)
-                })
-                .unwrap_or(false);
-            let title_downloading = item.as_ref().is_some_and(|item| item.downloading);
+            // A copy is "kept" because the user asked for that copy, not because
+            // the title as a whole is a download.
+            let kept = self
+                .item(version.torrent_id)
+                .is_some_and(|item| item.kept_files.contains(&version.file_id));
 
             egui::Frame::NONE
                 .fill(theme::SURFACE)
@@ -1841,10 +1791,10 @@ impl App {
                                 *action =
                                     Some(DetailAction::Play(version.torrent_id, version.file_id));
                             }
-                            if title_downloading && included {
+                            if kept {
                                 if ui
                                     .small_button("Stop download")
-                                    .on_hover_text("Stop keeping this download")
+                                    .on_hover_text("Stop keeping this copy")
                                     .clicked()
                                 {
                                     *action = Some(DetailAction::CancelDownload(
@@ -2033,29 +1983,16 @@ impl App {
         let chosen = self.chosen_variant(work, episode).cloned();
         let info = work.episode_info(episode).cloned();
 
-        let included = chosen
-            .as_ref()
-            .and_then(|variant| {
-                self.item(variant.torrent_id).and_then(|item| {
-                    item.torrent
-                        .files
-                        .iter()
-                        .find(|file| file.id == variant.file_id)
-                        .map(|file| file.included)
-                })
-            })
-            .unwrap_or(false);
         let watched = chosen.as_ref().and_then(|variant| {
             self.item(variant.torrent_id)
                 .and_then(|item| item.entry.watch_for_file(variant.file_id).cloned())
         });
-        // Being *selected* is not the same as being *kept*: a stream pack is
-        // paused, so every episode is in the fetch plan but nothing is
-        // downloading. Only a title the user asked to keep shows Stop download.
-        let title_downloading = chosen
-            .as_ref()
-            .and_then(|variant| self.item(variant.torrent_id))
-            .is_some_and(|item| item.downloading);
+        // Kept is per episode, not per title: downloading one episode of a
+        // pack keeps that episode and nothing else.
+        let kept = chosen.as_ref().is_some_and(|variant| {
+            self.item(variant.torrent_id)
+                .is_some_and(|item| item.kept_files.contains(&variant.file_id))
+        });
 
         let key = episode_choice_key(work, episode);
         let code = episode.code();
@@ -2144,10 +2081,10 @@ impl App {
                             if ui.small_button("Play").clicked() {
                                 *action = Some(DetailAction::Play(torrent_id, file_id));
                             }
-                            if title_downloading && included {
+                            if kept {
                                 if ui
                                     .small_button("Stop download")
-                                    .on_hover_text("Stop keeping this download")
+                                    .on_hover_text("Stop keeping this episode")
                                     .clicked()
                                 {
                                     *action =
@@ -2288,7 +2225,6 @@ enum DetailAction {
     Download(usize, usize),
     CancelDownload(usize, usize),
     DownloadEpisodes(Vec<(usize, Vec<usize>)>),
-    StopDownload,
 }
 
 /// The stable key an episode's chosen copy is remembered under, for a session.
@@ -3414,6 +3350,32 @@ mod tests {
             "pressing play has to resume the torrent or the stream never starts"
         );
         assert_eq!(fetching(&app, 9), vec![1], "only the episode being watched");
+    }
+
+    #[test]
+    fn downloading_one_episode_keeps_only_that_episode() {
+        let mut app = app_with_season_pack();
+
+        app.backend.download_files(9, &[1]);
+        app.refresh();
+        let item = app.item(9).expect("the pack");
+        assert!(item.downloading);
+        assert_eq!(item.kept_files, vec![1], "only the chosen episode is kept");
+        let included: Vec<usize> = item
+            .torrent
+            .files
+            .iter()
+            .filter(|file| file.included)
+            .map(|file| file.id)
+            .collect();
+        assert_eq!(included, vec![1], "and only it is fetched");
+
+        // Stopping that episode clears the title completely.
+        app.backend.stop_download_files(9, &[1]);
+        app.refresh();
+        let item = app.item(9).expect("the pack");
+        assert!(!item.downloading);
+        assert!(item.kept_files.is_empty());
     }
 
     #[test]

@@ -102,6 +102,117 @@ fn engine_backend_serves_its_api_in_process() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Poll until `check` is true, or fail with `what` after a deadline.
+fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if check() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// A multi-file pack: playing one episode fetches one episode, and downloading
+/// one episode keeps one episode — not the whole season.
+#[test]
+fn a_pack_streams_and_downloads_only_the_chosen_episode() {
+    let dir = scratch_dir("pack");
+    let pack = dir.join("pack");
+    std::fs::create_dir_all(&pack).unwrap();
+    for n in 1..=3u8 {
+        let bytes: Vec<u8> = (0..96 * 1024).map(|i| ((i as u8).wrapping_add(n * 7)) as u8).collect();
+        std::fs::write(pack.join(format!("Some.Show.S01E{n:02}.mkv")), bytes).unwrap();
+    }
+    let torrent_path = dir.join("pack.torrent");
+    {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let created = runtime
+            .block_on(reel_core::create_torrent_file(
+                &pack,
+                None,
+                Vec::new(),
+                Some(16 * 1024),
+            ))
+            .expect("create torrent");
+        std::fs::write(&torrent_path, &created.bytes).unwrap();
+    }
+
+    let scratch = scratch_dir("pack-state");
+    let config = EngineConfig {
+        disable_dht: true,
+        disable_trackers: true,
+        persist_session: false,
+        stream_scratch_dir: Some(scratch.clone()),
+        ..EngineConfig::new(&scratch)
+    };
+    let backend = EngineBackend::start_with_options(
+        config,
+        CatalogOptions {
+            api_key: None,
+            settings: Default::default(),
+            data_dir: dir.join("catalog"),
+            disable_bundled_sources: true,
+        },
+    )
+    .expect("start the engine backend");
+
+    backend.add(torrent_path.to_str().unwrap(), true);
+    wait_until("the pack to appear", || !backend.library().is_empty());
+    let id = backend.library().into_iter().next().unwrap().torrent.id;
+    wait_until("the pack to be live", || backend.is_live(id));
+
+    let included = |backend: &EngineBackend| -> Vec<usize> {
+        backend
+            .item(id)
+            .expect("the pack")
+            .torrent
+            .files
+            .iter()
+            .filter(|file| file.included)
+            .map(|file| file.id)
+            .collect()
+    };
+
+    // Added as a stream: paused, nothing is being fetched yet.
+    assert!(
+        backend.item(id).expect("the pack").torrent.stats.is_paused(),
+        "a stream pack waits to be told what to play"
+    );
+    assert!(!backend.item(id).expect("the pack").downloading);
+
+    // Play episode 2: it resumes, and fetches only episode 2.
+    backend.start_files(id, &[1]);
+    wait_until("episode 2 to start", || {
+        !backend.item(id).expect("the pack").torrent.stats.is_paused()
+    });
+    assert_eq!(included(&backend), vec![1], "only the played episode is fetched");
+
+    // Download episode 2: only it is kept, not the whole pack.
+    backend.download_files(id, &[1]);
+    wait_until("the download to be marked", || {
+        backend.item(id).expect("the pack").downloading
+    });
+    wait_until("the download to run", || {
+        backend.is_live(id) && !backend.item(id).expect("the pack").torrent.stats.is_paused()
+    });
+    assert_eq!(
+        included(&backend),
+        vec![1],
+        "downloading one episode must not fetch the whole pack"
+    );
+
+    // Stop it again in one action.
+    backend.stop_download(id);
+    wait_until("the download to stop", || {
+        !backend.item(id).expect("the pack").downloading
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 /// The streaming lifecycle against the real engine, with no swarm: a title is
 /// added, is temporary by default, can be kept as a download, and is released
 /// again so its temporary storage goes away.

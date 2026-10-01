@@ -157,6 +157,7 @@ fn item(
 
     LibraryItem {
         downloading: false,
+        kept_files: Vec::new(),
         torrent: TorrentView {
             id,
             info_hash: info_hash.to_string(),

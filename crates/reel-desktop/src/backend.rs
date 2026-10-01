@@ -94,6 +94,9 @@ pub struct LibraryItem {
     /// The user asked to keep this title on disk. `false` means it is only ever
     /// streamed.
     pub downloading: bool,
+    /// Which files the user asked to keep, so a per-episode/season/film row can
+    /// show its own Download/Stop toggle.
+    pub kept_files: Vec<usize>,
 }
 
 impl LibraryItem {
@@ -167,6 +170,10 @@ pub trait Backend {
 
     /// Stop keeping a download: delete its files and go back to streaming-only.
     fn stop_download(&self, id: usize);
+
+    /// Stop keeping specific files (an episode, a season, a film copy) while
+    /// leaving any other kept files alone.
+    fn stop_download_files(&self, id: usize, files: &[usize]);
 
     /// Playback has stopped. A title that is not being downloaded is released
     /// so its temporary storage goes away; a download is left alone.
@@ -494,38 +501,39 @@ impl EngineBackend {
                 Err(_) => return,
             };
 
-            let paused = !downloading && start.is_none();
+            // The selection is applied as the torrent is added, so the whole
+            // pack is never briefly selected. It starts paused because nothing
+            // should download before that; only a download (or a play) resumes.
+            // Add it already in the state it should end in. Trying to resume a
+            // just-added torrent does not work (it is still initialising), and
+            // with the selection applied at add there is no burst to guard
+            // against anyway.
+            let running = start.is_some() || downloading;
+            let selection = start
+                .clone()
+                .filter(|files| !files.is_empty())
+                .or_else(|| {
+                    downloading
+                        .then(|| entry.selected_files.clone())
+                        .filter(|files| !files.is_empty())
+                });
             let options = AddOptions {
-                media_only: true,
-                paused,
+                media_only: selection.is_none(),
+                only_files: selection,
+                paused: !running,
                 allow_overwrite: downloading,
                 ephemeral: !downloading,
                 pause_multi_file: false,
                 ..Default::default()
             };
 
-            let outcome = match engine.add(source, options).await {
-                Ok(outcome) => outcome,
+            let engine_id = match engine.add(source, options).await {
+                Ok(outcome) => outcome.torrent.id,
                 Err(e) => {
                     tracing::warn!(info_hash = %entry.info_hash, error = %e, "could not re-add");
                     return;
                 }
             };
-            let engine_id = outcome.torrent.id;
-
-            let selection = start
-                .clone()
-                .or_else(|| downloading.then(|| entry.selected_files.clone()));
-            if let Some(files) = selection.filter(|files| !files.is_empty()) {
-                if let Err(e) = engine.set_only_files(engine_id, &files).await {
-                    tracing::warn!(error = %e, "could not restore the file selection");
-                }
-            }
-            if start.is_some() || downloading {
-                if let Err(e) = engine.resume(engine_id).await {
-                    tracing::warn!(error = %e, "could not start the re-added torrent");
-                }
-            }
 
             if let Some(bytes) = engine.torrent_bytes(engine_id) {
                 let dir = data_dir.join("torrents");
@@ -557,6 +565,19 @@ impl EngineBackend {
         for entry in entries {
             self.recycle(entry, true, None, false);
         }
+    }
+
+    /// Record which files the user asked to keep. A title with none is a
+    /// stream; a title with some is a download that survives a restart.
+    fn set_kept(&self, id: usize, keep: &[usize]) {
+        let mut store = self.library.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = store.entry_mut(id) {
+            entry.selected_files = keep.to_vec();
+            entry.downloading = !keep.is_empty();
+        }
+        let snapshot = store.clone();
+        drop(store);
+        let _ = snapshot.save(&self.library_path());
     }
 
     /// Write back the file list the engine knows, once a magnet has resolved.
@@ -744,6 +765,7 @@ impl EngineBackend {
         LibraryItem {
             torrent,
             downloading: entry.downloading,
+            kept_files: entry.selected_files.clone(),
             entry: CatalogEntry {
                 torrent_id: entry.id,
                 info_hash: entry.info_hash.clone(),
@@ -950,8 +972,17 @@ impl Backend for EngineBackend {
                 if let Some(entry) = store.entry_mut(id) {
                     entry.files = view.files.iter().map(StoredFile::from_view).collect();
                     entry.primary_file_id = view.primary_file_id;
-                    entry.selected_files =
-                        view.files.iter().filter(|file| file.included).map(|file| file.id).collect();
+                    // A stream keeps nothing; a download keeps what the add
+                    // selected (the media files).
+                    entry.selected_files = if downloading {
+                        view.files
+                            .iter()
+                            .filter(|file| file.included)
+                            .map(|file| file.id)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     entry.downloading = downloading;
                 }
                 (id, store.clone())
@@ -1063,22 +1094,35 @@ impl Backend for EngineBackend {
         let Some(entry) = self.snapshot().entry(id).cloned() else {
             return;
         };
-        match self
+
+        // The file being watched, plus anything already being kept, is what the
+        // torrent should fetch.
+        let mut selection = files.to_vec();
+        for file in &entry.selected_files {
+            if !selection.contains(file) {
+                selection.push(*file);
+            }
+        }
+        selection.sort_unstable();
+        selection.dedup();
+
+        let live_id = self
             .live_map()
             .get(&entry.info_hash.to_ascii_lowercase())
-            .copied()
-        {
-            Some(engine_id) => {
+            .copied();
+        match live_id {
+            // A download is running: leave its storage alone, just make sure
+            // the streamed file is fetched too.
+            Some(engine_id) if !entry.selected_files.is_empty() => {
                 let engine = self.engine.clone();
-                let files = files.to_vec();
                 self.spawn_result("start files", async move {
-                    engine.set_only_files(engine_id, &files).await?;
-                    engine.resume(engine_id).await
+                    engine.resume(engine_id).await?;
+                    engine.set_only_files(engine_id, &selection).await
                 });
             }
-            // Not in the session (for example after a stop): bring it back with
-            // temporary storage, select, and play.
-            None => self.recycle(entry, false, Some(files.to_vec()), false),
+            // Pure streaming: recycle with exactly this selection, so nothing
+            // else is fetched and the previous stream's storage is freed.
+            _ => self.recycle(entry, false, Some(selection), false),
         }
     }
 
@@ -1086,36 +1130,67 @@ impl Backend for EngineBackend {
         let Some(entry) = self.snapshot().entry(id).cloned() else {
             return;
         };
-        {
-            let mut store = self.library.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(entry) = store.entry_mut(id) {
-                entry.downloading = true;
-                entry.selected_files = files.to_vec();
+        // Keep this episode/season/film in addition to whatever is already kept.
+        let mut keep = entry.selected_files.clone();
+        for file in files {
+            if !keep.contains(file) {
+                keep.push(*file);
             }
-            let snapshot = store.clone();
-            drop(store);
-            let _ = snapshot.save(&self.library_path());
         }
-        // Switch to filesystem storage and keep the chosen files.
-        self.recycle(entry, true, Some(files.to_vec()), false);
+        keep.sort_unstable();
+        keep.dedup();
+        self.set_kept(id, &keep);
+
+        let entry = self.snapshot().entry(id).cloned().unwrap_or(entry);
+        // Filesystem storage, only the kept files selected, running.
+        self.recycle(entry, true, Some(keep), false);
     }
 
-    fn stop_download(&self, id: usize) {
+    fn stop_download_files(&self, id: usize, files: &[usize]) {
         let Some(entry) = self.snapshot().entry(id).cloned() else {
             return;
         };
-        {
-            let mut store = self.library.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(entry) = store.entry_mut(id) {
-                entry.downloading = false;
-                entry.selected_files.clear();
-            }
-            let snapshot = store.clone();
-            drop(store);
-            let _ = snapshot.save(&self.library_path());
+        let mut keep: Vec<usize> = entry
+            .selected_files
+            .iter()
+            .copied()
+            .filter(|file| !files.contains(file))
+            .collect();
+        keep.sort_unstable();
+        self.set_kept(id, &keep);
+
+        let entry = self.snapshot().entry(id).cloned().unwrap_or(entry);
+        if keep.is_empty() {
+            // Nothing is kept any more: delete the files and go back to a
+            // temporary, paused stream.
+            self.recycle(entry, false, None, true);
+            return;
         }
-        // Delete the kept files and go back to a temporary, paused stream.
-        self.recycle(entry, false, None, true);
+        // Keep the rest. A running download just narrows; otherwise re-add it.
+        let live_id = self
+            .live_map()
+            .get(&entry.info_hash.to_ascii_lowercase())
+            .copied();
+        match live_id {
+            Some(engine_id) => {
+                let engine = self.engine.clone();
+                self.spawn_result("stop download", async move {
+                    engine.set_only_files(engine_id, &keep).await
+                });
+            }
+            None => self.recycle(entry, true, Some(keep), false),
+        }
+    }
+
+    fn stop_download(&self, id: usize) {
+        let kept = self
+            .snapshot()
+            .entry(id)
+            .map(|entry| entry.selected_files.clone())
+            .unwrap_or_default();
+        if !kept.is_empty() {
+            self.stop_download_files(id, &kept);
+        }
     }
 
     fn stop_streaming(&self, id: usize) {
@@ -1530,20 +1605,41 @@ impl Backend for FakeBackend {
     }
 
     fn download_files(&self, id: usize, files: &[usize]) {
-        self.start_files(id, files);
         let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(item) = items.iter_mut().find(|i| i.torrent.id == id) {
+            for file in files {
+                if !item.kept_files.contains(file) {
+                    item.kept_files.push(*file);
+                }
+            }
+            item.kept_files.sort_unstable();
             item.downloading = true;
+            item.torrent.stats.state = "live".to_string();
+            item.torrent.state = "live".to_string();
+            for file in &mut item.torrent.files {
+                file.included = item.kept_files.contains(&file.id);
+            }
+        }
+    }
+
+    fn stop_download_files(&self, id: usize, files: &[usize]) {
+        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(item) = items.iter_mut().find(|i| i.torrent.id == id) {
+            item.kept_files.retain(|file| !files.contains(file));
+            item.downloading = !item.kept_files.is_empty();
+            if !item.downloading {
+                item.torrent.stats.state = "paused".to_string();
+                item.torrent.state = "paused".to_string();
+            }
+            for file in &mut item.torrent.files {
+                file.included = item.kept_files.contains(&file.id);
+            }
         }
     }
 
     fn stop_download(&self, id: usize) {
-        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(item) = items.iter_mut().find(|i| i.torrent.id == id) {
-            item.downloading = false;
-            item.torrent.stats.state = "paused".to_string();
-            item.torrent.state = "paused".to_string();
-        }
+        let kept = self.item(id).map(|item| item.kept_files).unwrap_or_default();
+        self.stop_download_files(id, &kept);
     }
 
     fn stop_streaming(&self, id: usize) {

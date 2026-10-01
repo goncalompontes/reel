@@ -290,6 +290,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         // the download folder, not a temporary stream.
         pause_multi_file: false,
         ephemeral: false,
+        only_files: None,
     };
 
     // Adds run *after* the API is up, and off the startup path. Resolving a

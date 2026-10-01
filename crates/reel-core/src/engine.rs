@@ -136,6 +136,14 @@ pub struct AddOptions {
     /// the download folder. The storage is temporary, so the torrent is meant to
     /// be removed when playback stops.
     pub ephemeral: bool,
+
+    /// Select exactly these file ids at add time.
+    ///
+    /// Preferred over changing the selection afterwards: `add` returns before a
+    /// torrent can accept an update, so a post-add `set_only_files` can silently
+    /// fail and leave the media-only regex in force (the whole pack downloading).
+    /// When set, it takes precedence over `only_files_regex`.
+    pub only_files: Option<Vec<usize>>,
 }
 
 impl Default for AddOptions {
@@ -150,6 +158,7 @@ impl Default for AddOptions {
             download_limit_bps: None,
             pause_multi_file: false,
             ephemeral: false,
+            only_files: None,
         }
     }
 }
@@ -257,7 +266,14 @@ impl Engine {
         AddTorrentOptions {
             paused: opts.paused,
             output_folder: opts.output_folder.clone(),
-            only_files_regex: media_only.then(crate::media::media_only_regex),
+            // An explicit selection wins: it is applied as the torrent
+            // initialises, so nothing else is ever briefly selected.
+            only_files: opts.only_files.clone(),
+            only_files_regex: opts
+                .only_files
+                .is_none()
+                .then(|| media_only.then(crate::media::media_only_regex))
+                .flatten(),
             overwrite: opts.allow_overwrite,
             initial_peers: if opts.initial_peers.is_empty() {
                 None
@@ -418,6 +434,11 @@ impl Engine {
     }
 
     /// Change which files are downloaded for a torrent.
+    ///
+    /// librqbit refuses a selection change while a torrent is still
+    /// initialising, so it is retried briefly. Prefer passing [`AddOptions::only_files`]
+    /// when the selection is known at add time; this is for changing it on a
+    /// torrent that is already running.
     pub async fn set_only_files(
         &self,
         id: usize,
@@ -428,8 +449,19 @@ impl Engine {
             .get(TorrentIdOrHash::Id(id))
             .ok_or(EngineError::TorrentNotFound(id))?;
         let set = only_files.iter().copied().collect();
-        self.session.update_only_files(&handle, &set).await?;
-        Ok(())
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+
+        loop {
+            match self.session.update_only_files(&handle, &set).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(e.into());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
     }
 
     /// Open a sequential, on-demand read stream over one file.

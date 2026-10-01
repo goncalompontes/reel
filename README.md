@@ -367,10 +367,12 @@ library, the bytes do not.
   downloaded is removed from the engine and re-added paused, so its temporary
   storage is freed. The library keeps the title; playing it again brings it back
   from the saved `.torrent` (offline, instantly) and the player waits for it.
-* **Downloading is opt-in.** **Download** re-adds the title with filesystem
-  storage and starts it; **Stop download** deletes the files and returns to
-  streaming. The same switch is available per version, per episode and per
-  season.
+* **Downloading is per item.** There is one way to download — a version, an
+  episode, or a whole season — and **Download** / **Stop download** toggle it
+  on that row. The backend keeps the set of files you asked for, and manages
+  storage, re-adding and cleanup behind that. Downloading one episode of a pack
+  keeps that episode and nothing else; playing another episode does not cancel
+  what is already being kept.
 * **The library is durable.** Since a streamed torrent is removed when it stops,
   a persisted `library.json` (plus a saved `.torrent` per title) is what makes a
   title stay in the library. Downloads are re-added at startup; streams wait
