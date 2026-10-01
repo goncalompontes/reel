@@ -247,8 +247,28 @@ match the wrong catalogue. `LookupQuery` carries the kind and season for exactly
 that reason, and the cache key includes them so a film and a series of the same
 name do not collide.
 
+A pack holding several seasons keeps each file's own season, and the panel asks
+for every season present rather than one standing for all of them. The cache key
+includes the season list, because seasons 1-3 is a different lookup from season 1.
+
+A daily show has no season or episode in its name at all, only a date. That date
+is matched against the provider's episode list, and *which* season to fetch is
+worked out from the season list TMDB returns with the show: the latest season that
+had already started on that date. One extra call, not twenty-nine. If no episode
+carries that date the row shows the date and claims nothing more.
+
 Only the stills for episodes the torrent holds are fetched: a season can be
 twenty-odd images and a torrent is usually a handful.
+
+### Settings have to be on disk
+
+`settings.rs` exists because of a specific failure: the app is started by a
+launcher, a launcher does not read shell rc files, and so an API key exported
+from `.zshrc` is absent for anyone clicking an icon — the same trap as a launcher
+entry that depends on `PATH`. The key is therefore stored in
+`<data dir>/settings.json`, written with mode 600 because it is a credential, and
+editable from the settings page. The environment still wins when it is set, so
+scripts and one-off runs are unaffected.
 
 ### Watch positions are per file
 

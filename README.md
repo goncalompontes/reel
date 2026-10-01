@@ -38,6 +38,8 @@ documented, tested extension point: see
 | Per-file selection: watch one episode of a season pack | done |
 | Film vs series detection, season/episode parsing | done |
 | Series view with episode list, titles and thumbnails | done |
+| Multi-season packs grouped by season | done |
+| Daily shows matched by air date | done |
 | Per-episode resume positions | done |
 | On-disk metadata and artwork cache | done |
 | Search screen + pluggable sources | done |
@@ -197,6 +199,35 @@ cargo test -p reel-catalog --test tmdb_stub -- --ignored --nocapture
 REEL_TMDB_API_KEY=... cargo test -p reel-catalog --test tmdb_stub -- --ignored --nocapture
 ```
 
+## Getting metadata from TMDB
+
+Everything works without this — search, streaming, and a catalog with artwork
+generated from each title. A key is what turns that into real posters, synopses,
+episode titles and thumbnails.
+
+**What you need: a free TMDB account.** Nothing else. No key is needed for image
+downloads or for the bundled Internet Archive search source.
+
+1. Make an account at `themoviedb.org`.
+2. Settings → API → request a key. Either type works:
+   * a **v3 API key** — a short hex string, sent as `?api_key=`;
+   * a **v4 API Read Access Token** — a JWT starting with `eyJ`, sent as a
+     `Bearer` header. The app detects which you pasted.
+3. Put it in the app: **Settings → TMDB API key**, then **Check**.
+
+The key is stored in `~/.local/share/reel/settings.json` with mode `600` (it is a
+credential), and takes effect immediately — no restart.
+
+`REEL_TMDB_API_KEY` also works and **overrides** the stored key, for scripts and
+one-off runs. It is not the recommended route for normal use, and the reason is
+worth knowing: a desktop app is started by a launcher, and a launcher does not
+read shell rc files, so a variable exported from `.zshrc` is simply absent for
+anyone clicking an icon. That is the same trap as a launcher entry that depends on
+`PATH`.
+
+If you use your own key, note TMDB's terms ask for attribution: *"This product
+uses the TMDB API but is not endorsed or certified by TMDB."*
+
 ## Films and series look different
 
 There is no standard for release names, so this is best-effort by construction.
@@ -231,16 +262,26 @@ then the season — and only the thumbnails for episodes the torrent actually ho
 are downloaded, since a season is twenty-odd images and a torrent is usually a
 few.
 
+**Multi-season packs** are grouped by season. Each file keeps the season its own
+name says it belongs to, every season the torrent holds is looked up, and the list
+gets a heading per season. A torrent of seasons 1-3 is one entry, three headings.
+
+**Daily shows** number by air date rather than by episode:
+`The.Daily.Show.2024.01.15.1080p` has no `S01E02` to find. The date in the name is
+matched against the provider's episode list, which is what turns it into
+`S29E06 January 15, 2024`. Finding *which* season a date belongs to uses the
+season list TMDB returns, so only the one relevant season is fetched rather than
+all twenty-nine.
+
 ### What this cannot do
 
-* **Date-based shows.** `The.Daily.Show.2024.01.15.1080p` is recognised as an
-  episode but carries no season or episode number, so it falls back to a file
-  list. Air dates are not yet matched against TMDB's episode list.
 * **Anime absolute numbering.** `[Group] Show - 12` is read as episode 12 with no
   season, which is usually right but cannot be mapped to a season without
   knowing the show's cour layout.
 * **Multi-episode files.** `S01E01E02.mkv` is one file; it is treated as the
   first of the two, because one file cannot be two entries in a list.
+* **A date that matches nothing.** If the provider has no episode with that air
+  date the row shows the date instead of a code, and is not guessed at.
 * **A wrong guess is possible.** When parsing fails or the provider disagrees,
   the file list is the fallback, and it is always accurate.
 

@@ -109,6 +109,10 @@ pub struct EpisodeFile {
     pub season: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub episode: Option<u32>,
+    /// Air date, `YYYY-MM-DD`, for shows that number by date rather than by
+    /// episode. Matched against the provider's episode list afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub air_date: Option<String>,
     pub length: u64,
     /// Bonus material, opening/ending, a preview: worth listing, but not an
     /// episode, so it must not be numbered alongside them.
@@ -179,6 +183,39 @@ impl Default for Release {
 }
 
 impl Release {
+    /// Every season the torrent holds, ascending.
+    pub fn seasons(&self) -> Vec<u32> {
+        let mut seasons: Vec<u32> = self
+            .episodes
+            .iter()
+            .filter(|e| !e.extra)
+            .filter_map(|e| e.season)
+            .collect();
+        seasons.sort_unstable();
+        seasons.dedup();
+        seasons
+    }
+
+    /// Air dates present, ascending. Present means the torrent is of a show
+    /// that numbers by date.
+    pub fn air_dates(&self) -> Vec<String> {
+        let mut dates: Vec<String> = self
+            .episodes
+            .iter()
+            .filter_map(|e| e.air_date.clone())
+            .collect();
+        dates.sort();
+        dates.dedup();
+        dates
+    }
+
+    /// A show numbered by air date rather than by season and episode.
+    pub fn is_dated(&self) -> bool {
+        self.kind == MediaKind::Series
+            && self.episodes.iter().any(|e| e.air_date.is_some())
+            && self.episode_numbers().is_empty()
+    }
+
     /// Episode numbers found, in order, ignoring extras.
     pub fn episode_numbers(&self) -> Vec<u32> {
         let mut numbers: Vec<u32> = self
@@ -277,11 +314,22 @@ pub fn analyse(files: &[FileInput]) -> Release {
         .iter()
         .map(|(index, result)| {
             let file = videos[*index];
+            let season = result.season().and_then(|s| u32::try_from(s).ok());
+            let episode = result.episode().and_then(|e| u32::try_from(e).ok());
+            let is_episode = matches!(result.media_type(), Some(MediaType::Episode));
+
+            // A show numbered by air date has no episode number to find, so the
+            // date in the name is the only link to a provider's episode list.
+            let air_date = (is_episode && episode.is_none())
+                .then(|| extract_air_date(&file.path))
+                .flatten();
+
             EpisodeFile {
                 file_id: file.file_id,
                 path: file.path.clone(),
-                season: result.season().and_then(|s| u32::try_from(s).ok()),
-                episode: result.episode().and_then(|e| u32::try_from(e).ok()),
+                season,
+                episode,
+                air_date,
                 length: file.length,
                 extra: matches!(result.media_type(), Some(MediaType::Extra)),
             }
@@ -304,6 +352,7 @@ pub fn analyse(files: &[FileInput]) -> Release {
         .unwrap_or(Trust::Low);
 
     let numbered = episodes.iter().filter(|e| e.episode.is_some()).count();
+    let _ = &numbered;
     let is_season_pack = kind == MediaKind::Series
         && numbered == 0
         && episodes.iter().filter(|e| !e.extra).count() > 1;
@@ -346,6 +395,13 @@ fn decide_kind(
         .iter()
         .filter(|(_, r)| matches!(r.media_type(), Some(MediaType::Episode)))
         .count();
+
+    // A dated file is a series even without a number: hunch only calls it an
+    // episode when it has seen episode-shaped naming.
+    let dated = episodes.iter().filter(|e| e.air_date.is_some()).count();
+    if numbered == 0 && dated > 0 {
+        return MediaKind::Series;
+    }
 
     match (numbered, episode_shaped) {
         // One or more files with an episode number: a series.
@@ -450,6 +506,56 @@ fn clean(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_string)
+}
+
+/// Pull an air date out of a name, as `YYYY-MM-DD`.
+///
+/// Only used for files that look like episodes but carry no season or episode
+/// number, which is how daily shows are named. Requiring three numeric groups in
+/// a row keeps a film's year and a resolution from being read as a date.
+pub fn extract_air_date(name: &str) -> Option<String> {
+    let chars: Vec<char> = name.chars().collect();
+    let bytes = &chars;
+
+    for start in 0..bytes.len() {
+        if !bytes[start].is_ascii_digit() {
+            continue;
+        }
+        // Four digits, a separator, then two groups.
+        if start + 4 > bytes.len() || !bytes[start..start + 4].iter().all(char::is_ascii_digit) {
+            continue;
+        }
+        let year: u32 = bytes[start..start + 4].iter().collect::<String>().parse().ok()?;
+        if !(1900..=2200).contains(&year) {
+            continue;
+        }
+        let mut cursor = start + 4;
+        let mut groups = Vec::new();
+        for _ in 0..2 {
+            if cursor >= bytes.len() || !matches!(bytes[cursor], '.' | '-' | '_' | ' ') {
+                break;
+            }
+            cursor += 1;
+            let digits_start = cursor;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_digit() && cursor - digits_start < 2
+            {
+                cursor += 1;
+            }
+            if cursor == digits_start || bytes.get(cursor).is_some_and(|c| c.is_ascii_digit()) {
+                break;
+            }
+            groups.push(bytes[digits_start..cursor].iter().collect::<String>());
+        }
+
+        if groups.len() == 2 {
+            let month: u32 = groups[0].parse().ok()?;
+            let day: u32 = groups[1].parse().ok()?;
+            if (1..=12).contains(&month) && (1..=31).contains(&day) {
+                return Some(format!("{year:04}-{month:02}-{day:02}"));
+            }
+        }
+    }
+    None
 }
 
 /// Last resort for a display title: drop the extension and tidy separators.
@@ -660,6 +766,68 @@ mod tests {
             video(2, "Some.Show.S01E03.1080p.mkv", 1_500_000_000),
         ];
         assert_eq!(analyse(&files).title, "Some Show");
+    }
+
+    #[test]
+    fn a_daily_show_is_dated_rather_than_numbered() {
+        let files = [
+            video(0, "The.Daily.Show.2024.01.15.1080p.WEB.h264.mkv", 900_000_000),
+            video(1, "The.Daily.Show.2024.01.16.1080p.WEB.h264.mkv", 900_000_000),
+        ];
+        let release = series_release(&files);
+
+        assert_eq!(release.kind, MediaKind::Series);
+        assert!(release.is_dated(), "{release:?}");
+        assert_eq!(release.episode_numbers(), Vec::<u32>::new());
+        assert_eq!(release.air_dates(), ["2024-01-15", "2024-01-16"]);
+        assert_eq!(release.episodes[0].air_date.as_deref(), Some("2024-01-15"));
+    }
+
+    #[test]
+    fn air_dates_are_only_read_when_they_are_plausible() {
+        assert_eq!(
+            extract_air_date("The.Daily.Show.2024.01.15.1080p").as_deref(),
+            Some("2024-01-15")
+        );
+        assert_eq!(
+            extract_air_date("Show.2024-01-15.720p").as_deref(),
+            Some("2024-01-15")
+        );
+        // A film's year next to a resolution is not a date.
+        assert_eq!(extract_air_date("The.Matrix.1999.1080p.BluRay"), None);
+        assert_eq!(extract_air_date("Movie.2024.2160p.WEB"), None);
+        // Out of range numbers are rejected rather than formatted.
+        assert_eq!(extract_air_date("Show.2024.13.15"), None);
+        assert_eq!(extract_air_date("Show.2024.01.45"), None);
+        assert_eq!(extract_air_date("Show.99999.01.15"), None);
+        assert_eq!(extract_air_date("no date here"), None);
+    }
+
+    #[test]
+    fn a_film_is_not_dated_even_if_it_has_numbers() {
+        let release = series_release(&[video(0, "Movie.2024.1080p.WEB.mkv", 900_000_000)]);
+        assert_eq!(release.kind, MediaKind::Movie);
+        assert!(!release.is_dated());
+        assert!(release.episodes[0].air_date.is_none());
+    }
+
+    #[test]
+    fn a_multi_season_pack_lists_every_season_it_holds() {
+        let files = [
+            video(0, "Some.Show.S01E01.1080p.mkv", 1_000_000_000),
+            video(1, "Some.Show.S01E02.1080p.mkv", 1_000_000_000),
+            video(2, "Some.Show.S02E01.1080p.mkv", 1_000_000_000),
+            video(3, "Some.Show.S03E01.1080p.mkv", 1_000_000_000),
+        ];
+        let release = series_release(&files);
+        assert_eq!(release.seasons(), [1, 2, 3]);
+        // Each file keeps its own season rather than one standing for all.
+        let by_season: Vec<(u32, u32, usize)> = release
+            .episodes
+            .iter()
+            .map(|e| (e.season.unwrap(), e.episode.unwrap(), e.file_id))
+            .collect();
+        assert_eq!(by_season, [(1, 1, 0), (1, 2, 1), (2, 1, 2), (3, 1, 3)]);
     }
 
     #[test]

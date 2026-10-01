@@ -90,6 +90,17 @@ impl Artwork {
     }
 }
 
+/// One season of a series, as a metadata provider lists it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SeasonSummary {
+    pub number: u32,
+    /// When the season started, `YYYY-MM-DD`. The anchor for date lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub air_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode_count: Option<u32>,
+}
+
 /// One episode of a series, as a metadata provider describes it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EpisodeInfo {
@@ -161,6 +172,10 @@ pub struct Metadata {
     /// Number of seasons a series has, when it is a series.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub season_count: Option<u32>,
+    /// The provider's season list. Used to work out which season a date belongs
+    /// to, for a show numbered by air date.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seasons: Vec<SeasonSummary>,
     /// Episodes of the season that was looked up, when it is a series.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub episodes: Vec<EpisodeInfo>,
@@ -184,6 +199,21 @@ impl Metadata {
         self.episodes
             .iter()
             .find(|e| e.season == season && e.number == number)
+    }
+
+    /// The season a date falls in: the latest one that started on or before it.
+    ///
+    /// Daily shows are numbered by air date, and a date is the only handle we
+    /// have on which season it belongs to. Seasons are ordered by start date, so
+    /// the last one that has already begun is the candidate.
+    pub fn season_for_date(&self, date: &str) -> Option<u32> {
+        self.seasons
+            .iter()
+            .filter_map(|season| season.air_date.as_deref().map(|air| (season.number, air)))
+            .filter(|(_, air)| *air <= date)
+            .max_by_key(|(number, _)| *number)
+            .map(|(number, _)| number)
+            .or_else(|| self.seasons.first().map(|season| season.number))
     }
 
     /// `1h 52m`.

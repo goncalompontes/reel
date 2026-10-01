@@ -48,6 +48,7 @@ fn engine_backend_serves_its_api_in_process() {
     // the test never reaches the network or the real cache.
     let catalog = CatalogOptions {
         api_key: None,
+        settings: Default::default(),
         data_dir: dir.join("catalog"),
         // Keep the test offline: the bundled source searches over the network.
         disable_bundled_sources: true,
@@ -143,6 +144,7 @@ fn the_bundled_source_searches_through_the_app_backend() {
         config,
         CatalogOptions {
             api_key: None,
+            settings: Default::default(),
             data_dir: dir.join("catalog"),
             disable_bundled_sources: false,
         },

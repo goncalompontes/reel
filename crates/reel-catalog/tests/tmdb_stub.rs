@@ -127,6 +127,10 @@ async fn tv_search_handler(
          "first_air_date": "2008-01-20", "overview": "A chemistry teacher.",
          "popularity": 300.0, "vote_average": 8.9, "vote_count": 14000,
          "poster_path": "/bb-poster.jpg", "backdrop_path": "/bb-backdrop.jpg"},
+        {"id": 2224, "name": "The Daily Show", "original_name": "The Daily Show",
+         "first_air_date": "1996-07-22", "overview": "A nightly news satire.",
+         "popularity": 200.0, "vote_average": 6.4, "vote_count": 900,
+         "poster_path": "/ds-poster.jpg", "backdrop_path": "/ds-backdrop.jpg"},
         {"id": 9999, "name": "Breaking Bad: The Movie", "first_air_date": "2019-10-11",
          "overview": "A sequel film.", "popularity": 90.0, "vote_count": 3000,
          "poster_path": "/bbm-poster.jpg"}
@@ -143,6 +147,28 @@ async fn tv_handler(
     uri: axum::http::Uri,
 ) -> Response {
     record(&stub, uri.path(), uri.query().unwrap_or(""), &headers).await;
+
+    if id == 2224 {
+        // A daily show: many seasons, and episodes identified by air date.
+        let body = r#"{
+          "id": 2224,
+          "name": "The Daily Show",
+          "first_air_date": "1996-07-22",
+          "overview": "A nightly news satire.",
+          "genres": [{"id": 35, "name": "Comedy"}],
+          "number_of_seasons": 29,
+          "episode_run_time": [22],
+          "vote_average": 6.4,
+          "vote_count": 900,
+          "poster_path": "/ds-poster.jpg",
+          "backdrop_path": "/ds-backdrop.jpg",
+          "seasons": [
+            {"season_number": 28, "air_date": "2023-01-17", "episode_count": 2},
+            {"season_number": 29, "air_date": "2024-01-08", "episode_count": 2}
+          ]
+        }"#;
+        return (StatusCode::OK, body).into_response();
+    }
 
     if id != 1396 {
         return (
@@ -166,7 +192,11 @@ async fn tv_handler(
       "vote_count": 14000,
       "popularity": 300.0,
       "poster_path": "/bb-poster.jpg",
-      "backdrop_path": "/bb-backdrop.jpg"
+      "backdrop_path": "/bb-backdrop.jpg",
+      "seasons": [
+        {"season_number": 1, "air_date": "2008-01-20", "episode_count": 2},
+        {"season_number": 5, "air_date": "2012-07-15", "episode_count": 3}
+      ]
     }"#;
     (StatusCode::OK, body).into_response()
 }
@@ -179,25 +209,45 @@ async fn tv_season_handler(
 ) -> Response {
     record(&stub, uri.path(), uri.query().unwrap_or(""), &headers).await;
 
-    if id != 1396 || season != 5 {
-        return (
-            StatusCode::NOT_FOUND,
-            r#"{"status_code":34,"status_message":"not found","success":false}"#,
-        )
-            .into_response();
-    }
-
-    let body = r#"{
-      "season_number": 5,
-      "episodes": [
-        {"episode_number": 14, "name": "Ozymandias", "overview": "Everything ends.",
-         "still_path": "/still-514.jpg", "runtime": 48, "air_date": "2013-09-15"},
-        {"episode_number": 15, "name": "Granite State", "overview": "Consequences.",
-         "still_path": "/still-515.jpg", "runtime": 53, "air_date": "2013-09-22"},
-        {"episode_number": 16, "name": "Felina", "overview": "The end.",
-         "still_path": null, "runtime": 55, "air_date": "2013-09-29"}
-      ]
-    }"#;
+    let body = match (id, season) {
+        (1396, 5) => r#"{
+          "season_number": 5,
+          "episodes": [
+            {"episode_number": 14, "name": "Ozymandias", "overview": "Everything ends.",
+             "still_path": "/still-514.jpg", "runtime": 48, "air_date": "2013-09-15"},
+            {"episode_number": 15, "name": "Granite State", "overview": "Consequences.",
+             "still_path": "/still-515.jpg", "runtime": 53, "air_date": "2013-09-22"},
+            {"episode_number": 16, "name": "Felina", "overview": "The end.",
+             "still_path": null, "runtime": 55, "air_date": "2013-09-29"}
+          ]
+        }"#,
+        (1396, 1) => r#"{
+          "season_number": 1,
+          "episodes": [
+            {"episode_number": 1, "name": "Pilot", "still_path": "/still-101.jpg",
+             "runtime": 58, "air_date": "2008-01-20"},
+            {"episode_number": 2, "name": "Cat's in the Bag", "still_path": "/still-102.jpg",
+             "runtime": 48, "air_date": "2008-01-27"}
+          ]
+        }"#,
+        // A daily show: two episodes of season 29, told apart by air date.
+        (2224, 29) => r#"{
+          "season_number": 29,
+          "episodes": [
+            {"episode_number": 1, "name": "January 8, 2024", "still_path": "/ds-2901.jpg",
+             "runtime": 22, "air_date": "2024-01-08"},
+            {"episode_number": 6, "name": "January 15, 2024", "still_path": "/ds-2906.jpg",
+             "runtime": 22, "air_date": "2024-01-15"}
+          ]
+        }"#,
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                r#"{"status_code":34,"status_message":"not found","success":false}"#,
+            )
+                .into_response();
+        }
+    };
     (StatusCode::OK, body).into_response()
 }
 
@@ -533,6 +583,8 @@ async fn resolves_a_series_with_episodes_and_stills() {
         year: None,
         kind: MediaKind::Series,
         season: Some(5),
+        seasons: vec![5],
+        air_dates: Vec::new(),
         episodes: vec![14],
     };
 
@@ -606,6 +658,8 @@ async fn resolves_a_series_with_episodes_and_stills() {
             year: None,
             kind: MediaKind::Series,
             season: Some(5),
+            seasons: vec![5],
+            air_dates: Vec::new(),
             episodes: vec![14],
         })
         .await
@@ -613,6 +667,103 @@ async fn resolves_a_series_with_episodes_and_stills() {
         .expect("cached");
     assert_eq!(cached.episodes.len(), 3);
     assert!(cached.episode(5, 14).unwrap().still.as_ref().unwrap().is_cached());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+
+/// A pack holding two seasons: both must be described, not just the first.
+#[tokio::test]
+async fn a_multi_season_pack_fetches_every_season() {
+    use reel_catalog::release::MediaKind;
+
+    let (base, stub) = spawn_stub().await;
+    let root = scratch("multi-season");
+    let cache = Arc::new(CatalogCache::new(&root));
+    let provider = TmdbProvider::new(client(&base, "v3-key"), cache.clone());
+
+    let metadata = provider
+        .lookup(LookupQuery {
+            title: "Breaking Bad".to_string(),
+            year: None,
+            kind: MediaKind::Series,
+            season: Some(1),
+            seasons: vec![1, 5],
+            air_dates: Vec::new(),
+            episodes: vec![1, 14],
+        })
+        .await
+        .unwrap()
+        .expect("should match");
+
+    // Episodes from both seasons, each keeping its own season number.
+    let pairs: Vec<(u32, u32)> = metadata
+        .episodes
+        .iter()
+        .map(|e| (e.season, e.number))
+        .collect();
+    assert_eq!(pairs, [(1, 1), (1, 2), (5, 14), (5, 15), (5, 16)]);
+    assert_eq!(metadata.episode(1, 1).unwrap().label(), "S01E01  Pilot");
+    assert_eq!(metadata.episode(5, 14).unwrap().label(), "S05E14  Ozymandias");
+
+    // The season list is kept, which is what makes date lookup possible.
+    assert_eq!(metadata.seasons.len(), 2);
+    assert_eq!(metadata.season_for_date("2013-09-20"), Some(5));
+    assert_eq!(metadata.season_for_date("2009-06-01"), Some(1));
+
+    let requests = stub.seen.lock().unwrap().clone();
+    let paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
+    assert!(paths.contains(&"/3/tv/1396/season/1"), "{paths:?}");
+    assert!(paths.contains(&"/3/tv/1396/season/5"), "{paths:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A daily show carries no season or episode number, only a date.
+#[tokio::test]
+async fn a_dated_show_is_located_by_its_air_date() {
+    use reel_catalog::release::MediaKind;
+
+    let (base, stub) = spawn_stub().await;
+    let root = scratch("dated");
+    let cache = Arc::new(CatalogCache::new(&root));
+    let provider = TmdbProvider::new(client(&base, "v3-key"), cache.clone());
+
+    let metadata = provider
+        .lookup(LookupQuery {
+            title: "The Daily Show".to_string(),
+            year: None,
+            kind: MediaKind::Series,
+            season: None,
+            seasons: Vec::new(),
+            air_dates: vec!["2024-01-15".to_string()],
+            episodes: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .expect("should match");
+
+    // The provider had to work out that 2024-01-15 belongs to season 29, and
+    // only fetched that season rather than all twenty-nine.
+    let requests = stub.seen.lock().unwrap().clone();
+    let paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
+    assert!(paths.contains(&"/3/tv/2224/season/29"), "{paths:?}");
+    assert_eq!(
+        paths.iter().filter(|p| p.contains("/season/")).count(),
+        1,
+        "should read one season, not every season: {paths:?}"
+    );
+
+    // And the date maps onto a real episode, which is what the interface needs
+    // to name the file.
+    let matched = metadata
+        .episodes
+        .iter()
+        .find(|e| e.air_date.as_deref() == Some("2024-01-15"))
+        .expect("an episode with that air date");
+    assert_eq!(matched.season, 29);
+    assert_eq!(matched.number, 6);
+    assert_eq!(matched.label(), "S29E06  January 15, 2024");
 
     let _ = std::fs::remove_dir_all(&root);
 }

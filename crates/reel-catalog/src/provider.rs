@@ -141,14 +141,29 @@ impl TmdbProvider {
         let mut metadata = self.client.tv(id).await?;
         metadata.popularity = chosen.popularity;
 
+        // A dated show has no season in its name, so the date is the only way
+        // to find which season it belongs to.
+        let mut seasons = query.seasons.clone();
+        if seasons.is_empty() && !query.air_dates.is_empty() {
+            let dates: Vec<&String> = query.air_dates.iter().collect();
+            let mut guessed: Vec<u32> = dates
+                .iter()
+                .filter_map(|date| metadata.season_for_date(date))
+                .collect();
+            guessed.sort_unstable();
+            guessed.dedup();
+            if !guessed.is_empty() {
+                tracing::debug!(?guessed, "located seasons by air date");
+            }
+            seasons = guessed;
+        }
+
         // Without a season we know the show but not which episodes the torrent
         // holds; the interface falls back to listing files.
-        if let Some(season) = query.season {
+        for season in seasons {
             match self.client.tv_season(id, season).await {
-                Ok(episodes) => metadata.episodes = episodes,
-                Err(e) => {
-                    tracing::debug!(season, error = %e, "could not read the season");
-                }
+                Ok(episodes) => metadata.episodes.extend(episodes),
+                Err(e) => tracing::debug!(season, error = %e, "could not read the season"),
             }
         }
 
@@ -164,14 +179,25 @@ impl TmdbProvider {
         let source = metadata.source.clone();
         let series_id = metadata.source_id.clone();
 
-        let wanted: Vec<(u32, u32)> = metadata
+        // Only episodes the torrent holds get a thumbnail: a season can be
+        // twenty-odd images and a torrent is usually a handful. A dated show
+        // has no numbers yet, so its dates stand in for them.
+        let wanted: Vec<(u32, u32, Option<String>)> = metadata
             .episodes
             .iter()
-            .filter(|episode| query.episodes.contains(&episode.number))
-            .map(|episode| (episode.season, episode.number))
+            .filter(|episode| {
+                (query.seasons.is_empty() || query.seasons.contains(&episode.season))
+                    && query.episodes.contains(&episode.number)
+                    && (query.air_dates.is_empty()
+                        || episode
+                            .air_date
+                            .as_ref()
+                            .is_some_and(|date| query.air_dates.contains(date)))
+            })
+            .map(|episode| (episode.season, episode.number, episode.air_date.clone()))
             .collect();
 
-        for (season, number) in wanted {
+        for (season, number, _air_date) in wanted {
             let Some(path) = metadata
                 .episode(season, number)
                 .and_then(|e| e.still.as_ref())
@@ -412,11 +438,24 @@ fn query_index_key(query: &LookupQuery) -> String {
         MediaKind::Movie => "movie-",
         MediaKind::Unknown => "unknown-",
     };
-    match (query.year, query.season) {
-        (Some(year), Some(season)) => format!("{kind}{title}-{year}-s{season}"),
-        (Some(year), None) => format!("{kind}{title}-{year}"),
-        (None, Some(season)) => format!("{kind}{title}-s{season}"),
-        (None, None) => format!("{kind}{title}"),
+    // Every season is part of the identity: a pack of seasons 1-3 is not the
+    // same lookup as season 1 alone.
+    let seasons = if query.seasons.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "-s{}",
+            query
+                .seasons
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join("+")
+        )
+    };
+    match query.year {
+        Some(year) => format!("{kind}{title}-{year}{seasons}"),
+        None => format!("{kind}{title}{seasons}"),
     }
 }
 
@@ -492,14 +531,25 @@ mod tests {
         // serve the other's metadata.
         assert_ne!(query_index_key(&film), query_index_key(&series));
 
-        // Two seasons of one series are different lookups.
+        // Different seasons of one series are different lookups, and a pack of
+        // several is different again from any one of them.
         let s1 = LookupQuery {
             kind: MediaKind::Series,
             season: Some(1),
+            seasons: vec![1],
             ..LookupQuery::new("Some Show", None)
         };
-        let s2 = LookupQuery { season: Some(2), ..s1.clone() };
+        let s2 = LookupQuery {
+            seasons: vec![2],
+            ..s1.clone()
+        };
+        let pack = LookupQuery {
+            seasons: vec![1, 2, 3],
+            ..s1.clone()
+        };
         assert_ne!(query_index_key(&s1), query_index_key(&s2));
+        assert_ne!(query_index_key(&s1), query_index_key(&pack));
         assert!(query_index_key(&s1).contains("s1"), "{}", query_index_key(&s1));
+        assert!(query_index_key(&pack).contains("s1+2+3"), "{}", query_index_key(&pack));
     }
 }

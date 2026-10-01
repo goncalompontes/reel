@@ -19,9 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use reel_catalog::{
-    ArchiveOrgBackend, CatalogCache, CatalogEntry, FileInput, LookupQuery, Metadata,
-    MetadataProvider, Release, SearchAggregator, SearchResults, WatchHistory, WatchProgress,
-    analyse, default_data_dir, provider_from_key,
+    ArchiveOrgBackend, CatalogCache, CatalogEntry, CatalogSettings, FileInput, KeySource,
+    LookupQuery, Metadata, MetadataProvider, Release, SearchAggregator, SearchResults, TmdbClient,
+    WatchHistory, WatchProgress, analyse, default_data_dir, provider_from_key,
 };
 use reel_core::model::TorrentView;
 use reel_core::title::clean_title;
@@ -69,6 +69,10 @@ pub struct CatalogStatus {
     pub enriched: usize,
     /// How many library entries are still being looked up.
     pub pending: usize,
+    /// Where the key in use came from, in words.
+    pub key_source: String,
+    /// False when the key comes from the environment and cannot be changed here.
+    pub can_set_key: bool,
 }
 
 /// One configured place to look for torrents.
@@ -113,6 +117,8 @@ pub enum BackendEvent {
     Metadata { info_hash: String },
     /// Watch positions changed.
     WatchUpdated,
+    /// The result of checking an API key.
+    ApiKeyChecked { ok: bool, message: String },
     /// Results for a search. Carries the query so a stale answer for an older
     /// query can be recognised and dropped.
     SearchResults { query: String, results: SearchResults },
@@ -161,6 +167,10 @@ pub trait Backend {
     fn search_sources(&self) -> Vec<SourceInfo>;
 
     fn catalog_status(&self) -> CatalogStatus;
+    /// Store a TMDB key and use it immediately. `None` clears it.
+    fn set_api_key(&self, key: Option<String>);
+    /// Check a key against the provider and report back as an event.
+    fn test_api_key(&self, key: String);
     /// Clear cached metadata and artwork, then enrich again.
     fn clear_catalog_cache(&self);
     /// Forget what we know and look everything up again.
@@ -172,7 +182,10 @@ pub trait Backend {
 // ------------------------------------------------------------ real backend
 
 struct CatalogState {
-    provider: Arc<dyn MetadataProvider>,
+    /// Swappable: setting a key in Settings has to take effect without a restart.
+    provider: Mutex<Arc<dyn MetadataProvider>>,
+    settings: Mutex<CatalogSettings>,
+    data_dir: std::path::PathBuf,
     cache: Arc<CatalogCache>,
     metadata: Mutex<HashMap<String, Metadata>>,
     in_flight: Mutex<HashSet<String>>,
@@ -183,8 +196,15 @@ struct CatalogState {
 }
 
 impl CatalogState {
+    fn provider(&self) -> Arc<dyn MetadataProvider> {
+        self.provider
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     fn note(&self) -> Option<String> {
-        if self.provider.is_configured() {
+        if self.provider().is_configured() {
             None
         } else {
             Some(
@@ -287,7 +307,9 @@ impl EngineBackend {
         let search = SearchAggregator::new(backends);
 
         let catalog = Arc::new(CatalogState {
-            provider,
+            provider: Mutex::new(provider),
+            settings: Mutex::new(catalog_options.settings.clone()),
+            data_dir: catalog_options.data_dir.clone(),
             cache,
             metadata: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashSet::new()),
@@ -344,7 +366,7 @@ impl EngineBackend {
     /// per session so a provider that does not know a film is not asked again
     /// on every refresh.
     fn enrich_library(&self) {
-        if !self.catalog.provider.is_configured() {
+        if !self.catalog.provider().is_configured() {
             return;
         }
 
@@ -396,7 +418,7 @@ impl EngineBackend {
     }
 
     fn spawn_lookup(&self, info_hash: String, torrent: TorrentView) {
-        let provider = self.catalog.provider.clone();
+        let provider = self.catalog.provider();
         let state = self.catalog.clone();
         let events = self.events.clone();
 
@@ -515,7 +537,10 @@ pub(crate) fn display_title_for(torrent: &TorrentView) -> (String, Option<u16>) 
 /// Where the metadata key and cache live. Read once at startup.
 #[derive(Debug, Clone)]
 pub struct CatalogOptions {
+    /// The key to use, already resolved: environment over settings file.
     pub api_key: Option<String>,
+    /// The stored settings, so the app can show and change them.
+    pub settings: CatalogSettings,
     pub data_dir: std::path::PathBuf,
     /// Leave the bundled search source out entirely.
     pub disable_bundled_sources: bool,
@@ -525,11 +550,20 @@ impl CatalogOptions {
     /// `REEL_TMDB_API_KEY` overrides the stored key, which is convenient for
     /// running without writing anything to disk.
     pub fn from_env() -> Self {
+        Self::load(default_data_dir())
+    }
+
+    /// Read the settings file and let the environment override it.
+    ///
+    /// The file matters: a desktop app is started by a launcher, and a launcher
+    /// does not read shell rc files, so an environment variable set in `.zshrc`
+    /// is simply absent for anyone clicking an icon.
+    pub fn load(data_dir: std::path::PathBuf) -> Self {
+        let settings = CatalogSettings::load(&data_dir);
         Self {
-            api_key: std::env::var("REEL_TMDB_API_KEY")
-                .ok()
-                .filter(|key| !key.trim().is_empty()),
-            data_dir: default_data_dir(),
+            api_key: settings.api_key(),
+            settings,
+            data_dir,
             disable_bundled_sources: std::env::var("REEL_NO_BUNDLED_SOURCES")
                 .map(|value| value != "0")
                 .unwrap_or(false),
@@ -757,9 +791,15 @@ impl Backend for EngineBackend {
             in_flight.len()
         };
 
+        let settings = self.catalog.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let source = settings.key_source();
+        drop(settings);
+
         CatalogStatus {
-            provider: self.catalog.provider.name().to_string(),
-            configured: self.catalog.provider.is_configured(),
+            provider: self.catalog.provider().name().to_string(),
+            configured: self.catalog.provider().is_configured(),
+            key_source: source.describe().to_string(),
+            can_set_key: source != KeySource::Environment,
             note: self.catalog.note(),
             cached_metadata: self.catalog.cache.metadata_count(),
             cache_bytes: self.catalog.cache.total_bytes(),
@@ -767,6 +807,68 @@ impl Backend for EngineBackend {
             enriched,
             pending,
         }
+    }
+
+    fn set_api_key(&self, key: Option<String>) {
+        let key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+
+        {
+            let mut settings = self.catalog.settings.lock().unwrap_or_else(|e| e.into_inner());
+            settings.tmdb_api_key = key.clone();
+            if let Err(e) = settings.save(&self.catalog.data_dir) {
+                self.push(BackendEvent::Error(format!(
+                    "could not save the API key: {e}"
+                )));
+            }
+        }
+
+        let provider = provider_from_key(key.as_deref(), self.catalog.cache.clone());
+        let configured = provider.is_configured();
+        *self
+            .catalog
+            .provider
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = provider;
+
+        // A new key means the answers change, so ask again.
+        self.catalog
+            .attempted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.catalog
+            .metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.enrich_library();
+
+        self.push(BackendEvent::Info(if configured {
+            "Metadata key saved; looking titles up again".to_string()
+        } else {
+            "Metadata key cleared".to_string()
+        }));
+    }
+
+    fn test_api_key(&self, key: String) {
+        let events = self.events.clone();
+        let cache_root = self.catalog.cache.root().to_path_buf();
+
+        self.runtime.spawn(async move {
+            let message = match TmdbClient::new(key) {
+                Ok(client) => match client.ping().await {
+                    Ok(()) => "The key works. Posters and synopses will load.".to_string(),
+                    Err(e) => e.user_message(),
+                },
+                Err(e) => e.user_message(),
+            };
+            let ok = message.starts_with("The key works");
+            let _ = cache_root;
+            events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(BackendEvent::ApiKeyChecked { ok, message });
+        });
     }
 
     fn clear_catalog_cache(&self) {
@@ -1024,6 +1126,23 @@ impl Backend for FakeBackend {
         status
     }
 
+    fn set_api_key(&self, _key: Option<String>) {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(BackendEvent::Info("key saved (demo)".to_string()));
+    }
+
+    fn test_api_key(&self, _key: String) {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(BackendEvent::ApiKeyChecked {
+                ok: true,
+                message: "The key works (demo).".to_string(),
+            });
+    }
+
     fn clear_catalog_cache(&self) {
         self.events
             .lock()
@@ -1042,8 +1161,6 @@ impl Backend for FakeBackend {
         std::mem::take(&mut *self.events.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
-
-
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()

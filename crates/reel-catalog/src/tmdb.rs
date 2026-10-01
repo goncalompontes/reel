@@ -12,7 +12,9 @@ use serde_json::Value;
 
 use crate::error::CatalogError;
 use crate::matching::LookupQuery;
-use crate::model::{Artwork, ArtworkRef, ArtworkSize, Candidate, EpisodeInfo, Metadata};
+use crate::model::{
+    Artwork, ArtworkRef, ArtworkSize, Candidate, EpisodeInfo, Metadata, SeasonSummary,
+};
 use crate::release::MediaKind;
 
 pub const DEFAULT_BASE_URL: &str = "https://api.themoviedb.org/3";
@@ -165,6 +167,21 @@ impl TmdbClient {
 
         serde_json::from_str(&body)
             .map_err(|e| CatalogError::Decode(format!("{e}: {}", body.chars().take(200).collect::<String>())))
+    }
+
+    /// Check that the key works, without needing to know a title.
+    ///
+    /// `/configuration` is the cheapest endpoint that requires authentication,
+    /// and it is what the settings page uses for its "check" button.
+    pub async fn ping(&self) -> Result<(), CatalogError> {
+        let body = self.get_json("configuration", &[]).await?;
+        // A 200 with no images block would mean something is very wrong.
+        if body.get("images").is_none() {
+            return Err(CatalogError::Decode(
+                "configuration response had no `images` block".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Search for a film by name, optionally constrained to a year.
@@ -413,6 +430,26 @@ pub fn parse_tv(body: &Value) -> Result<Metadata, CatalogError> {
             .get("number_of_seasons")
             .and_then(Value::as_u64)
             .map(|v| v as u32),
+        seasons: body
+            .get("seasons")
+            .and_then(Value::as_array)
+            .map(|seasons| {
+                seasons
+                    .iter()
+                    .filter_map(|value| {
+                        let number = value.get("season_number").and_then(Value::as_u64)? as u32;
+                        Some(SeasonSummary {
+                            number,
+                            air_date: non_empty(value.get("air_date").and_then(Value::as_str)),
+                            episode_count: value
+                                .get("episode_count")
+                                .and_then(Value::as_u64)
+                                .map(|v| v as u32),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         episodes: Vec::new(),
     })
 }
@@ -485,6 +522,7 @@ pub fn parse_movie(body: &Value) -> Result<Metadata, CatalogError> {
     Ok(Metadata {
         kind: MediaKind::Movie,
         season_count: None,
+        seasons: Vec::new(),
         episodes: Vec::new(),
         source: PROVIDER.to_string(),
         source_id,

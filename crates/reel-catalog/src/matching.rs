@@ -25,8 +25,14 @@ pub struct LookupQuery {
     /// Film or series. The provider uses a different endpoint for each, so
     /// getting this wrong means searching the wrong catalogue entirely.
     pub kind: MediaKind,
-    /// Which season to fetch episodes for, when it is a series.
+    /// Which season to fetch episodes for, when it is a series. Kept alongside
+    /// `seasons` for callers that only care about one.
     pub season: Option<u32>,
+    /// Every season the torrent holds, so a multi-season pack can be described
+    /// properly rather than by one season standing for all of them.
+    pub seasons: Vec<u32>,
+    /// Air dates present, for a show numbered by date rather than by episode.
+    pub air_dates: Vec<String>,
     /// Episodes the torrent actually holds. Sent so a provider can fetch only
     /// the thumbnails that will be shown.
     pub episodes: Vec<u32>,
@@ -39,6 +45,8 @@ impl LookupQuery {
             year,
             kind: MediaKind::Unknown,
             season: None,
+            seasons: Vec::new(),
+            air_dates: Vec::new(),
             episodes: Vec::new(),
         }
     }
@@ -46,11 +54,14 @@ impl LookupQuery {
     /// Build from a parsed torrent, so the provider is asked about the right
     /// kind of thing with the right season.
     pub fn from_release(release: &Release) -> Self {
+        let seasons = release.seasons();
         Self {
             title: release.title.clone(),
             year: release.year,
             kind: release.kind,
-            season: release.season,
+            season: seasons.first().copied().or(release.season),
+            seasons,
+            air_dates: release.air_dates(),
             episodes: release.episode_numbers(),
         }
     }
@@ -68,6 +79,8 @@ impl LookupQuery {
             year,
             kind,
             season: None,
+            seasons: Vec::new(),
+            air_dates: Vec::new(),
             episodes: Vec::new(),
         }
     }

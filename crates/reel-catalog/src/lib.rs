@@ -33,6 +33,7 @@ pub mod provider;
 pub mod release;
 pub mod rows;
 pub mod search;
+pub mod settings;
 pub mod tmdb;
 
 pub use backends::ArchiveOrgBackend;
@@ -47,6 +48,7 @@ pub use provider::{MetadataProvider, NullProvider, StaticProvider, TmdbProvider}
 pub use release::{FileInput, MediaKind, Release, ReleaseAttributes, Trust, analyse, parse_one};
 pub use rows::{Row, RowKind, build_rows};
 pub use search::{SearchAggregator, SearchError, SearchHit, SearchQuery, SearchResults};
+pub use settings::{CatalogSettings, KeySource};
 pub use tmdb::TmdbClient;
 
 /// Where the cache and watch history live by default, under a data directory.

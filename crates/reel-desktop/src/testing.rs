@@ -99,6 +99,7 @@ fn metadata(id: &str, title: &str, year: u16, overview: &str) -> Metadata {
     Metadata {
         kind: MediaKind::Movie,
         season_count: None,
+        seasons: Vec::new(),
         episodes: Vec::new(),
         source: "static".into(),
         source_id: id.into(),
@@ -268,6 +269,11 @@ pub fn sample_season_pack() -> LibraryItem {
             metadata: Some(Metadata {
                 kind: MediaKind::Series,
                 season_count: Some(1),
+                seasons: vec![reel_catalog::model::SeasonSummary {
+                    number: 1,
+                    air_date: Some("2024-01-08".into()),
+                    episode_count: Some(3),
+                }],
                 episodes: (1..=3)
                     .map(|n| EpisodeInfo {
                         season: 1,
@@ -287,6 +293,74 @@ pub fn sample_season_pack() -> LibraryItem {
                 rating: Some(7.9),
                 vote_count: Some(2_000),
                 popularity: Some(20.0),
+                artwork: Artwork::default(),
+                ..Default::default()
+            }),
+            watch: None,
+        },
+    )
+}
+
+/// A pack holding two seasons, which is the case a single-season view cannot
+/// describe: the file names say which season each episode belongs to, and the
+/// interface has to keep them apart.
+pub fn sample_two_season_pack() -> LibraryItem {
+    let episodes: Vec<FileView> = [(1u32, 1u32), (1, 2), (2, 1), (2, 2)]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (season, episode))| {
+            file(
+                index,
+                &format!("Two.Seasons.S{season:02}E{episode:02}.1080p.mkv"),
+                1_400_000_000,
+                true,
+            )
+        })
+        .collect();
+
+    item(
+        10,
+        "Two.Seasons.S01.S02.1080p.WEB-DL.x264-GROUP",
+        "e0e1e2e3e4e5e6e7e8e9eaebecedeeef00112233",
+        false,
+        5.0,
+        episodes,
+        Catalog {
+            metadata: Some(Metadata {
+                kind: MediaKind::Series,
+                season_count: Some(2),
+                seasons: vec![
+                    reel_catalog::model::SeasonSummary {
+                        number: 1,
+                        air_date: Some("2022-09-01".into()),
+                        episode_count: Some(2),
+                    },
+                    reel_catalog::model::SeasonSummary {
+                        number: 2,
+                        air_date: Some("2023-09-01".into()),
+                        episode_count: Some(2),
+                    },
+                ],
+                episodes: [(1u32, 1u32), (1, 2), (2, 1), (2, 2)]
+                    .into_iter()
+                    .map(|(season, number)| EpisodeInfo {
+                        season,
+                        number,
+                        name: Some(format!("Season {season} Episode {number}")),
+                        runtime_minutes: Some(52),
+                        ..Default::default()
+                    })
+                    .collect(),
+                source: "static".into(),
+                source_id: "two-seasons".into(),
+                title: "Two Seasons".into(),
+                year: Some(2022),
+                overview: Some("A show with two seasons in one torrent.".into()),
+                genres: vec!["Drama".into()],
+                runtime_minutes: Some(52),
+                rating: Some(8.1),
+                vote_count: Some(5_000),
+                popularity: Some(40.0),
                 artwork: Artwork::default(),
                 ..Default::default()
             }),

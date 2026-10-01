@@ -305,6 +305,27 @@ fn snapshot_season_pack() {
     harness.snapshot("season-pack");
 }
 
+/// A pack with two seasons: each season gets its own heading, and every episode
+/// keeps the season its file name says it belongs to.
+#[test]
+fn snapshot_two_season_pack() {
+    let mut items = sample_library();
+    items.push(reel_desktop::testing::sample_two_season_pack());
+
+    let mut harness = Harness::builder()
+        .with_size((1280.0, 1150.0))
+        .build_ui_state(
+            |ui, app: &mut App| {
+                let mut frame = eframe::Frame::_new_kittest();
+                eframe::App::ui(app, ui, &mut frame);
+            },
+            App::new(Box::new(FakeBackend::new(items))),
+        );
+    harness.state_mut().navigate(Screen::Detail(10));
+    harness.run_steps(3);
+    harness.snapshot("two-season-pack");
+}
+
 /// Renders the library to a PNG so the layout can be reviewed by eye.
 #[test]
 fn snapshot_library() {

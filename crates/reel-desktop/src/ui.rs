@@ -54,6 +54,9 @@ pub struct App {
     /// Source names and failures worth showing under the results.
     search_note: Option<String>,
     searching: bool,
+    /// The API key being typed on the settings page. Never filled in from
+    /// storage: a credential is written, not displayed.
+    api_key_input: String,
     player: PlayerController,
     /// Torrent id the player was started from, to return to.
     player_origin: Option<usize>,
@@ -97,6 +100,7 @@ impl App {
             search_hits: Vec::new(),
             search_note: None,
             searching: false,
+            api_key_input: String::new(),
             player: PlayerController::new(),
             player_origin: None,
             show_delete_confirm: None,
@@ -297,6 +301,9 @@ impl App {
                 }
                 BackendEvent::Metadata { .. } | BackendEvent::WatchUpdated => {
                     self.refresh();
+                }
+                BackendEvent::ApiKeyChecked { ok, message } => {
+                    self.set_toast(message, !ok);
                 }
                 BackendEvent::SearchResults { query, results } => {
                     // A late answer for an older query must not replace what the
@@ -1373,7 +1380,6 @@ impl App {
 
     }
 
-
     /// What is stored where, shown under either view.
     fn storage_line(&self, ui: &mut egui::Ui, item: &LibraryItem) {
         ui.add_space(6.0);
@@ -1393,6 +1399,10 @@ impl App {
     }
 
     /// The series view: one row per episode, joined to the file that holds it.
+    ///
+    /// Rows are resolved to a season and episode number first, and only then
+    /// rendered, because there are two ways a file can say which episode it is:
+    /// in its name, or by its air date for a show that numbers by date.
     fn episode_list(
         &mut self,
         ui: &mut egui::Ui,
@@ -1402,32 +1412,75 @@ impl App {
         let metadata = item.entry.metadata.as_ref();
         let release = &item.entry.release;
 
-        let included: Vec<usize> = item
-            .torrent
-            .files
+        // Resolve every file to an episode, then order by season and number.
+        let mut rows: Vec<ResolvedEpisode<'_>> = release
+            .episodes
             .iter()
-            .filter(|f| f.included)
-            .map(|f| f.id)
+            .filter(|file| !file.extra)
+            .map(|file| {
+                // A dated show: the provider's episode list is the only place a
+                // date becomes a season and episode number.
+                let by_date = file.air_date.as_deref().and_then(|date| {
+                    metadata.and_then(|m| {
+                        m.episodes
+                            .iter()
+                            .find(|episode| episode.air_date.as_deref() == Some(date))
+                    })
+                });
+
+                let season = by_date.map(|e| e.season).or(file.season);
+                let number = file.episode.or_else(|| by_date.map(|e| e.number));
+                let info = match (season, number) {
+                    (Some(season), Some(number)) => metadata.and_then(|m| m.episode(season, number)),
+                    _ => by_date,
+                };
+
+                ResolvedEpisode {
+                    file,
+                    season,
+                    number,
+                    info,
+                }
+            })
             .collect();
 
-        // Header: what this is, and how much of the season is here.
-        let season = release.season;
-        let mut heading = match (season, metadata.map(|m| m.title.clone())) {
-            (Some(season), Some(title)) => format!("{title} \u{2014} Season {season}"),
-            (Some(season), None) => format!("Season {season}"),
-            (None, Some(title)) => title,
-            (None, None) => "Episodes".to_string(),
+        rows.sort_by_key(|row| {
+            (
+                row.season.unwrap_or(u32::MAX),
+                row.number.unwrap_or(u32::MAX),
+                row.file.file_id,
+            )
+        });
+
+        let seasons: Vec<u32> = {
+            let mut list: Vec<u32> = rows.iter().filter_map(|row| row.season).collect();
+            list.sort_unstable();
+            list.dedup();
+            list
         };
-        let numbered = release.episode_numbers().len();
+
+        // Header: what this is, and how much of it is here.
+        let title = metadata.map(|m| m.title.clone());
+        let mut heading = match (&title, seasons.as_slice()) {
+            (Some(title), [season]) => format!("{title} \u{2014} Season {season}"),
+            (Some(title), _) => title.clone(),
+            (None, [season]) => format!("Season {season}"),
+            (None, _) => "Episodes".to_string(),
+        };
+        let numbered = rows.iter().filter(|row| row.number.is_some()).count();
         if numbered > 0 {
-            heading.push_str(&format!("  \u{2022}  {numbered} episode{}", if numbered == 1 { "" } else { "s" }));
+            heading.push_str(&format!(
+                "  \u{2022}  {numbered} episode{}",
+                if numbered == 1 { "" } else { "s" }
+            ));
         } else if release.is_season_pack {
             heading.push_str("  \u{2022}  season pack");
         }
-        if let Some(count) = metadata.and_then(|m| m.season_count) {
-            if count > 1 {
-                heading.push_str(&format!("  \u{2022}  {count} seasons"));
-            }
+        if seasons.len() > 1 {
+            heading.push_str(&format!("  \u{2022}  {} seasons", seasons.len()));
+        }
+        if release.is_dated() {
+            heading.push_str("  \u{2022}  numbered by air date");
         }
 
         ui.label(egui::RichText::new(heading).size(16.0).strong());
@@ -1441,6 +1494,13 @@ impl App {
         }
         ui.add_space(8.0);
 
+        let included: Vec<usize> = item
+            .torrent
+            .files
+            .iter()
+            .filter(|f| f.included)
+            .map(|f| f.id)
+            .collect();
         let narrowed = included.len() < item.torrent.files.len();
         if narrowed {
             ui.horizontal(|ui| {
@@ -1462,27 +1522,32 @@ impl App {
             ui.add_space(6.0);
         }
 
-        // One row per video file, ordered by episode number.
-        let mut rows: Vec<(Option<u32>, &reel_catalog::release::EpisodeFile)> = release
-            .episodes
-            .iter()
-            .filter(|e| !e.extra)
-            .map(|e| (e.episode, e))
-            .collect();
-        rows.sort_by_key(|(number, file)| (number.is_none(), number.unwrap_or(u32::MAX), file.file_id));
+        let mut current_season: Option<u32> = None;
+        for row in rows {
+            // A season heading, but only when there is more than one to tell
+            // apart: one season does not need a label saying so.
+            if seasons.len() > 1 && row.season != current_season {
+                if let Some(season) = row.season {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!("Season {season}"))
+                            .size(13.0)
+                            .strong()
+                            .color(theme::ACCENT),
+                    );
+                }
+                current_season = row.season;
+            }
 
-        for (number, episode_file) in rows {
-            let file = item.torrent.files.iter().find(|f| f.id == episode_file.file_id);
+            let file = item
+                .torrent
+                .files
+                .iter()
+                .find(|f| f.id == row.file.file_id);
             let (length, progress, is_included) = file
                 .map(|f| (f.length, f.progress_bytes, f.included))
-                .unwrap_or((episode_file.length, 0, false));
-
-            let info = match (release.season, number) {
-                (Some(season), Some(number)) => metadata.and_then(|m| m.episode(season, number)),
-                _ => None,
-            };
-
-            let watched = item.entry.watch_for_file(episode_file.file_id);
+                .unwrap_or((row.file.length, 0, false));
+            let watched = item.entry.watch_for_file(row.file.file_id);
 
             egui::Frame::NONE
                 .fill(theme::SURFACE)
@@ -1490,18 +1555,22 @@ impl App {
                 .corner_radius(theme::CARD_RADIUS)
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        // Thumbnail, when the provider gave us one.
-                        let (thumb, _) = ui.allocate_exact_size(Vec2::new(96.0, 54.0), Sense::hover());
-                        if let Some(uri) = info.and_then(|i| i.still_uri()) {
+                        let (thumb, _) =
+                            ui.allocate_exact_size(Vec2::new(96.0, 54.0), Sense::hover());
+                        if let Some(uri) = row.info.and_then(|i| i.still_uri()) {
                             egui::Image::new(uri)
                                 .corner_radius(CornerRadius::same(4))
                                 .paint_at(ui, thumb);
                         } else {
-                            ui.painter().rect_filled(thumb, CornerRadius::same(4), theme::SURFACE_RAISED);
+                            ui.painter().rect_filled(
+                                thumb,
+                                CornerRadius::same(4),
+                                theme::SURFACE_RAISED,
+                            );
                             ui.painter().text(
                                 thumb.center(),
                                 egui::Align2::CENTER_CENTER,
-                                number
+                                row.number
                                     .map(|n| format!("E{n:02}"))
                                     .unwrap_or_else(|| "?".to_string()),
                                 egui::FontId::proportional(14.0),
@@ -1511,33 +1580,46 @@ impl App {
 
                         ui.add_space(6.0);
                         ui.vertical(|ui| {
-                            let code = match (release.season, number) {
-                                (Some(season), Some(number)) => format!("S{season:02}E{number:02}"),
+                            let code = match (row.season, row.number) {
+                                (Some(season), Some(number)) => {
+                                    format!("S{season:02}E{number:02}")
+                                }
                                 (_, Some(number)) => format!("Episode {number}"),
-                                _ => reel_core::title::truncate(&episode_file.path, 40),
+                                // A season pack with no per-file numbering, or a
+                                // dated show whose date matched nothing.
+                                (Some(season), None) => format!("S{season:02} (unnumbered)"),
+                                (None, None) => row
+                                    .file
+                                    .air_date
+                                    .clone()
+                                    .unwrap_or_else(|| "Unnumbered".to_string()),
                             };
-                            let title = info
+                            let name = row
+                                .info
                                 .and_then(|i| i.name.clone())
                                 .unwrap_or_else(|| "(no title found)".to_string());
                             ui.label(
-                                egui::RichText::new(format!("{code}  {title}"))
+                                egui::RichText::new(format!("{code}  {name}"))
                                     .size(13.5)
                                     .strong(),
                             );
 
                             let mut facts = Vec::new();
-                            if let Some(runtime) = info.and_then(|i| i.runtime_minutes) {
+                            if let Some(runtime) = row.info.and_then(|i| i.runtime_minutes) {
                                 facts.push(format!("{runtime}m"));
                             }
-                            if let Some(air) = info.and_then(|i| i.air_date.as_deref()) {
+                            if let Some(air) = row.info.and_then(|i| i.air_date.as_deref()) {
                                 facts.push(air.to_string());
                             }
                             facts.push(fmt::human_bytes(length));
-                            if let Some(position) = watched.map(|w| w.position) {
-                                if !watched.is_some_and(|w| w.is_finished()) {
-                                    facts.push(format!("resume {}", fmt::human_duration(position)));
-                                } else {
+                            if let Some(progress) = watched {
+                                if progress.is_finished() {
                                     facts.push("watched".to_string());
+                                } else {
+                                    facts.push(format!(
+                                        "resume {}",
+                                        fmt::human_duration(progress.position)
+                                    ));
                                 }
                             }
                             ui.label(
@@ -1549,7 +1631,7 @@ impl App {
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("Play").clicked() {
-                                *action = Some(DetailAction::Play(episode_file.file_id));
+                                *action = Some(DetailAction::Play(row.file.file_id));
                             }
                             if is_included && progress > 0 {
                                 let percent = (progress as f64 / length.max(1) as f64) * 100.0;
@@ -1574,10 +1656,10 @@ impl App {
                             if toggle.changed() {
                                 let mut next = included.clone();
                                 if wanted {
-                                    next.push(episode_file.file_id);
+                                    next.push(row.file.file_id);
                                     next.sort_unstable();
                                 } else {
-                                    next.retain(|id| *id != episode_file.file_id);
+                                    next.retain(|id| *id != row.file.file_id);
                                 }
                                 *action = Some(DetailAction::SelectFiles(next));
                             }
@@ -1592,12 +1674,12 @@ impl App {
         let leftovers: Vec<&reel_catalog::release::EpisodeFile> = release
             .episodes
             .iter()
-            .filter(|e| e.extra || e.episode.is_none())
+            .filter(|e| e.extra)
             .collect();
         if !leftovers.is_empty() {
             ui.add_space(6.0);
             ui.label(
-                egui::RichText::new("Extras and other files")
+                egui::RichText::new("Extras")
                     .size(13.0)
                     .color(theme::TEXT_DIM),
             );
@@ -1618,9 +1700,16 @@ impl App {
                 });
             }
         }
-
     }
 
+}
+
+/// A file resolved to an episode, by name or by air date.
+struct ResolvedEpisode<'a> {
+    file: &'a reel_catalog::release::EpisodeFile,
+    season: Option<u32>,
+    number: Option<u32>,
+    info: Option<&'a reel_catalog::model::EpisodeInfo>,
 }
 
 enum DetailAction {
@@ -1684,7 +1773,6 @@ fn plural(count: usize, singular: &str) -> String {
         format!("{count} {singular}s")
     }
 }
-
 
 fn stat(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.vertical(|ui| {
@@ -1930,6 +2018,8 @@ impl App {
         let caps = self.backend.capabilities().clone();
         let catalog = self.backend.catalog_status();
         let mut action: Option<SettingsAction> = None;
+        let mut save_key: Option<Option<String>> = None;
+        let mut check_key: Option<String> = None;
 
         ui.add_space(16.0);
         ui.label(egui::RichText::new("Settings").size(22.0).strong());
@@ -1955,6 +2045,7 @@ impl App {
                 "not configured".to_string()
             };
             row(ui, "Status", &status);
+            row(ui, "Key", &catalog.key_source);
             row(ui, "Cache folder", &catalog.cache_dir);
             row(
                 ui,
@@ -1980,6 +2071,46 @@ impl App {
                 );
             }
 
+            if catalog.can_set_key {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        Vec2::new(150.0, 18.0),
+                        egui::Label::new(egui::RichText::new("TMDB API key").color(theme::TEXT_DIM)),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.api_key_input)
+                            .password(true)
+                            .hint_text("v3 key or v4 token")
+                            .desired_width(300.0),
+                    );
+                    let typed = !self.api_key_input.trim().is_empty();
+                    if ui.add_enabled(typed, egui::Button::new("Save")).clicked() {
+                        save_key = Some(Some(self.api_key_input.clone()));
+                    }
+                    if ui.add_enabled(typed, egui::Button::new("Check")).clicked() {
+                        check_key = Some(self.api_key_input.clone());
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "A TMDB account is free. Either key type works: a v3 API key, or a v4 \
+                         API Read Access Token which starts with eyJ.",
+                    )
+                    .color(theme::TEXT_DIM)
+                    .size(11.0),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(
+                        "The key is coming from REEL_TMDB_API_KEY, which overrides anything \
+                         stored here. Unset it to manage the key in this window.",
+                    )
+                    .color(theme::TEXT_DIM)
+                    .size(11.0),
+                );
+            }
+
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("Look up metadata again").clicked() {
@@ -1987,6 +2118,12 @@ impl App {
                 }
                 if ui.button("Clear poster and metadata cache").clicked() {
                     action = Some(SettingsAction::ClearCache);
+                }
+                if catalog.can_set_key
+                    && catalog.key_source != "not set"
+                    && ui.button("Remove stored key").clicked()
+                {
+                    save_key = Some(None);
                 }
             });
             ui.add_space(14.0);
@@ -2080,6 +2217,14 @@ impl App {
                 .size(12.0),
             );
         });
+
+        if let Some(key) = save_key {
+            self.backend.set_api_key(key);
+            self.api_key_input.clear();
+        }
+        if let Some(key) = check_key {
+            self.backend.test_api_key(key);
+        }
 
         match action {
             Some(SettingsAction::RefreshMetadata) => self.backend.refresh_metadata(),
