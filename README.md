@@ -46,7 +46,9 @@ documented, tested extension point: see
 | Bundled sources | one: the Internet Archive (public domain / CC film) |
 | Settings file as the canonical configuration (not env) | done |
 | Merge copies of a film or show into one title | done |
-| Stream on demand; per-file / per-episode / per-season downloads | done |
+| Temporary streaming: memory first, spills to scratch, freed on stop | done |
+| Downloads are opt-in and toggle to cancel/remove | done |
+| Library survives independently of the torrent session | done |
 | Subtitles: embedded tracks, sidecar files, track and delay controls | done |
 | Audio track, speed and aspect controls; fullscreen + shortcuts | done |
 | Transcoding for odd codecs | not yet |
@@ -310,10 +312,13 @@ the bytes fetched per file, a **Download** button per file or episode, a
 **Download season** button per season, and a *Fetch every file* button, so the
 choice is visible and reversible.
 
-Downloading is **optional**. The default, set in **Settings → Streaming and
-downloads → Stream on demand**, is to fetch a file only while you watch it. Turn
-that off to download every playable file of a new torrent in the background, or
-use the per-file/per-season Download buttons to keep specific things.
+Downloading is **optional and explicit**. The default is to stream: a title is
+fetched only while you watch it, kept in memory (spilling to a scratch file when
+it outgrows the budget) and **thrown away when playback stops**. **Download** on
+a version or episode keeps it in the download folder instead, and the button
+becomes **Stop download**, which deletes it again. **Settings → Streaming and
+downloads → Stream on demand** turns the whole default off, so new titles are
+downloads from the start. See *Streaming is temporary* below.
 
 Selection is at **piece granularity**, which is a property of BitTorrent, not a
 shortcut: a piece that straddles a file boundary belongs to both files, so a
@@ -341,6 +346,32 @@ Two things resume, and they resume independently:
   as an empty file. Verified by stopping a throttled download partway,
   restarting, and checking both that progress was retained and that the retained
   bytes matched the source.
+
+## Streaming is temporary
+
+Pressing **Play** streams the file without keeping it. The title lands in the
+library, the bytes do not.
+
+* **Storage.** A streamed torrent uses temporary storage: pieces stay in RAM up
+  to a budget (512 MiB by default) and spill, whole files at a time, to a scratch
+  directory under the system temp dir. Nothing is written to your download
+  folder, and the scratch is deleted when the stream is released.
+* **Why not a pure RAM cache.** librqbit's reader trusts the chunk tracker's
+  have-bit and reads storage directly, so an evicted piece is a hard stream
+  error; a bounded cache that evicts is unsafe for a seeker. Keeping whole files
+  while they fit, and spilling the rest, is bounded *and* seek-safe.
+* **Released on stop.** When you leave the player, a title that is not being
+  downloaded is removed from the engine and re-added paused, so its temporary
+  storage is freed. The library keeps the title; playing it again brings it back
+  from the saved `.torrent` (offline, instantly) and the player waits for it.
+* **Downloading is opt-in.** **Download** re-adds the title with filesystem
+  storage and starts it; **Stop download** deletes the files and returns to
+  streaming. The same switch is available per version, per episode and per
+  season.
+* **The library is durable.** Since a streamed torrent is removed when it stops,
+  a persisted `library.json` (plus a saved `.torrent` per title) is what makes a
+  title stay in the library. Downloads are re-added at startup; streams wait
+  until you play them.
 
 ## One title, several torrents
 

@@ -23,9 +23,11 @@ use reel_catalog::{
     Metadata, MetadataProvider, Release, SearchAggregator, SearchResults, TmdbClient, WatchHistory,
     WatchProgress, analyse, default_data_dir, provider_from_key,
 };
-use reel_core::model::TorrentView;
+use reel_core::model::{FileView, StatsView, StreamTarget, TorrentView};
 use reel_core::title::clean_title;
-use reel_core::{AddOptions, AddSource, Engine, EngineConfig};
+use reel_core::{
+    AddOptions, AddSource, Engine, EngineConfig, LibraryEntry, LibraryStore, StoredFile,
+};
 
 /// How many metadata lookups may be in flight at once. Providers rate-limit, and
 /// a library can be large.
@@ -89,6 +91,9 @@ pub struct LibraryItem {
     pub torrent: TorrentView,
     /// Catalogue state: metadata, artwork, watch position.
     pub entry: CatalogEntry,
+    /// The user asked to keep this title on disk. `false` means it is only ever
+    /// streamed.
+    pub downloading: bool,
 }
 
 impl LibraryItem {
@@ -115,6 +120,9 @@ pub enum BackendEvent {
     Added { id: usize, title: String },
     /// Metadata arrived for a torrent, so the UI should refresh.
     Metadata { info_hash: String },
+    /// A title that had to be brought back into the session is now live and can
+    /// be streamed. Payback may have been requested before that.
+    Ready { info_hash: String },
     /// Watch positions changed.
     WatchUpdated,
     /// The result of checking an API key.
@@ -146,10 +154,28 @@ pub trait Backend {
 
     /// Fetch exactly these files *and* make sure the torrent is running.
     ///
-    /// This is what pressing Play (or Download) uses. A multi-file torrent is
-    /// added paused, so narrowing the selection alone would leave the stream
-    /// request waiting forever: the torrent has to be unpaused too.
+    /// This is what pressing Play uses: the copy is temporary, so it is fetched
+    /// with the streaming storage and thrown away when playback stops. A
+    /// multi-file torrent is added paused, so narrowing the selection alone
+    /// would leave the stream request waiting forever; the torrent is unpaused
+    /// too.
     fn start_files(&self, id: usize, files: &[usize]);
+
+    /// Keep these files: fetch them to the download folder with persistent
+    /// storage, switching the title out of streaming mode if it was in it.
+    fn download_files(&self, id: usize, files: &[usize]);
+
+    /// Stop keeping a download: delete its files and go back to streaming-only.
+    fn stop_download(&self, id: usize);
+
+    /// Playback has stopped. A title that is not being downloaded is released
+    /// so its temporary storage goes away; a download is left alone.
+    fn stop_streaming(&self, id: usize);
+
+    /// Whether the title is currently in the session, so it can stream now.
+    /// A title that is not live has to be brought back first, which reports
+    /// [`BackendEvent::Ready`] when it is done.
+    fn is_live(&self, id: usize) -> bool;
 
     /// Remember how far through one file of a torrent playback got.
     ///
@@ -236,6 +262,8 @@ pub struct EngineBackend {
     capabilities: BackendCapabilities,
     shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     catalog: Arc<CatalogState>,
+    /// The durable library, independent of which torrents are in the session.
+    library: Arc<Mutex<LibraryStore>>,
 }
 
 impl EngineBackend {
@@ -246,7 +274,7 @@ impl EngineBackend {
     }
 
     pub fn start_with_options(
-        config: EngineConfig,
+        mut config: EngineConfig,
         catalog_options: CatalogOptions,
     ) -> anyhow::Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -254,8 +282,15 @@ impl EngineBackend {
             .thread_name("reel-backend")
             .build()?;
 
+        // The desktop keeps its own durable library, so a streamed torrent can
+        // be removed without the title disappearing. librqbit's session
+        // persistence would re-add every torrent with filesystem storage, which
+        // is exactly what streaming must not do.
+        config.persist_session = false;
+
         let download_dir = config.download_dir.display().to_string();
         let client_name = config.client_name.clone();
+        let data_dir = catalog_options.data_dir.clone();
 
         let engine = runtime.block_on(Engine::new(config))?;
 
@@ -331,6 +366,8 @@ impl EngineBackend {
             search,
         });
 
+        let library = Arc::new(Mutex::new(LibraryStore::load(&data_dir.join("library.json"))));
+
         let backend = Self {
             runtime,
             engine,
@@ -339,9 +376,11 @@ impl EngineBackend {
             capabilities,
             shutdown: Mutex::new(Some(shutdown_tx)),
             catalog,
+            library,
         };
 
-        // Kick off enrichment for whatever is already in the session.
+        // Bring back the titles the user asked to keep, then enrich.
+        backend.restore_downloads();
         backend.enrich_library();
         Ok(backend)
     }
@@ -372,28 +411,181 @@ impl EngineBackend {
         });
     }
 
-    /// Look up metadata for every torrent we have not tried yet.
+    // ------------------------------------------------------------ library
+
+    /// The live engine id for each torrent in the session, by info hash.
+    fn live_map(&self) -> HashMap<String, usize> {
+        self.engine
+            .list()
+            .into_iter()
+            .map(|view| (view.info_hash.to_ascii_lowercase(), view.id))
+            .collect()
+    }
+
+    fn library_path(&self) -> std::path::PathBuf {
+        self.catalog.data_dir.join("library.json")
+    }
+
+    fn save_library(&self) {
+        let library = self.library.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = library.save(&self.library_path()) {
+            tracing::warn!(error = %e, "could not save the library");
+        }
+    }
+
+    fn snapshot(&self) -> LibraryStore {
+        self.library
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Persist the `.torrent` bytes so the title can be re-added offline.
+    fn save_torrent_bytes(&self, info_hash: &str, bytes: &[u8]) {
+        let dir = self.catalog.data_dir.join("torrents");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(error = %e, "could not create the torrent cache");
+            return;
+        }
+        let path = dir.join(format!("{}.torrent", info_hash.to_ascii_lowercase()));
+        if let Err(e) = std::fs::write(&path, bytes) {
+            tracing::warn!(error = %e, path = %path.display(), "could not save torrent bytes");
+        }
+    }
+
+    /// Remove a live torrent and bring it back, optionally with different
+    /// storage and a file selection.
     ///
-    /// Bounded by [`MAX_CONCURRENT_LOOKUPS`], and each title is attempted once
-    /// per session so a provider that does not know a film is not asked again
-    /// on every refresh.
+    /// This is how a title switches between streaming (temporary storage,
+    /// paused when not playing) and downloading (filesystem storage, running),
+    /// and how a stopped stream frees its temporary data. It runs as one task
+    /// so the remove always completes before the re-add, and the library's
+    /// stable id is untouched while the engine id changes.
+    fn recycle(
+        &self,
+        entry: LibraryEntry,
+        downloading: bool,
+        start: Option<Vec<usize>>,
+        delete_files: bool,
+    ) {
+        let engine = self.engine.clone();
+        let events = self.events.clone();
+        let data_dir = self.catalog.data_dir.clone();
+
+        self.runtime.spawn(async move {
+            if let Some(engine_id) = engine.id_for_hash(&entry.info_hash) {
+                if let Err(e) = engine.remove(engine_id, delete_files).await {
+                    tracing::warn!(error = %e, "removing before re-add failed");
+                }
+            }
+
+            let source = match std::fs::read(LibraryStore::torrent_path(&data_dir, &entry)) {
+                Ok(bytes) => AddSource::File(bytes),
+                Err(_) if !entry.source.is_empty() => match AddSource::detect(&entry.source) {
+                    Ok(source) => source,
+                    Err(e) => {
+                        events
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(BackendEvent::Error(format!("{e}")));
+                        return;
+                    }
+                },
+                Err(_) => return,
+            };
+
+            let paused = !downloading && start.is_none();
+            let options = AddOptions {
+                media_only: true,
+                paused,
+                allow_overwrite: downloading,
+                ephemeral: !downloading,
+                pause_multi_file: false,
+                ..Default::default()
+            };
+
+            let outcome = match engine.add(source, options).await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    tracing::warn!(info_hash = %entry.info_hash, error = %e, "could not re-add");
+                    return;
+                }
+            };
+            let engine_id = outcome.torrent.id;
+
+            let selection = start
+                .clone()
+                .or_else(|| downloading.then(|| entry.selected_files.clone()));
+            if let Some(files) = selection.filter(|files| !files.is_empty()) {
+                if let Err(e) = engine.set_only_files(engine_id, &files).await {
+                    tracing::warn!(error = %e, "could not restore the file selection");
+                }
+            }
+            if start.is_some() || downloading {
+                if let Err(e) = engine.resume(engine_id).await {
+                    tracing::warn!(error = %e, "could not start the re-added torrent");
+                }
+            }
+
+            if let Some(bytes) = engine.torrent_bytes(engine_id) {
+                let dir = data_dir.join("torrents");
+                let _ = std::fs::create_dir_all(&dir);
+                let path = dir.join(format!("{}.torrent", entry.info_hash.to_ascii_lowercase()));
+                let _ = std::fs::write(path, bytes);
+            }
+
+            let mut queue = events.lock().unwrap_or_else(|e| e.into_inner());
+            queue.push(BackendEvent::Metadata {
+                info_hash: entry.info_hash.clone(),
+            });
+            queue.push(BackendEvent::Ready {
+                info_hash: entry.info_hash.clone(),
+            });
+        });
+    }
+
+    /// Re-add every title the user asked to keep.
+    fn restore_downloads(&self) {
+        let entries: Vec<LibraryEntry> = self
+            .library
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|entry| entry.downloading)
+            .cloned()
+            .collect();
+        for entry in entries {
+            self.recycle(entry, true, None, false);
+        }
+    }
+
+    /// Write back the file list the engine knows, once a magnet has resolved.
+    fn sync_entry(&self, id: usize, view: &TorrentView) {
+        let mut library = self.library.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = library.entry_mut(id) else {
+            return;
+        };
+        entry.name = view.name.clone().or_else(|| entry.name.clone());
+        entry.primary_file_id = view.primary_file_id.or(entry.primary_file_id);
+        if !view.files.is_empty() {
+            entry.files = view.files.iter().map(StoredFile::from_view).collect();
+        }
+    }
+
+    /// Look up metadata for every stored title we have not tried yet.
     fn enrich_library(&self) {
         if !self.catalog.provider().is_configured() {
             return;
         }
 
-        let torrents = self.engine.list();
+        let entries = self.snapshot();
         let mut to_start = Vec::new();
 
-        for torrent in torrents {
-            // A magnet that has not found its metadata yet has no name, and
-            // searching for its info hash would be nonsense.
-            if torrent.name.as_deref().is_none_or(str::is_empty) {
+        for entry in entries.iter() {
+            if entry.name.as_deref().is_none_or(str::is_empty) && entry.files.is_empty() {
                 continue;
             }
-
-            let key = torrent.info_hash.clone();
-
+            let key = entry.info_hash.clone();
             if self
                 .catalog
                 .metadata
@@ -420,24 +612,20 @@ impl EngineBackend {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(key.clone());
-
-            to_start.push((key, torrent.clone()));
+            to_start.push((key, analyse_entry(&entry)));
         }
 
-        for (info_hash, torrent) in to_start {
-            self.spawn_lookup(info_hash, torrent);
+        for (info_hash, release) in to_start {
+            self.spawn_lookup(info_hash, release);
         }
     }
 
-    fn spawn_lookup(&self, info_hash: String, torrent: TorrentView) {
+    fn spawn_lookup(&self, info_hash: String, release: Release) {
         let provider = self.catalog.provider();
         let state = self.catalog.clone();
         let events = self.events.clone();
 
         self.runtime.spawn(async move {
-            // The torrent's own names decide what this is, so the provider is
-            // asked about a film or a series and, for a series, which season.
-            let release = analyse_torrent(&torrent);
             let query = if release.title.is_empty() {
                 LookupQuery::from_release_name(&info_hash)
             } else {
@@ -454,11 +642,7 @@ impl EngineBackend {
 
             match result {
                 Ok(Some(metadata)) => {
-                    tracing::info!(
-                        %info_hash,
-                        title = %metadata.title,
-                        "matched metadata"
-                    );
+                    tracing::info!(%info_hash, title = %metadata.title, "matched metadata");
                     state
                         .metadata
                         .lock()
@@ -469,22 +653,67 @@ impl EngineBackend {
                         .unwrap_or_else(|e| e.into_inner())
                         .push(BackendEvent::Metadata { info_hash });
                 }
-                Ok(None) => {
-                    tracing::debug!(%info_hash, "no metadata match");
-                }
-                Err(e) => {
-                    // A missing key or an offline machine must not surface as a
-                    // scary error for every title in the library.
-                    tracing::debug!(%info_hash, error = %e, "metadata lookup failed");
-                }
+                Ok(None) => tracing::debug!(%info_hash, "no metadata match"),
+                Err(e) => tracing::debug!(%info_hash, error = %e, "metadata lookup failed"),
             }
         });
     }
 
-    fn entry_for(&self, torrent: &TorrentView) -> LibraryItem {
-        let release = analyse_torrent(torrent);
+    /// A view for a title that is not currently in the session, built from what
+    /// the store remembers so the library can still draw it.
+    fn synth_view(&self, entry: &LibraryEntry) -> TorrentView {
+        let files: Vec<FileView> = entry
+            .files
+            .iter()
+            .map(|file| FileView {
+                id: file.id,
+                path: file.path.clone(),
+                name: file.name.clone(),
+                length: file.length,
+                progress_bytes: 0,
+                included: entry.selected_files.contains(&file.id),
+                is_video: file.is_video,
+                is_audio: file.is_audio,
+                is_subtitle: file.is_subtitle,
+                stream: StreamTarget {
+                    torrent_id: entry.id,
+                    file_id: file.id,
+                    name: file.name.clone(),
+                    mime: reel_core::mime_for_name(&file.name).to_string(),
+                    length: file.length,
+                    path: format!(
+                        "/stream/{}/{}",
+                        entry.id,
+                        reel_core::model::percent_encode_path_segment(&file.name)
+                    ),
+                    url: None,
+                },
+            })
+            .collect();
+
+        TorrentView {
+            id: entry.id,
+            info_hash: entry.info_hash.clone(),
+            name: entry.name.clone(),
+            output_folder: String::new(),
+            state: "paused".to_string(),
+            finished: false,
+            primary_file_id: entry.primary_file_id,
+            files,
+            stats: StatsView {
+                state: "paused".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn entry_for(&self, entry: &LibraryEntry, live: Option<&TorrentView>) -> LibraryItem {
+        let release = match live {
+            Some(view) => analyse_torrent(view),
+            None => analyse_entry(entry),
+        };
         let (display_title, year) = if release.title.is_empty() {
-            display_title_for(torrent)
+            display_title_for_entry(entry)
         } else {
             (release.title.clone(), release.year)
         };
@@ -494,19 +723,30 @@ impl EngineBackend {
             .metadata
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&torrent.info_hash)
+            .get(&entry.info_hash)
             .cloned();
 
         let history = self.catalog.history.lock().unwrap_or_else(|e| e.into_inner());
-        let watch_by_file = history.per_file(&torrent.info_hash);
-        let watch = history.get(&torrent.info_hash).cloned();
+        let watch_by_file = history.per_file(&entry.info_hash);
+        let watch = history.get(&entry.info_hash).cloned();
         drop(history);
 
+        let mut torrent = match live {
+            Some(view) => {
+                let mut view = view.clone();
+                view.id = entry.id;
+                view
+            }
+            None => self.synth_view(entry),
+        };
+        torrent.with_base_url(&self.base_url);
+
         LibraryItem {
-            torrent: torrent.clone(),
+            torrent,
+            downloading: entry.downloading,
             entry: CatalogEntry {
-                torrent_id: torrent.id,
-                info_hash: torrent.info_hash.clone(),
+                torrent_id: entry.id,
+                info_hash: entry.info_hash.clone(),
                 display_title,
                 year,
                 metadata,
@@ -531,13 +771,20 @@ pub(crate) fn analyse_torrent(torrent: &TorrentView) -> Release {
     analyse(&files)
 }
 
-/// What to call a torrent in the UI.
-///
-/// A magnet that has not resolved its metadata yet has no name; showing its
-/// info hash would be worse than admitting we are still fetching it. The same
-/// rule keeps enrichment from searching for a hex string.
-pub(crate) fn display_title_for(torrent: &TorrentView) -> (String, Option<u16>) {
-    match torrent.name.as_deref().filter(|name| !name.trim().is_empty()) {
+/// The same judgement, from the library's stored file list, so metadata can be
+/// looked up for a title that is not currently in the session.
+pub(crate) fn analyse_entry(entry: &LibraryEntry) -> Release {
+    let files: Vec<FileInput> = entry
+        .files
+        .iter()
+        .map(|file| FileInput::new(file.id, file.path.clone(), file.length))
+        .collect();
+    analyse(&files)
+}
+
+/// What to call a stored title in the UI.
+pub(crate) fn display_title_for_entry(entry: &LibraryEntry) -> (String, Option<u16>) {
+    match entry.name.as_deref().filter(|name| !name.trim().is_empty()) {
         Some(name) => {
             let clean = clean_title(name);
             (clean.title, clean.year)
@@ -593,38 +840,76 @@ impl Backend for EngineBackend {
         // makes metadata appear shortly after a torrent is added.
         self.enrich_library();
 
-        let mut torrents = self.engine.list();
-        for torrent in &mut torrents {
-            torrent.with_base_url(&self.base_url);
+        let views = self.engine.list();
+        let mut live: HashMap<String, &TorrentView> = HashMap::new();
+        for view in &views {
+            let key = view.info_hash.to_ascii_lowercase();
+            live.insert(key.clone(), view);
+            // A magnet's files only exist once it has resolved; write them (and
+            // the .torrent) back into the store the first time we see them.
+            if self
+                .library
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .by_hash(&view.info_hash)
+                .is_some_and(|entry| entry.files.is_empty() && !view.files.is_empty())
+            {
+                if let Some(entry_id) = self
+                    .library
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .by_hash(&view.info_hash)
+                    .map(|entry| entry.id)
+                {
+                    self.sync_entry(entry_id, view);
+                    self.save_library();
+                }
+                if let Some(bytes) = self.engine.torrent_bytes(view.id) {
+                    self.save_torrent_bytes(&view.info_hash, &bytes);
+                }
+            }
         }
-        torrents.iter().map(|t| self.entry_for(t)).collect()
+
+        let entries = self.snapshot();
+        entries
+            .iter()
+            .map(|entry| {
+                let view = live.get(&entry.info_hash.to_ascii_lowercase()).copied();
+                self.entry_for(entry, view)
+            })
+            .collect()
     }
 
     fn item(&self, id: usize) -> Option<LibraryItem> {
-        let mut torrent = self.engine.view(id).ok()?;
-        torrent.with_base_url(&self.base_url);
-        Some(self.entry_for(&torrent))
+        let entry = self.snapshot().entry(id).cloned()?;
+        let view = self
+            .engine
+            .list()
+            .into_iter()
+            .find(|view| view.info_hash.eq_ignore_ascii_case(&entry.info_hash));
+        Some(self.entry_for(&entry, view.as_ref()))
     }
 
     fn add(&self, source: &str, media_only: bool) {
         let engine = self.engine.clone();
         let events = self.events.clone();
+        let library = self.library.clone();
+        let data_dir = self.catalog.data_dir.clone();
         let source = source.to_string();
-        // Streaming is the primary way to use the app: by default a multi-file
-        // torrent waits until something is chosen, rather than fetching the
-        // whole pack. Turning `stream_only` off restores background download.
-        let stream_only = self.settings().stream_only;
+        // Streaming is the primary way to use the app: a new title is temporary
+        // unless the user has turned that off, in which case it is a download.
+        let downloading = !self.settings().stream_only;
+        let re_add_source = source.clone();
 
         self.runtime.spawn(async move {
             let options = AddOptions {
                 media_only,
-                // A season pack should wait until an episode is chosen; a film
-                // has nothing to choose, so it starts on its own.
-                pause_multi_file: stream_only,
+                pause_multi_file: !downloading,
+                ephemeral: !downloading,
                 ..Default::default()
             };
-            let result = match AddSource::detect(&source) {
-                Ok(parsed) => engine.add(parsed, options).await,
+            let parsed = match AddSource::detect(&source) {
+                Ok(parsed) => parsed,
                 Err(e) => {
                     events
                         .lock()
@@ -633,68 +918,140 @@ impl Backend for EngineBackend {
                     return;
                 }
             };
-
-            let mut queue = events.lock().unwrap_or_else(|e| e.into_inner());
-            match result {
-                Ok(outcome) => {
-                    let title = outcome
-                        .torrent
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| outcome.torrent.info_hash.clone());
-                    queue.push(BackendEvent::Added {
-                        id: outcome.torrent.id,
-                        title,
-                    });
+            let outcome = match engine.add(parsed, options).await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    events
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(BackendEvent::Error(format!("could not add torrent: {e}")));
+                    return;
                 }
-                Err(e) => queue.push(BackendEvent::Error(format!("could not add torrent: {e}"))),
+            };
+            let view = outcome.torrent;
+
+            if let Some(bytes) = engine.torrent_bytes(view.id) {
+                let dir = data_dir.join("torrents");
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(
+                    dir.join(format!("{}.torrent", view.info_hash.to_ascii_lowercase())),
+                    bytes,
+                );
             }
+
+            let (id, snapshot) = {
+                let mut store = library.lock().unwrap_or_else(|e| e.into_inner());
+                let id = store.upsert(
+                    &view.info_hash,
+                    &re_add_source,
+                    view.name.clone(),
+                    now_unix(),
+                );
+                if let Some(entry) = store.entry_mut(id) {
+                    entry.files = view.files.iter().map(StoredFile::from_view).collect();
+                    entry.primary_file_id = view.primary_file_id;
+                    entry.selected_files =
+                        view.files.iter().filter(|file| file.included).map(|file| file.id).collect();
+                    entry.downloading = downloading;
+                }
+                (id, store.clone())
+            };
+            let _ = snapshot.save(&data_dir.join("library.json"));
+
+            let title = view.name.clone().unwrap_or_else(|| view.info_hash.clone());
+            events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(BackendEvent::Added { id, title });
         });
     }
 
     fn set_paused(&self, id: usize, paused: bool) {
+        let Some(entry) = self.snapshot().entry(id).cloned() else {
+            return;
+        };
         let engine = self.engine.clone();
-        self.spawn_result(if paused { "pause" } else { "resume" }, async move {
-            if paused {
-                engine.pause(id).await
-            } else {
-                engine.resume(id).await
+        let downloading = entry.downloading;
+        match self
+            .live_map()
+            .get(&entry.info_hash.to_ascii_lowercase())
+            .copied()
+        {
+            Some(engine_id) => {
+                self.spawn_result(if paused { "pause" } else { "resume" }, async move {
+                    if paused {
+                        engine.pause(engine_id).await
+                    } else {
+                        engine.resume(engine_id).await
+                    }
+                });
             }
-        });
+            None if !paused => self.recycle(entry, downloading, None, false),
+            None => {}
+        }
     }
 
     fn remove(&self, id: usize, delete_files: bool) {
         let engine = self.engine.clone();
-        // Remember the info hash so the watch history entry goes with it.
-        let info_hash = self.engine.view(id).ok().map(|view| view.info_hash);
         let state = self.catalog.clone();
-        let events = self.events.clone();
+        let library = self.library.clone();
+        let data_dir = self.catalog.data_dir.clone();
+        let entry = self.snapshot().entry(id).cloned();
+
+        if let Some(entry) = entry.clone() {
+            if let Some(path) = Some(LibraryStore::torrent_path(&data_dir, &entry)) {
+                let _ = std::fs::remove_file(path);
+            }
+            let mut store = library.lock().unwrap_or_else(|e| e.into_inner());
+            store.remove(id);
+            let snapshot = store.clone();
+            drop(store);
+            let _ = snapshot.save(&data_dir.join("library.json"));
+        }
 
         self.runtime.spawn(async move {
-            if let Err(e) = engine.remove(id, delete_files).await {
-                events
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(BackendEvent::Error(format!("remove: {e}")));
-                return;
-            }
-            if let Some(hash) = info_hash {
+            if let Some(entry) = entry {
+                if let Some(engine_id) = engine.id_for_hash(&entry.info_hash) {
+                    if let Err(e) = engine.remove(engine_id, delete_files).await {
+                        tracing::warn!(error = %e, "remove failed");
+                    }
+                }
                 let mut history = state.history.lock().unwrap_or_else(|e| e.into_inner());
-                let _ = history.forget(&hash);
+                let _ = history.forget(&entry.info_hash);
             }
         });
     }
 
     fn set_only_files(&self, id: usize, files: &[usize]) {
         if files.is_empty() {
-            // An empty selection would leave the torrent with nothing to fetch.
             tracing::warn!(id, "refusing to select no files");
             return;
         }
+        // Remember the selection so a download can be restored after a restart.
+        {
+            let mut store = self.library.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = store.entry_mut(id) {
+                entry.selected_files = files.to_vec();
+            }
+            let snapshot = store.clone();
+            drop(store);
+            let _ = snapshot.save(&self.library_path());
+        }
+
+        let Some(entry) = self.snapshot().entry(id).cloned() else {
+            return;
+        };
+        let Some(engine_id) = self
+            .live_map()
+            .get(&entry.info_hash.to_ascii_lowercase())
+            .copied()
+        else {
+            return;
+        };
         let engine = self.engine.clone();
         let files = files.to_vec();
         self.spawn_result("select files", async move {
-            engine.set_only_files(id, &files).await
+            engine.set_only_files(engine_id, &files).await
         });
     }
 
@@ -703,12 +1060,81 @@ impl Backend for EngineBackend {
             tracing::warn!(id, "refusing to start an empty selection");
             return;
         }
-        let engine = self.engine.clone();
-        let files = files.to_vec();
-        self.spawn_result("start files", async move {
-            engine.set_only_files(id, &files).await?;
-            engine.resume(id).await
-        });
+        let Some(entry) = self.snapshot().entry(id).cloned() else {
+            return;
+        };
+        match self
+            .live_map()
+            .get(&entry.info_hash.to_ascii_lowercase())
+            .copied()
+        {
+            Some(engine_id) => {
+                let engine = self.engine.clone();
+                let files = files.to_vec();
+                self.spawn_result("start files", async move {
+                    engine.set_only_files(engine_id, &files).await?;
+                    engine.resume(engine_id).await
+                });
+            }
+            // Not in the session (for example after a stop): bring it back with
+            // temporary storage, select, and play.
+            None => self.recycle(entry, false, Some(files.to_vec()), false),
+        }
+    }
+
+    fn download_files(&self, id: usize, files: &[usize]) {
+        let Some(entry) = self.snapshot().entry(id).cloned() else {
+            return;
+        };
+        {
+            let mut store = self.library.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = store.entry_mut(id) {
+                entry.downloading = true;
+                entry.selected_files = files.to_vec();
+            }
+            let snapshot = store.clone();
+            drop(store);
+            let _ = snapshot.save(&self.library_path());
+        }
+        // Switch to filesystem storage and keep the chosen files.
+        self.recycle(entry, true, Some(files.to_vec()), false);
+    }
+
+    fn stop_download(&self, id: usize) {
+        let Some(entry) = self.snapshot().entry(id).cloned() else {
+            return;
+        };
+        {
+            let mut store = self.library.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = store.entry_mut(id) {
+                entry.downloading = false;
+                entry.selected_files.clear();
+            }
+            let snapshot = store.clone();
+            drop(store);
+            let _ = snapshot.save(&self.library_path());
+        }
+        // Delete the kept files and go back to a temporary, paused stream.
+        self.recycle(entry, false, None, true);
+    }
+
+    fn stop_streaming(&self, id: usize) {
+        let Some(entry) = self.snapshot().entry(id).cloned() else {
+            return;
+        };
+        if entry.downloading {
+            return;
+        }
+        // Free the temporary storage: remove the live torrent and re-add it
+        // paused, still in the library.
+        self.recycle(entry, false, None, false);
+    }
+
+    fn is_live(&self, id: usize) -> bool {
+        self.snapshot()
+            .entry(id)
+            .map(|entry| entry.info_hash.to_ascii_lowercase())
+            .is_some_and(|hash| self.live_map().contains_key(&hash))
     }
 
     fn record_watch(
@@ -1097,6 +1523,31 @@ impl Backend for FakeBackend {
         }
     }
 
+    fn download_files(&self, id: usize, files: &[usize]) {
+        self.start_files(id, files);
+    }
+
+    fn stop_download(&self, id: usize) {
+        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(item) = items.iter_mut().find(|i| i.torrent.id == id) {
+            item.torrent.stats.state = "paused".to_string();
+            item.torrent.state = "paused".to_string();
+        }
+    }
+
+    fn stop_streaming(&self, id: usize) {
+        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(item) = items.iter_mut().find(|i| i.torrent.id == id) {
+            item.torrent.stats.state = "paused".to_string();
+            item.torrent.state = "paused".to_string();
+        }
+    }
+
+    fn is_live(&self, _id: usize) -> bool {
+        // Fixtures are always present; the demo never re-adds torrents.
+        true
+    }
+
     fn record_watch(
         &self,
         info_hash: &str,
@@ -1251,36 +1702,45 @@ mod tests {
 
     use super::*;
 
-    fn torrent_without_name() -> TorrentView {
-        let mut view = sample_library()[0].torrent.clone();
-        view.name = None;
-        view
+    fn entry_without_name() -> LibraryEntry {
+        let item = sample_library().into_iter().next().expect("a sample");
+        LibraryEntry {
+            id: 0,
+            info_hash: item.torrent.info_hash.clone(),
+            source: String::new(),
+            name: None,
+            files: Vec::new(),
+            primary_file_id: None,
+            selected_files: Vec::new(),
+            downloading: false,
+            added_at: 0,
+        }
     }
 
     #[test]
     fn an_unresolved_magnet_is_not_called_by_its_hash() {
-        let torrent = torrent_without_name();
-        let (title, year) = display_title_for(&torrent);
+        let entry = entry_without_name();
+        let (title, year) = display_title_for_entry(&entry);
         assert_eq!(title, "Resolving magnet\u{2026}");
         assert_eq!(year, None);
         assert!(
-            !title.contains(&torrent.info_hash),
+            !title.contains(&entry.info_hash),
             "the info hash should never be shown as a title"
         );
     }
 
     #[test]
     fn an_empty_name_is_treated_as_no_name() {
-        let mut torrent = torrent_without_name();
-        torrent.name = Some("   ".to_string());
-        assert_eq!(display_title_for(&torrent).0, "Resolving magnet\u{2026}");
+        let mut entry = entry_without_name();
+        entry.name = Some("   ".to_string());
+        assert_eq!(display_title_for_entry(&entry).0, "Resolving magnet\u{2026}");
     }
 
     #[test]
     fn a_real_name_is_cleaned_as_usual() {
-        let mut torrent = torrent_without_name();
-        torrent.name = Some("The.Matrix.1999.1080p.BluRay.x264-GROUP".to_string());
-        let (title, year) = display_title_for(&torrent);
+        let mut entry = entry_without_name();
+        entry.name = Some("The.Matrix.1999.1080p.BluRay.x264-GROUP".to_string());
+        let (title, year) = display_title_for_entry(&entry);
         assert_eq!(title, "The Matrix");
         assert_eq!(year, Some(1999));
     }

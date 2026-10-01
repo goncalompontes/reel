@@ -156,6 +156,7 @@ fn item(
     );
 
     LibraryItem {
+        downloading: false,
         torrent: TorrentView {
             id,
             info_hash: info_hash.to_string(),

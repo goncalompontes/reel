@@ -17,13 +17,17 @@ pub mod config;
 pub mod create;
 pub mod engine;
 pub mod fmt;
+pub mod library;
 pub mod media;
 pub mod model;
+pub mod streaming;
 pub mod title;
 
 pub use config::EngineConfig;
 pub use create::{CreatedTorrent, create_torrent_file};
 pub use engine::{AddOptions, AddSource, BoxedByteStream, Engine, EngineError};
+pub use library::{LibraryEntry, LibraryStore, StoredFile};
+pub use streaming::{DEFAULT_MEMORY_BUDGET, StreamingStorageFactory};
 pub use media::{is_media_file, is_video_file, mime_for_name, pick_primary_file};
 pub use model::{
     AddOutcome, AddRequest, FileProbe, FileView, PeerView, StatsView, StreamTarget, TorrentView,

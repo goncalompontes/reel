@@ -102,6 +102,93 @@ fn engine_backend_serves_its_api_in_process() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The streaming lifecycle against the real engine, with no swarm: a title is
+/// added, is temporary by default, can be kept as a download, and is released
+/// again so its temporary storage goes away.
+#[test]
+fn streaming_is_temporary_and_downloading_is_opt_in() {
+    use std::time::{Duration, Instant};
+
+    let dir = scratch_dir("lifecycle");
+    std::fs::create_dir_all(dir.join("payload")).unwrap();
+    // A small non-video file: enough to make a torrent without a codec.
+    let payload = dir.join("payload/data.bin");
+    let bytes: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&payload, &bytes).unwrap();
+
+    let torrent_path = dir.join("data.torrent");
+    {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let created = runtime
+            .block_on(reel_core::create_torrent_file(
+                &dir.join("payload"),
+                None,
+                Vec::new(),
+                Some(16 * 1024),
+            ))
+            .expect("create torrent");
+        std::fs::write(&torrent_path, &created.bytes).unwrap();
+    }
+
+    let scratch = scratch_dir("lifecycle-state");
+    let config = EngineConfig {
+        disable_dht: true,
+        disable_trackers: true,
+        persist_session: false,
+        stream_scratch_dir: Some(scratch.clone()),
+        ..EngineConfig::new(&scratch)
+    };
+    let backend = EngineBackend::start_with_options(
+        config,
+        CatalogOptions {
+            api_key: None,
+            settings: Default::default(),
+            data_dir: dir.join("catalog"),
+            disable_bundled_sources: true,
+        },
+    )
+    .expect("start the engine backend");
+
+    let wait = |what: &str, mut check: Box<dyn FnMut() -> bool + '_>| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if check() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("timed out waiting for {what}");
+    };
+
+    // Add it: by default it is a temporary stream, not a download.
+    backend.add(torrent_path.to_str().unwrap(), true);
+    wait("the torrent to appear in the library", Box::new(|| !backend.library().is_empty()));
+
+    let item = backend.library().into_iter().next().unwrap();
+    let id = item.torrent.id;
+    assert!(!item.downloading, "a new title streams by default");
+    assert!(!item.torrent.files.is_empty(), "the file list was captured");
+    wait("the torrent to be live", Box::new(|| backend.is_live(id)));
+
+    // Keep it: this switches to filesystem storage and marks it a download.
+    backend.download_files(id, &[0]);
+    wait("the download to be marked", Box::new(|| {
+        backend.item(id).is_some_and(|item| item.downloading)
+    }));
+
+    // Stop keeping it: files are deleted and it goes back to temporary.
+    backend.stop_download(id);
+    wait("the download to be cleared", Box::new(|| {
+        backend.item(id).is_some_and(|item| !item.downloading)
+    }));
+
+    // The title is still in the library even though the torrent was recycled.
+    assert!(backend.item(id).is_some(), "the library outlives the torrent");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 #[test]
 fn fake_backend_drives_the_ui_without_an_engine() {
     use reel_desktop::backend::FakeBackend;

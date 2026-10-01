@@ -286,8 +286,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         upload_limit_bps: args.upload_limit,
         download_limit_bps: args.download_limit,
         // The CLI is used for seeding as much as for watching, so it does not
-        // second-guess: `--paused` is there when it is wanted.
+        // second-guess: `--paused` is there when it is wanted. Its storage is
+        // the download folder, not a temporary stream.
         pause_multi_file: false,
+        ephemeral: false,
     };
 
     // Adds run *after* the API is up, and off the startup path. Resolving a

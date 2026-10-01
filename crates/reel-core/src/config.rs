@@ -39,6 +39,13 @@ pub struct EngineConfig {
 
     /// Reported to peers and trackers as the client name.
     pub client_name: String,
+
+    /// How much RAM a stream-only torrent may use before spilling to scratch.
+    pub stream_memory_budget: usize,
+
+    /// Where stream-only scratch files are written. `None` uses the OS temp
+    /// directory. Nothing here is ever a "download".
+    pub stream_scratch_dir: Option<PathBuf>,
 }
 
 impl EngineConfig {
@@ -55,6 +62,8 @@ impl EngineConfig {
             peer_limit: None,
             ipv4_only: false,
             client_name: format!("reel/{}", env!("CARGO_PKG_VERSION")),
+            stream_memory_budget: crate::streaming::DEFAULT_MEMORY_BUDGET,
+            stream_scratch_dir: None,
         }
     }
 
@@ -62,5 +71,13 @@ impl EngineConfig {
         self.session_state_dir
             .clone()
             .unwrap_or_else(|| self.download_dir.join(".reel-session"))
+    }
+
+    /// Where stream-only scratch files go. Never inside the download folder:
+    /// the point is that a stream leaves nothing behind to find later.
+    pub fn stream_scratch_dir(&self) -> PathBuf {
+        self.stream_scratch_dir.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("reel-stream-{}", std::process::id()))
+        })
     }
 }

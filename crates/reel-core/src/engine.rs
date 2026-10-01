@@ -17,6 +17,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use librqbit::api::{Api, TorrentDetailsResponse, TorrentIdOrHash};
 use librqbit::limits::LimitsConfig;
+use librqbit::storage::StorageFactoryExt;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, ListenerMode, ListenerOptions, Session,
     SessionOptions, SessionPersistenceConfig, TorrentStats, TorrentStatsState,
@@ -130,6 +131,11 @@ pub struct AddOptions {
     /// Off by default: the CLI is also used for seeding, where pausing would be
     /// exactly wrong.
     pub pause_multi_file: bool,
+
+    /// Stream only: keep pieces in RAM (spilling to scratch) and never write to
+    /// the download folder. The storage is temporary, so the torrent is meant to
+    /// be removed when playback stops.
+    pub ephemeral: bool,
 }
 
 impl Default for AddOptions {
@@ -143,6 +149,7 @@ impl Default for AddOptions {
             upload_limit_bps: None,
             download_limit_bps: None,
             pause_multi_file: false,
+            ephemeral: false,
         }
     }
 }
@@ -237,6 +244,16 @@ impl Engine {
     }
 
     fn build_add_opts(&self, opts: &AddOptions, media_only: bool) -> AddTorrentOptions {
+        // A stream is temporary: RAM first, spill to scratch, never the
+        // download folder. A download uses the session's filesystem storage.
+        let storage_factory = opts.ephemeral.then(|| {
+            crate::streaming::StreamingStorageFactory::new(
+                self.config.stream_scratch_dir(),
+                self.config.stream_memory_budget,
+            )
+            .boxed()
+        });
+
         AddTorrentOptions {
             paused: opts.paused,
             output_folder: opts.output_folder.clone(),
@@ -251,6 +268,7 @@ impl Engine {
                 upload_bps: opts.upload_limit_bps.and_then(NonZeroU32::new),
                 download_bps: opts.download_limit_bps.and_then(NonZeroU32::new),
             },
+            storage_factory,
             ..Default::default()
         }
     }
@@ -499,6 +517,26 @@ impl Engine {
             torrent_id: id,
             file_id,
         })
+    }
+
+    /// The torrent's `.torrent` bytes, once its metadata has resolved.
+    ///
+    /// Saved so the library can re-add a title offline and instantly, which is
+    /// what makes a temporary stream practical: the torrent can be removed when
+    /// playback stops and brought back without asking the swarm again.
+    pub fn torrent_bytes(&self, id: usize) -> Option<Vec<u8>> {
+        let handle = self.session.get(TorrentIdOrHash::Id(id))?;
+        handle
+            .with_metadata(|metadata| metadata.torrent_bytes.to_vec())
+            .ok()
+    }
+
+    /// The live engine id for an info hash, if the torrent is in the session.
+    pub fn id_for_hash(&self, info_hash: &str) -> Option<usize> {
+        self.list()
+            .into_iter()
+            .find(|view| view.info_hash.eq_ignore_ascii_case(info_hash))
+            .map(|view| view.id)
     }
 
     /// Stop the session. Call this on shutdown so fast-resume state is flushed.

@@ -123,9 +123,29 @@ pointer movement.
 
 # Phase 2: merging torrents into works, and temporary streaming
 
-> **Phase 2 status: merging is implemented** (`reel-catalog/src/work.rs`,
-> `rows.rs`, the desktop library/detail screens, and the *Merge copies* setting).
-> The temporary-streaming / persisted-library lifecycle below is the next pass.
+> **Phase 2 status: implemented.** Merging lives in `reel-catalog/src/work.rs`
+> and drives the library/detail screens. Temporary streaming is
+> `reel-core/src/streaming.rs` plus `AddOptions::ephemeral`; the durable library
+> is `reel-core/src/library.rs`, used by the desktop backend to keep titles when
+> their torrent is removed. The player defers a play until a re-added title is
+> live, so a temporary stream can be released on stop and brought back on
+> demand. `tests/backend.rs` exercises add → stream → keep → stop against the
+> real engine.
+
+## Implementation notes (streaming pass)
+
+* `reel-core/src/streaming.rs`: a `StorageFactory` whose storage keeps pieces in
+  RAM to a budget and spills whole files to a per-torrent scratch directory.
+  Memory is bounded; spill files are removed when the storage is dropped.
+* `AddOptions::ephemeral` picks that factory; otherwise the session's
+  filesystem storage is used, which is what "Download" means.
+* Because removing a torrent changes its engine id, the desktop backend keys the
+  library by a stable id in a persisted `LibraryStore` and translates to the
+  live engine id internally. A `.torrent` saved per entry makes re-adding offline
+  and immediate.
+* Streaming a title that is not live re-adds it from the saved `.torrent`; the
+  HTTP server waits briefly for an unknown torrent so the player's first range
+  request does not 404 during that window.
 
 ## Merging
 

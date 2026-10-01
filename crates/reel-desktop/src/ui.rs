@@ -76,6 +76,8 @@ pub struct App {
     player_controls_hidden: bool,
     /// Torrent id the player was started from, to return to.
     player_origin: Option<usize>,
+    /// A play request waiting for its temporary torrent to be brought back.
+    pending_play: Option<(usize, usize)>,
     /// The egui context for the current frame, so UI actions triggered deep in
     /// the widget tree can still start playback.
     pending_ctx: Option<egui::Context>,
@@ -126,6 +128,7 @@ impl App {
             player_last_activity: Instant::now(),
             player_controls_hidden: false,
             player_origin: None,
+            pending_play: None,
             pending_ctx: None,
             watch_last_recorded: 0.0,
             watch_recording_for: None,
@@ -387,6 +390,17 @@ impl App {
         selection.extend(companions.iter().copied());
         selection.sort_unstable();
         selection.dedup();
+
+        // A streamed title is removed when playback stops, so playing it again
+        // means bringing it back first. That is asynchronous, so the play waits
+        // for the Ready event rather than opening a player on a missing torrent.
+        if !self.backend.is_live(torrent_id) {
+            self.start_streaming(torrent_id, &selection);
+            self.pending_play = Some((torrent_id, file_id));
+            self.set_toast("Preparing to stream\u{2026}", false);
+            return;
+        }
+
         self.start_streaming(torrent_id, &selection);
         if others > 0 {
             self.set_toast(
@@ -497,6 +511,20 @@ impl App {
                 }
                 BackendEvent::Metadata { .. } | BackendEvent::WatchUpdated => {
                     self.refresh();
+                }
+                BackendEvent::Ready { info_hash } => {
+                    self.refresh();
+                    if let Some((torrent_id, file_id)) = self.pending_play {
+                        let matches = self
+                            .item(torrent_id)
+                            .is_some_and(|item| item.entry.info_hash == info_hash);
+                        if matches {
+                            self.pending_play = None;
+                            if let Some(ctx) = self.pending_ctx.clone() {
+                                self.play_file(&ctx, torrent_id, file_id);
+                            }
+                        }
+                    }
                 }
                 BackendEvent::ApiKeyChecked { ok, message } => {
                     self.set_toast(message, !ok);
@@ -1609,6 +1637,19 @@ impl App {
                     action = Some(DetailAction::MarkWatched);
                 }
 
+                let any_downloading = work.members.iter().any(|member| {
+                    self.item(member.torrent_id())
+                        .is_some_and(|item| item.downloading)
+                });
+                if any_downloading
+                    && ui
+                        .button("Stop download")
+                        .on_hover_text("Delete the kept files and go back to streaming only")
+                        .clicked()
+                {
+                    action = Some(DetailAction::StopDownload);
+                }
+
                 if ui.button("\u{1f5d1}  Remove").clicked() {
                     action = Some(DetailAction::OpenRemove);
                 }
@@ -1697,13 +1738,26 @@ impl App {
                 }
             }
             Some(DetailAction::Download(torrent_id, file_id)) => {
-                self.start_streaming(torrent_id, &[file_id]);
+                self.backend.download_files(torrent_id, &[file_id]);
+                self.invalidate();
             }
             Some(DetailAction::CancelDownload(torrent_id, file_id)) => {
                 self.cancel_file(torrent_id, file_id);
             }
             Some(DetailAction::DownloadEpisodes(selections)) => {
-                self.start_streaming_many(&selections);
+                for (torrent_id, files) in &selections {
+                    self.backend.download_files(*torrent_id, files);
+                }
+                self.invalidate();
+            }
+            Some(DetailAction::StopDownload) => {
+                for member in &work.members {
+                    let torrent_id = member.torrent_id();
+                    if self.item(torrent_id).is_some_and(|item| item.downloading) {
+                        self.backend.stop_download(torrent_id);
+                    }
+                }
+                self.invalidate();
             }
             None => {}
         }
@@ -2187,6 +2241,7 @@ enum DetailAction {
     Download(usize, usize),
     CancelDownload(usize, usize),
     DownloadEpisodes(Vec<(usize, Vec<usize>)>),
+    StopDownload,
 }
 
 /// The stable key an episode's chosen copy is remembered under, for a session.
@@ -3127,6 +3182,11 @@ impl App {
             .player_origin
             .map(Screen::Detail)
             .unwrap_or(Screen::Library);
+        // A stream-only title gives its temporary storage back now; a download
+        // is left alone.
+        if let Some(origin) = self.player_origin {
+            self.backend.stop_streaming(origin);
+        }
         self.refresh();
     }
 }

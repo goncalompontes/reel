@@ -153,6 +153,9 @@ pub async fn add_torrent(
                 download_limit_bps: req.download_limit_bps,
                 initial_peers,
                 pause_multi_file: req.pause_multi_file.unwrap_or(false),
+                // The HTTP API is also how a scripted seed is added; it keeps
+                // filesystem storage unless a caller explicitly asks otherwise.
+                ephemeral: false,
             },
         )
     };
