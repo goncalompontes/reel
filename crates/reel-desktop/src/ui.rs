@@ -263,9 +263,11 @@ impl App {
         let episodes = work.episodes();
         for episode in &episodes {
             for variant in &episode.variants {
+                // Exact, not the torrent-level fallback: a series must never
+                // treat episode 1's position as episode 2's.
                 let resumable = self
                     .item(variant.torrent_id)
-                    .and_then(|item| item.entry.watch_for_file(variant.file_id).cloned())
+                    .and_then(|item| item.entry.watch_by_file.get(&variant.file_id).cloned())
                     .is_some_and(|progress| progress.is_resumable());
                 if resumable {
                     return Some((variant.torrent_id, variant.file_id));
@@ -390,16 +392,7 @@ impl App {
         // Resume the *file* that was actually being watched, not the torrent as
         // a whole: a series is one torrent with many episodes. The torrent-level
         // record is only a fallback for a single-file title.
-        let per_file = item
-            .entry
-            .watch_by_file
-            .get(&file_id)
-            .filter(|progress| progress.is_resumable())
-            .map(|progress| progress.position);
-        let start_at = per_file.or_else(|| {
-            let playable = item.torrent.files.iter().filter(|f| f.included).count();
-            (playable <= 1).then(|| item.resume_position()).flatten()
-        });
+        let start_at = resume_start_at(&item, file_id);
 
         let companions = companion_subtitles(&item.torrent.files, file);
         let subtitles: Vec<(String, String)> = companions
@@ -2025,7 +2018,7 @@ impl App {
 
         let watched = chosen.as_ref().and_then(|variant| {
             self.item(variant.torrent_id)
-                .and_then(|item| item.entry.watch_for_file(variant.file_id).cloned())
+                .and_then(|item| item.entry.watch_by_file.get(&variant.file_id).cloned())
         });
         // Kept is per episode, not per title: downloading one episode of a
         // pack keeps that episode and nothing else.
@@ -2431,6 +2424,22 @@ fn plural(count: usize, singular: &str) -> String {
     } else {
         format!("{count} {singular}s")
     }
+}
+
+/// Where playback of one file should start.
+///
+/// The file's own position is the answer whenever there is one. The torrent's
+/// whole-title position is only borrowed by a **film**, whose single feature is
+/// the only thing its position can mean: for a series it would apply episode 1's
+/// position to episode 2, which is exactly the bug this separates.
+pub fn resume_start_at(item: &LibraryItem, file_id: usize) -> Option<f64> {
+    let per_file = item
+        .entry
+        .watch_by_file
+        .get(&file_id)
+        .filter(|progress| progress.is_resumable())
+        .map(|progress| progress.position);
+    per_file.or_else(|| (!item.entry.is_series()).then(|| item.resume_position()).flatten())
 }
 
 /// What a single file's download is doing, for one row.
@@ -3591,6 +3600,37 @@ mod tests {
         let state = download_state(&item, 0);
         assert!(state.kept && !state.done);
         assert!(state.fraction < 0.3);
+    }
+
+    #[test]
+    fn resume_positions_are_per_file_not_per_torrent() {
+        let mut app = app_with_season_pack();
+        let hash = app.item(9).expect("the pack").entry.info_hash.clone();
+        // Watch episode 1 (file 0) for a while.
+        app.backend
+            .record_watch(&hash, 0, None, None, 123.0, Some(1000.0));
+        app.refresh();
+
+        let item = app.item(9).expect("the pack");
+        assert_eq!(resume_start_at(&item, 0), Some(123.0));
+        assert_eq!(
+            resume_start_at(&item, 1),
+            None,
+            "episode 2 must not inherit episode 1's position"
+        );
+        assert_eq!(resume_start_at(&item, 2), None);
+    }
+
+    #[test]
+    fn a_film_may_borrow_its_torrent_position() {
+        let app = app();
+        let matrix = app.item(1).expect("the matrix");
+        assert!(!matrix.entry.is_series());
+        assert_eq!(
+            resume_start_at(&matrix, 0),
+            matrix.resume_position(),
+            "a film's own record is the only thing its position can mean"
+        );
     }
 
     #[test]
