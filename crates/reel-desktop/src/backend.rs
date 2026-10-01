@@ -1231,6 +1231,17 @@ impl Backend for EngineBackend {
         let has_buffer = self
             .item(id)
             .is_some_and(|item| item.torrent.stats.progress_bytes > 0);
+        let was_paused = self
+            .item(id)
+            .is_some_and(|item| item.torrent.stats.is_paused());
+        tracing::info!(
+            id,
+            live = live_id.is_some(),
+            cache_hit = has_buffer,
+            kept = entry.selected_files.len(),
+            selections = selection.len(),
+            "starting a stream"
+        );
         match live_id {
             Some(engine_id) if has_buffer || !entry.selected_files.is_empty() => {
                 let engine = self.engine.clone();
@@ -1238,8 +1249,10 @@ impl Backend for EngineBackend {
                     if let Err(e) = engine.set_only_files(engine_id, &selection).await {
                         tracing::warn!(error = %e, "could not set the stream selection");
                     }
-                    if let Err(e) = engine.resume(engine_id).await {
-                        tracing::warn!(error = %e, "could not start the stream");
+                    if was_paused {
+                        if let Err(e) = engine.resume(engine_id).await {
+                            tracing::warn!(error = %e, "could not start the stream");
+                        }
                     }
                     events
                         .lock()
@@ -1344,11 +1357,16 @@ impl Backend for EngineBackend {
         // Keep the buffer: pause instead of removing, so a replay in this
         // session is instant. The session cache bounds how much is kept; the
         // least recently watched streams are released when it overflows.
-        if let Some(item) = self.item(id) {
-            if !item.torrent.stats.is_paused() {
-                self.set_paused(id, true);
-            }
-        }
+        // Do NOT pause. A stream-only torrent with no active stream fetches
+        // nothing (the picker has no window to prioritise), so leaving it live
+        // costs no bandwidth, keeps the peer connections warm, and keeps the
+        // buffer — which is what makes the replay instant. Pausing instead
+        // dropped the peers and is where a resume could stall.
+        let progress = self
+            .item(id)
+            .map(|item| item.torrent.stats.progress_bytes)
+            .unwrap_or(0);
+        tracing::info!(id, progress, "kept a stream in the session cache");
         self.touch_cache(id);
         self.enforce_stream_cache();
     }

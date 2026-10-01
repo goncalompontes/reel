@@ -41,6 +41,7 @@ pub const MPV_FORMAT_DOUBLE: c_int = 5;
 
 pub const MPV_EVENT_NONE: c_int = 0;
 pub const MPV_EVENT_SHUTDOWN: c_int = 1;
+pub const MPV_EVENT_LOG_MESSAGE: c_int = 2;
 pub const MPV_EVENT_END_FILE: c_int = 7;
 pub const MPV_EVENT_FILE_LOADED: c_int = 8;
 pub const MPV_EVENT_PROPERTY_CHANGE: c_int = 22;
@@ -77,6 +78,14 @@ pub struct mpv_event_property {
     pub name: *const c_char,
     pub format: c_int,
     pub data: *mut c_void,
+}
+
+#[repr(C)]
+pub struct mpv_event_log_message {
+    pub prefix: *const c_char,
+    pub level: *const c_char,
+    pub text: *const c_char,
+    pub log_level: c_int,
 }
 
 #[repr(C)]
@@ -188,6 +197,7 @@ mpv_fns! {
     fn mpv_observe_property(ctx: MpvHandle, reply_userdata: u64, name: *const c_char, format: c_int) -> c_int;
     fn mpv_wait_event(ctx: MpvHandle, timeout: c_double) -> *mut mpv_event;
     fn mpv_set_wakeup_callback(ctx: MpvHandle, callback: unsafe extern "C" fn(*mut c_void), data: *mut c_void) -> c_int;
+    fn mpv_request_log_messages(ctx: MpvHandle, min_level: *const c_char) -> c_int;
     fn mpv_render_context_create(res: *mut MpvRenderContext, ctx: MpvHandle, params: *mut mpv_render_param) -> c_int;
     fn mpv_render_context_render(ctx: MpvRenderContext, params: *mut mpv_render_param) -> c_int;
     fn mpv_render_context_update(ctx: MpvRenderContext) -> u64;
@@ -252,6 +262,14 @@ impl MpvLib {
 
         let rc = unsafe { (self.mpv_command)(ctx, ptrs.as_ptr()) };
         self.check(rc, || format!("running command {args:?}"))
+    }
+
+    /// Ask mpv to deliver log messages at `level` or above as events, so the
+    /// player's own warnings surface in the app's log instead of vanishing.
+    pub fn request_log_messages(&self, ctx: MpvHandle, level: &str) {
+        if let Ok(level) = to_cstring(level) {
+            unsafe { (self.mpv_request_log_messages)(ctx, level.as_ptr()) };
+        }
     }
 
     pub fn observe(&self, ctx: MpvHandle, id: u64, name: &str, format: c_int) {

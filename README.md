@@ -392,9 +392,11 @@ library, the bytes do not.
 * **A clear download state.** Each row carries its own progress bar while it
   downloads, and turns into **Downloaded** with a *Remove download* button once
   the file is complete — not a forever "Stop download" at 100%.
-* **Replay is instant in the same session.** Leaving the player pauses the
-  stream instead of discarding it, so pressing play again resumes from the
-  buffer. **Settings → Playback → Session cache (MB)** bounds how much is kept
+* **Replay is instant in the same session.** Leaving the player keeps the stream
+  instead of discarding it: a stream-only torrent with no active stream fetches
+  nothing, so it costs no bandwidth, and the buffer *and* the peer connections
+  both survive — pressing play again does not have to reconnect. **Settings →
+  Playback → Session cache (MB)** bounds how much is kept
   across titles (default 1 GiB); the least recently watched streams are released
   when it overflows, and `0` releases each one as soon as playback stops.
 * **The library is durable.** Since a streamed torrent is removed when it stops,

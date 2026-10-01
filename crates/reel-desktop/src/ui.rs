@@ -155,6 +155,21 @@ impl App {
         self.library.len()
     }
 
+    /// Frames the player has decoded and uploaded. Exposed for tests.
+    pub fn frames_uploaded(&self) -> u64 {
+        self.player.frames_uploaded()
+    }
+
+    /// The player's current error, if any. Exposed for tests.
+    pub fn player_error(&self) -> Option<String> {
+        self.player.error().map(str::to_string)
+    }
+
+    /// The player's transport state. Exposed for tests.
+    pub fn player_state(&self) -> reel_player::PlayerState {
+        self.player.state()
+    }
+
     /// Row headings currently laid out. Exposed for tests.
     pub fn row_titles(&self) -> Vec<String> {
         self.rows.iter().map(|row| row.title.clone()).collect()
@@ -430,6 +445,7 @@ impl App {
         self.watch_last_recorded = start_at.unwrap_or(0.0);
         self.watch_recording_for = Some(item.entry.info_hash.clone());
 
+        tracing::info!(%url, start_at = ?start_at, live = file.included, "opening the player");
         let ctx = self
             .pending_ctx
             .clone()

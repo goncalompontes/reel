@@ -289,10 +289,12 @@ impl Engine {
                 .then(|| media_only.then(crate::media::media_only_regex))
                 .flatten(),
             overwrite: opts.allow_overwrite,
-            initial_peers: if opts.initial_peers.is_empty() {
-                None
-            } else {
+            initial_peers: if !opts.initial_peers.is_empty() {
                 Some(opts.initial_peers.clone())
+            } else if !self.config.initial_peers.is_empty() {
+                Some(self.config.initial_peers.clone())
+            } else {
+                None
             },
             ratelimits: LimitsConfig {
                 upload_bps: opts.upload_limit_bps.and_then(NonZeroU32::new),

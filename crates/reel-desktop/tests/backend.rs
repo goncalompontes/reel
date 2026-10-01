@@ -302,12 +302,9 @@ fn streaming_is_temporary_and_downloading_is_opt_in() {
     wait("the first stream to start", Box::new(|| backend.is_live(id)));
 
     backend.stop_streaming(id);
-    wait("the stream to be cached", Box::new(|| {
-        backend.is_live(id)
-            && backend
-                .item(id)
-                .is_some_and(|item| item.torrent.stats.is_paused())
-    }));
+    // It stays live: a stream-only torrent with no active stream fetches
+    // nothing, so the buffer and the peer connections are both kept.
+    wait("the stream to be cached", Box::new(|| backend.is_live(id)));
 
     assert!(
         backend.item(id).is_some(),

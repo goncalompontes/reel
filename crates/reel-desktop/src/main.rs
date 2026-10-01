@@ -55,9 +55,12 @@ fn init_tracing(verbosity: u8) {
         1 => "debug",
         _ => "trace",
     };
-    // librqbit is chatty below warn; keep the app's own logs readable.
+    // librqbit is chatty below warn; keep the app's own logs readable. The
+    // player and the streaming server are kept at a level that shows a stall:
+    // mpv's warnings and the byte ranges the player asked for.
     let filter = format!(
-        "{level},librqbit=warn,librqbit_dht=warn,librqbit_utp=warn,reel_player=warn"
+        "{level},librqbit=warn,librqbit_dht=warn,librqbit_utp=warn,\
+         reel_player=info,reel_http=debug"
     );
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter));

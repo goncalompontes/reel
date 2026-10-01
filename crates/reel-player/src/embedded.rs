@@ -18,7 +18,7 @@
 //! That is cheap enough to keep, and it avoids the GL/FBO interop that would be
 //! required to share a texture with the windowing backend.
 
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_int, c_void, CStr};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -129,6 +129,9 @@ impl EmbeddedCore {
         core.create_render_context()?;
         core.observe_properties();
         core.install_callbacks();
+        // Surface mpv's own warnings: without this they are dropped, and a
+        // stalled stream looks like nothing happening at all.
+        core.lib.request_log_messages(handle, "warn");
 
         // A property rather than an option, so it has to wait until mpv is up.
         core.lib
@@ -531,6 +534,26 @@ impl Worker {
 
     fn handle_event(&mut self, event: &ffi::mpv_event) {
         match event.event_id {
+            ffi::MPV_EVENT_LOG_MESSAGE => {
+                if !event.data.is_null() {
+                    let message = unsafe { &*(event.data as *const ffi::mpv_event_log_message) };
+                    let text = if message.text.is_null() {
+                        String::new()
+                    } else {
+                        unsafe { CStr::from_ptr(message.text) }
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    let prefix = if message.prefix.is_null() {
+                        String::new()
+                    } else {
+                        unsafe { CStr::from_ptr(message.prefix) }
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    tracing::warn!(target: "reel_player::mpv", prefix = %prefix, "{}", text.trim_end());
+                }
+            }
             ffi::MPV_EVENT_PROPERTY_CHANGE => self.handle_property_change(event),
             ffi::MPV_EVENT_FILE_LOADED => {
                 lock_shared(&self.shared).state.loaded = true;

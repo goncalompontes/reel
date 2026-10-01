@@ -31,6 +31,10 @@ pub struct EngineConfig {
     /// Extra trackers added to every torrent.
     pub extra_trackers: Vec<String>,
 
+    /// Peers to connect to for every torrent added, when it does not name its
+    /// own. Useful for a private swarm or another instance on the LAN.
+    pub initial_peers: Vec<std::net::SocketAddr>,
+
     /// Hard cap on connected peers per torrent.
     pub peer_limit: Option<usize>,
 
@@ -64,6 +68,7 @@ impl EngineConfig {
             disable_dht: false,
             disable_trackers: false,
             extra_trackers: Vec::new(),
+            initial_peers: Vec::new(),
             peer_limit: None,
             ipv4_only: false,
             client_name: format!("reel/{}", env!("CARGO_PKG_VERSION")),
