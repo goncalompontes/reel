@@ -237,6 +237,7 @@ fn a_stream_plays_again_after_leaving() {
     let mut controller = PlayerController::new();
     let (frames, why) = play(&mut controller, &ctx, &url, None, 10, Duration::from_secs(90));
     assert!(frames >= 10, "first play produced no frames: {why}");
+    let cores_after_first_play = controller.player_rebuilds();
 
     // The point of the test is a partially buffered stream: if the whole file
     // arrived, a resume proves nothing.
@@ -287,6 +288,11 @@ fn a_stream_plays_again_after_leaving() {
         Duration::from_secs(60),
     );
     assert!(frames >= 10, "second play produced no frames: {why}");
+    assert_eq!(
+        controller.player_rebuilds(),
+        cores_after_first_play,
+        "a replay must reuse the mpv core, not rebuild it"
+    );
     println!(
         "resumed at {resume_at:.2}s with {progress_cached} cached bytes; \
          first {frames} frames in {} ms",

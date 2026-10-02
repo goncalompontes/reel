@@ -3379,8 +3379,11 @@ impl App {
             torrent_id = info.torrent_id,
             file_id = info.file_id,
             frames,
-            "no new frames for 8s; restarting the stream from scratch"
+            "no new frames for 8s; rebuilding the stream and the player"
         );
+        // A wedged picture is as likely to be the decoder as the fetch, so the
+        // core is dropped too; the next play builds a fresh one.
+        self.player.reset();
         self.pending_play = Some((info.torrent_id, info.file_id));
         self.backend.restart_stream(info.torrent_id, &[info.file_id]);
         self.set_toast("Reconnecting the stream\u{2026}", false);

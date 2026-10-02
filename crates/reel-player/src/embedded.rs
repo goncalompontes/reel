@@ -395,6 +395,9 @@ impl Worker {
 
         let mut guard = lock_shared(&self.shared);
         let volume = guard.state.volume;
+        // Drop the previous file's last frame so a reused core does not show it
+        // while the new file loads.
+        guard.frame = None;
         guard.state = PlayerState {
             loaded: true,
             url: Some(url.to_string()),

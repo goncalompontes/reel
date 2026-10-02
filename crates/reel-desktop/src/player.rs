@@ -64,6 +64,9 @@ pub struct PlayerController {
     scrub_position: Option<f64>,
     created_with: Option<PlayerCapability>,
     preferences: PlaybackPreferences,
+    /// How many times the underlying mpv core has been built. A replay reuses
+    /// it; only a wedge or a capability change rebuilds it.
+    rebuilds: u64,
     /// Whether the window is currently fullscreen.
     fullscreen: bool,
 }
@@ -85,6 +88,7 @@ impl PlayerController {
             volume: 100.0,
             scrub_position: None,
             created_with: None,
+            rebuilds: 0,
             preferences: PlaybackPreferences {
                 subtitles_enabled: true,
                 subtitle_language: None,
@@ -225,20 +229,43 @@ impl PlayerController {
         }
         self.created_with = Some(capability.clone());
         self.player = Some(player);
+        self.rebuilds += 1;
         Ok(())
     }
 
+    /// How many mpv cores have been built. Used by tests to prove a replay
+    /// reuses the core instead of rebuilding it.
+    pub fn player_rebuilds(&self) -> u64 {
+        self.rebuilds
+    }
+
     pub fn close(&mut self) {
+        // Stop the current file but keep the mpv core. A replay then reuses its
+        // demuxer cache, index and decoder, which is what makes a resume cheap
+        // instead of a fresh container probe. The core is dropped only by
+        // [`Self::reset`], which a wedged stream calls.
         if let Some(player) = self.player.as_ref() {
             player.set_target_size(None);
             let _ = player.stop();
         }
-        // Drop the whole mpv instance rather than reusing it. A reused core
-        // keeps its demuxer cache, decoder and seek index, and after a seeked
-        // HEVC stream it has been seen to wedge: the server has bytes queued and
-        // mpv simply stops reading them. A fresh core per play costs a few tens
-        // of milliseconds and cannot inherit that state.
-        self.player = None;
+        self.current = None;
+        self.scrub_position = None;
+        self.texture = None;
+        self.last_sequence = 0;
+    }
+
+    /// Drop the mpv core so the next play builds a fresh one.
+    ///
+    /// Only for a stream that has wedged — the server has bytes queued and mpv
+    /// has stopped consuming them, which a fresh decoder clears. Doing this on
+    /// every play was what threw away the cache the session buffer exists to
+    /// exploit.
+    pub fn reset(&mut self) {
+        if let Some(player) = self.player.take() {
+            player.set_target_size(None);
+            let _ = player.stop();
+        }
+        self.created_with = None;
         self.current = None;
         self.scrub_position = None;
         self.texture = None;
