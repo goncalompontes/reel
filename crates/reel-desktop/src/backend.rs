@@ -923,11 +923,7 @@ impl EngineBackend {
                     name: file.name.clone(),
                     mime: reel_core::mime_for_name(&file.name).to_string(),
                     length: file.length,
-                    path: format!(
-                        "/stream/{}/{}",
-                        entry.id,
-                        reel_core::model::percent_encode_path_segment(&file.name)
-                    ),
+                    path: stream_path(entry.id, file.id, &file.name),
                     url: None,
                 },
             })
@@ -1034,6 +1030,16 @@ pub(crate) fn display_title_for_entry(entry: &LibraryEntry) -> (String, Option<u
         }
         None => ("Resolving magnet\u{2026}".to_string(), None),
     }
+}
+
+/// The stream URL path for one file. It is always three segments — torrent id,
+/// file id, name — because a two-segment path makes the router parse the file
+/// name as a file id and answer `400`.
+pub(crate) fn stream_path(torrent_id: usize, file_id: usize, name: &str) -> String {
+    format!(
+        "/stream/{torrent_id}/{file_id}/{}",
+        reel_core::model::percent_encode_path_segment(name)
+    )
 }
 
 /// Where the metadata key and cache live. Read once at startup.
@@ -2176,6 +2182,15 @@ mod tests {
             downloading: false,
             added_at: 0,
         }
+    }
+
+    #[test]
+    fn a_stream_path_names_the_torrent_and_the_file() {
+        let path = stream_path(0, 3, "Show S01E04.mkv");
+        assert_eq!(path, "/stream/0/3/Show%20S01E04.mkv");
+        // Always `stream / <torrent> / <file> / <name>`: a missing file id
+        // makes the router treat the file name as the id and answer 400.
+        assert_eq!(path.trim_start_matches('/').split('/').count(), 4);
     }
 
     #[test]

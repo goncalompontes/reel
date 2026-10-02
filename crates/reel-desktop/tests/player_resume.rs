@@ -106,6 +106,13 @@ fn a_stream_plays_again_after_leaving() {
         return;
     }
 
+    if std::env::var_os("REEL_TEST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("reel_player=debug,reel_http=debug,info")
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
+
     let dir = scratch("run");
     // An MKV, like the real releases: the seek index (cues) is at the end.
     let video = dir.join("clip.mkv");
