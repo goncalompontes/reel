@@ -207,12 +207,48 @@ fn a_pack_streams_and_downloads_only_the_chosen_episode() {
         "downloading one episode must not fetch the whole pack"
     );
 
-    // Stop it again in one action.
-    backend.stop_media_download(vec![MediaDownload {
-        key: "pack#s01e02".into(),
+    // Adding another episode to an existing download must not recycle the
+    // source: it already uses filesystem storage, so the engine only narrows.
+    let engine_before = backend
+        .item(id)
+        .expect("the pack")
+        .torrent
+        .files[0]
+        .stream
+        .torrent_id;
+    backend.download_media(vec![MediaDownload {
+        key: "pack#s01e03".into(),
         torrent_id: id,
-        files: vec![1],
+        files: vec![2],
     }]);
+    wait_until("the second download", || {
+        backend.item(id).is_some_and(|item| item.kept_files.len() == 2)
+    });
+    let engine_after = backend
+        .item(id)
+        .expect("the pack")
+        .torrent
+        .files[0]
+        .stream
+        .torrent_id;
+    assert_eq!(
+        engine_before, engine_after,
+        "adding a download to an existing download must not re-add the source"
+    );
+
+    // Stop both in one action.
+    backend.stop_media_download(vec![
+        MediaDownload {
+            key: "pack#s01e02".into(),
+            torrent_id: id,
+            files: vec![1],
+        },
+        MediaDownload {
+            key: "pack#s01e03".into(),
+            torrent_id: id,
+            files: vec![2],
+        },
+    ]);
     wait_until("the download to stop", || {
         !backend.item(id).expect("the pack").downloading
     });

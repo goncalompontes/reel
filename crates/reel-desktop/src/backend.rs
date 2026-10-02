@@ -727,18 +727,41 @@ impl EngineBackend {
 
     /// Apply the derived download state to the engine for the affected sources.
     ///
-    /// A source with wanted files switches to filesystem storage and runs; one
-    /// with none deletes its files and goes back to a temporary stream.
-    fn apply_download_state(&self, affected: &[String]) {
-        for info_hash in affected {
+    /// A source that changes between stream and download has to be re-added
+    /// (the storage type is fixed at add time). A source that is already a
+    /// download and just gained or lost a file only needs its selection
+    /// narrowed — recycling it would drop the peer connections and the buffer
+    /// for no reason.
+    fn apply_download_state(&self, modes: &[(String, bool)]) {
+        for (info_hash, was_downloading) in modes {
             let Some(entry) = self.snapshot().by_hash(info_hash).cloned() else {
                 continue;
             };
             let keep = entry.selected_files.clone();
-            if keep.is_empty() {
-                self.recycle(entry, false, None, true);
-            } else {
+            let now_downloading = !keep.is_empty();
+            if *was_downloading == now_downloading {
+                if now_downloading {
+                    // Already filesystem storage: narrow in place if live.
+                    let live = self
+                        .live_map()
+                        .get(&entry.info_hash.to_ascii_lowercase())
+                        .copied();
+                    match live {
+                        Some(engine_id) => {
+                            let engine = self.engine.clone();
+                            self.spawn_result("select download files", async move {
+                                engine.set_only_files(engine_id, &keep).await
+                            });
+                        }
+                        None => self.recycle(entry, true, Some(keep), false),
+                    }
+                }
+                continue;
+            }
+            if now_downloading {
                 self.recycle(entry, true, Some(keep), false);
+            } else {
+                self.recycle(entry, false, None, true);
             }
         }
     }
@@ -1500,8 +1523,17 @@ impl Backend for EngineBackend {
             }
         }
         self.save_media();
+        let modes: Vec<(String, bool)> = affected
+            .iter()
+            .map(|hash| {
+                (
+                    hash.clone(),
+                    snapshot.by_hash(hash).is_some_and(|entry| entry.downloading),
+                )
+            })
+            .collect();
         self.rehydrate_downloads();
-        self.apply_download_state(&affected.into_iter().collect::<Vec<_>>());
+        self.apply_download_state(&modes);
     }
 
     fn stop_media_download(&self, items: Vec<MediaDownload>) {
@@ -1535,8 +1567,17 @@ impl Backend for EngineBackend {
             }
         }
         self.save_media();
+        let modes: Vec<(String, bool)> = affected
+            .iter()
+            .map(|hash| {
+                (
+                    hash.clone(),
+                    snapshot.by_hash(hash).is_some_and(|entry| entry.downloading),
+                )
+            })
+            .collect();
         self.rehydrate_downloads();
-        self.apply_download_state(&affected.into_iter().collect::<Vec<_>>());
+        self.apply_download_state(&modes);
     }
 
     fn stop_streaming(&self, id: usize) {
