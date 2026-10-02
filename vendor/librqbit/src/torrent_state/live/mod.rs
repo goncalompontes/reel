@@ -1437,7 +1437,10 @@ impl PeerHandler {
                 let result = pieces.acquire_piece(AcquireRequest {
                     peer: self.addr,
                     peer_avg_time: self.counters.average_piece_download_time(),
-                    priority_pieces: self.state.streams.iter_next_pieces(&self.state.lengths),
+                    priority_pieces: self.state.streams.iter_next_pieces(
+                        &self.state.lengths,
+                        self.state.shared.options.stream_lookahead_bytes(),
+                    ),
                     file_priorities,
                     file_infos: &self.state.metadata.file_infos,
                     peer_has_piece: |p| bf.get(p.get() as usize).map(|v| *v) == Some(true),

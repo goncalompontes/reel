@@ -298,6 +298,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         pause_multi_file: false,
         ephemeral: false,
         only_files: None,
+        preferred_id: None,
     };
 
     // Adds run *after* the API is up, and off the startup path. Resolving a

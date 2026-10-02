@@ -17,7 +17,6 @@ use anyhow::Context;
 use bytes::Bytes;
 use librqbit::api::{Api, TorrentDetailsResponse, TorrentIdOrHash};
 use librqbit::limits::LimitsConfig;
-use librqbit::storage::StorageFactoryExt;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, ListenerMode, ListenerOptions, Session,
     SessionOptions, SessionPersistenceConfig, TorrentStats, TorrentStatsState,
@@ -144,6 +143,14 @@ pub struct AddOptions {
     /// fail and leave the media-only regex in force (the whole pack downloading).
     /// When set, it takes precedence over `only_files_regex`.
     pub only_files: Option<Vec<usize>>,
+
+    /// Re-add under this engine id instead of allocating a new one.
+    ///
+    /// A re-add changes the engine id, and a stream URL embeds it, so a player
+    /// that already opened the old URL would 404. Reusing the id keeps every
+    /// existing URL valid. Only safe when the old torrent has already been
+    /// removed.
+    pub preferred_id: Option<usize>,
 }
 
 impl Default for AddOptions {
@@ -159,6 +166,7 @@ impl Default for AddOptions {
             pause_multi_file: false,
             ephemeral: false,
             only_files: None,
+            preferred_id: None,
         }
     }
 }
@@ -175,6 +183,8 @@ pub struct Engine {
     session: Arc<Session>,
     api: Api,
     config: EngineConfig,
+    /// Temporary directory per ephemeral torrent, removed when it is.
+    stream_dirs: std::sync::Mutex<std::collections::HashMap<usize, std::path::PathBuf>>,
 }
 
 impl Engine {
@@ -245,6 +255,7 @@ impl Engine {
             session,
             api,
             config,
+            stream_dirs: std::sync::Mutex::new(std::collections::HashMap::new()),
         }))
     }
 
@@ -264,22 +275,21 @@ impl Engine {
     }
 
     fn build_add_opts(&self, opts: &AddOptions, media_only: bool) -> AddTorrentOptions {
-        // A stream is temporary: RAM first, spill to scratch, never the
-        // download folder. A download uses the session's filesystem storage.
-        let storage_factory = opts.ephemeral.then(|| {
-            crate::streaming::StreamingStorageFactory::new(
-                self.config.stream_scratch_dir(),
-                self.config.stream_memory_budget,
-            )
-            .boxed()
-        });
-
         AddTorrentOptions {
             paused: opts.paused,
             // A temporary stream fetches only around the playhead; a download
             // fetches everything it selected.
             streaming_only: opts.ephemeral,
+            stream_lookahead_bytes: opts
+                .ephemeral
+                .then_some(self.config.stream_lookahead_bytes as u64),
+            // A stream writes to its own temporary directory (set by `add`);
+            // a download uses the session's download folder. Either way this
+            // is librqbit's own sparse filesystem storage.
             output_folder: opts.output_folder.clone(),
+            // Keep the engine id stable across a re-add, so a stream URL a
+            // player already holds stays valid.
+            preferred_id: opts.preferred_id,
             // An explicit selection wins: it is applied as the torrent
             // initialises, so nothing else is ever briefly selected.
             only_files: opts.only_files.clone(),
@@ -300,7 +310,6 @@ impl Engine {
                 upload_bps: opts.upload_limit_bps.and_then(NonZeroU32::new),
                 download_bps: opts.download_limit_bps.and_then(NonZeroU32::new),
             },
-            storage_factory,
             ..Default::default()
         }
     }
@@ -310,7 +319,22 @@ impl Engine {
     /// With [`AddOptions::media_only`] the engine asks the session to only
     /// download playable files. If that filter matches nothing (rare, but
     /// happens with e.g. disc images), it transparently retries without it.
-    pub async fn add(&self, source: AddSource, opts: AddOptions) -> Result<AddOutcome, EngineError> {
+    pub async fn add(&self, source: AddSource, mut opts: AddOptions) -> Result<AddOutcome, EngineError> {
+        // A stream gets a fresh temporary directory. librqbit's own filesystem
+        // storage writes into it sparsely, so there is no custom storage engine
+        // to maintain and no whole-file buffer.
+        let stream_dir = if opts.ephemeral {
+            match crate::streaming::new_stream_dir(&self.config.stream_scratch_dir()) {
+                Ok(dir) => {
+                    opts.output_folder = Some(dir.display().to_string());
+                    Some(dir)
+                }
+                Err(e) => return Err(EngineError::Other(e.into())),
+            }
+        } else {
+            None
+        };
+
         let add_opts = self.build_add_opts(&opts, opts.media_only);
 
         let response = match self
@@ -321,26 +345,80 @@ impl Engine {
             Ok(r) => r,
             Err(err) if opts.media_only => {
                 warn!(error = %err, "media-only add failed, retrying with all files");
-                self.session
+                match self
+                    .session
                     .add_torrent(
                         self.add_torrent_borrowed(&source),
                         Some(self.build_add_opts(&opts, false)),
                     )
-                    .await?
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(err) => {
+                        if let Some(dir) = &stream_dir {
+                            let _ = std::fs::remove_dir_all(dir);
+                        }
+                        return Err(err.into());
+                    }
+                }
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                if let Some(dir) = &stream_dir {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                return Err(err.into());
+            }
         };
 
         let (id, was_new) = match response {
             AddTorrentResponse::Added(id, _) => (id, true),
             AddTorrentResponse::AlreadyManaged(id, _) => (id, false),
             AddTorrentResponse::ListOnly(_) => {
+                if let Some(dir) = &stream_dir {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
                 return Err(anyhow::anyhow!(
                     "torrent was added in list-only mode, which this engine does not use"
                 )
                 .into());
             }
         };
+
+        // Record the temporary directory so removing the torrent frees it. An
+        // already-managed torrent keeps its existing storage, so its new
+        // directory is unused and removed.
+        if let Some(dir) = stream_dir {
+            if was_new {
+                if let Some(old) = self
+                    .stream_dirs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(id, dir)
+                {
+                    let _ = std::fs::remove_dir_all(old);
+                }
+            } else {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        // If the torrent was already in the session, the add-time selection and
+        // pause state were ignored. Apply them now, so a re-add that races an
+        // existing entry still ends in the state the caller asked for. A
+        // pause with a selection would otherwise leave it stuck.
+        if !was_new {
+            if !opts.paused {
+                let _ = self.resume(id).await;
+            }
+            if let Some(files) = opts.only_files.as_ref().filter(|files| !files.is_empty()) {
+                if let Err(e) = self.set_only_files(id, files).await {
+                    warn!(id, error = %e, "could not apply selection to an existing torrent");
+                }
+            }
+            if opts.paused {
+                let _ = self.pause(id).await;
+            }
+        }
 
         let mut view = self.view(id)?;
         let mut paused_for_selection = false;
@@ -446,6 +524,16 @@ impl Engine {
         self.session
             .delete(TorrentIdOrHash::Id(id), delete_files)
             .await?;
+        // A stream's temporary directory always goes, whether or not the
+        // caller asked for the files to be deleted.
+        if let Some(dir) = self
+            .stream_dirs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id)
+        {
+            let _ = std::fs::remove_dir_all(dir);
+        }
         Ok(())
     }
 
@@ -528,7 +616,6 @@ impl Engine {
 
         Ok(Box::new(stream))
     }
-
     /// [`Engine::stream_from`] from the very beginning of the file.
     pub async fn stream(&self, id: usize, file_id: usize) -> Result<BoxedByteStream, EngineError> {
         self.stream_from(id, file_id, 0).await
@@ -590,6 +677,17 @@ impl Engine {
     /// Stop the session. Call this on shutdown so fast-resume state is flushed.
     pub async fn shutdown(&self) {
         self.session.stop().await;
+        // Free every stream's temporary directory; nothing here is a download.
+        let dirs: Vec<std::path::PathBuf> = self
+            .stream_dirs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, dir)| dir)
+            .collect();
+        for dir in dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     // ---------------------------------------------------------------- mapping

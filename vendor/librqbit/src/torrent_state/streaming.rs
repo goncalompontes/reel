@@ -25,8 +25,10 @@ use super::{ManagedTorrentHandle, TorrentMetadata};
 
 type StreamId = usize;
 
-// 32 mb lookahead by default.
-const PER_STREAM_BUF_DEFAULT: u64 = 32 * 1024 * 1024;
+// How much data around the playhead a stream fetches when no explicit
+// look-ahead is configured. The session's `stream_lookahead_bytes` overrides
+// it; reel sets that from the user's "Stream buffer (MB)" setting.
+pub(crate) const PER_STREAM_BUF_DEFAULT: u64 = 32 * 1024 * 1024;
 
 struct StreamState {
     file_id: usize,
@@ -41,9 +43,15 @@ impl StreamState {
         lengths.compute_current_piece(self.position, self.file_abs_offset)
     }
 
-    fn queue<'a>(&self, lengths: &'a Lengths) -> impl Iterator<Item = ValidPieceIndex> + use<'a> {
+    fn queue<'a>(
+        &self,
+        lengths: &'a Lengths,
+        lookahead: u64,
+    ) -> impl Iterator<Item = ValidPieceIndex> + use<'a> {
         let start = self.file_abs_offset + self.position;
-        let end = (start + PER_STREAM_BUF_DEFAULT).min(self.file_abs_offset + self.file_len);
+        let end = start
+            .saturating_add(lookahead)
+            .min(self.file_abs_offset + self.file_len);
         let dpl = lengths.default_piece_length();
         let start_id = (start / dpl as u64).try_into().unwrap();
         let end_id = end.div_ceil(dpl as u64).try_into().unwrap();
@@ -73,6 +81,7 @@ impl TorrentStreams {
     pub(crate) fn iter_next_pieces<'a>(
         &'a self,
         lengths: &'a Lengths,
+        lookahead: u64,
     ) -> impl Iterator<Item = ValidPieceIndex> + 'a {
         struct Interleave<I> {
             all: VecDeque<I>,
@@ -92,7 +101,11 @@ impl TorrentStreams {
             }
         }
 
-        let mut all: Vec<_> = self.streams.iter().map(|s| s.queue(lengths)).collect();
+        let mut all: Vec<_> = self
+            .streams
+            .iter()
+            .map(|s| s.queue(lengths, lookahead))
+            .collect();
 
         // Shuffle to decrease determinism and make queueing fairer.
         use rand::seq::SliceRandom;

@@ -49,8 +49,10 @@ pub struct EngineConfig {
     /// it off, deliberately.
     pub disable_upload: bool,
 
-    /// How much RAM a stream-only torrent may use before spilling to scratch.
-    pub stream_memory_budget: usize,
+    /// How far ahead of the playhead a stream-only torrent fetches, in bytes.
+    /// This is the window the vendored piece picker is allowed to download;
+    /// beyond it, nothing is fetched until playback advances.
+    pub stream_lookahead_bytes: usize,
 
     /// Where stream-only scratch files are written. `None` uses the OS temp
     /// directory. Nothing here is ever a "download".
@@ -73,7 +75,7 @@ impl EngineConfig {
             ipv4_only: false,
             client_name: format!("reel/{}", env!("CARGO_PKG_VERSION")),
             disable_upload: true,
-            stream_memory_budget: crate::streaming::DEFAULT_MEMORY_BUDGET,
+            stream_lookahead_bytes: 32 * 1024 * 1024,
             stream_scratch_dir: None,
         }
     }
