@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 
 use reel_core::EngineConfig;
-use reel_desktop::backend::{Backend, CatalogOptions, EngineBackend};
+use reel_desktop::backend::{Backend, CatalogOptions, EngineBackend, MediaDownload};
 
 fn scratch_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("reel-test-{}-{name}", std::process::id()));
@@ -190,7 +190,11 @@ fn a_pack_streams_and_downloads_only_the_chosen_episode() {
     assert_eq!(included(&backend), vec![1], "only the played episode is fetched");
 
     // Download episode 2: only it is kept, not the whole pack.
-    backend.download_files(id, &[1]);
+    backend.download_media(vec![MediaDownload {
+        key: "pack#s01e02".into(),
+        torrent_id: id,
+        files: vec![1],
+    }]);
     wait_until("the download to be marked", || {
         backend.item(id).expect("the pack").downloading
     });
@@ -204,7 +208,11 @@ fn a_pack_streams_and_downloads_only_the_chosen_episode() {
     );
 
     // Stop it again in one action.
-    backend.stop_download(id);
+    backend.stop_media_download(vec![MediaDownload {
+        key: "pack#s01e02".into(),
+        torrent_id: id,
+        files: vec![1],
+    }]);
     wait_until("the download to stop", || {
         !backend.item(id).expect("the pack").downloading
     });
@@ -282,16 +290,45 @@ fn streaming_is_temporary_and_downloading_is_opt_in() {
     wait("the torrent to be live", Box::new(|| backend.is_live(id)));
 
     // Keep it: this switches to filesystem storage and marks it a download.
-    backend.download_files(id, &[0]);
+    backend.download_media(vec![MediaDownload {
+        key: "lifecycle#movie".into(),
+        torrent_id: id,
+        files: vec![0],
+    }]);
     wait("the download to be marked", Box::new(|| {
         backend.item(id).is_some_and(|item| item.downloading)
     }));
 
+    // The download is owned by the media and persisted by media key, not by
+    // the torrent's positional file id.
+    {
+        let store =
+            reel_catalog::MediaStore::load(&reel_catalog::MediaStore::path(&dir.join("catalog")));
+        assert!(
+            store.is_downloaded("lifecycle#movie"),
+            "the download must be recorded against the media"
+        );
+        assert_eq!(store.len(), 1);
+    }
+
     // Stop keeping it: files are deleted and it goes back to temporary.
-    backend.stop_download(id);
+    backend.stop_media_download(vec![MediaDownload {
+        key: "lifecycle#movie".into(),
+        torrent_id: id,
+        files: vec![0],
+    }]);
     wait("the download to be cleared", Box::new(|| {
         backend.item(id).is_some_and(|item| !item.downloading)
     }));
+
+    {
+        let store =
+            reel_catalog::MediaStore::load(&reel_catalog::MediaStore::path(&dir.join("catalog")));
+        assert!(
+            !store.is_downloaded("lifecycle#movie"),
+            "stopping a download must clear the media record"
+        );
+    }
 
     // The title is still in the library even though the torrent was recycled.
     assert!(backend.item(id).is_some(), "the library outlives the torrent");
@@ -413,4 +450,90 @@ fn the_bundled_source_searches_through_the_app_backend() {
     println!("torrent: {}", hits[0].torrent_url.as_deref().unwrap_or(""));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A download belongs to the media, not the torrent, so it has to survive a
+/// restart even though the torrent is re-added from its saved `.torrent`.
+#[test]
+fn a_media_download_survives_a_restart() {
+    let dir = scratch_dir("media-restart");
+    std::fs::create_dir_all(dir.join("payload")).unwrap();
+    std::fs::write(dir.join("payload/data.bin"), vec![7u8; 64 * 1024]).unwrap();
+    let torrent_path = dir.join("data.torrent");
+    {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let created = runtime
+            .block_on(reel_core::create_torrent_file(
+                &dir.join("payload"),
+                None,
+                Vec::new(),
+                Some(16 * 1024),
+            ))
+            .expect("create torrent");
+        std::fs::write(&torrent_path, &created.bytes).unwrap();
+    }
+
+    let scratch = scratch_dir("media-restart-state");
+    let data_dir = dir.join("catalog");
+    let download_dir = dir.join("downloads");
+
+    let id = {
+        let backend = EngineBackend::start_with_options(
+            EngineConfig {
+                disable_dht: true,
+                disable_trackers: true,
+                persist_session: false,
+                stream_scratch_dir: Some(scratch.clone()),
+                ..EngineConfig::new(&download_dir)
+            },
+            CatalogOptions {
+                api_key: None,
+                settings: Default::default(),
+                data_dir: data_dir.clone(),
+                disable_bundled_sources: true,
+            },
+        )
+        .expect("backend");
+        backend.add(torrent_path.to_str().unwrap(), true);
+        wait_until("the title", || !backend.library().is_empty());
+        let id = backend.library().into_iter().next().unwrap().torrent.id;
+        backend.download_media(vec![MediaDownload {
+            key: "movie".into(),
+            torrent_id: id,
+            files: vec![0],
+        }]);
+        wait_until("the download", || {
+            backend.item(id).is_some_and(|item| item.downloading)
+        });
+        id
+        // The backend is dropped here, simulating a quit.
+    };
+
+    let backend = EngineBackend::start_with_options(
+        EngineConfig {
+            disable_dht: true,
+            disable_trackers: true,
+            persist_session: false,
+            stream_scratch_dir: Some(scratch.clone()),
+            ..EngineConfig::new(&download_dir)
+        },
+        CatalogOptions {
+            api_key: None,
+            settings: Default::default(),
+            data_dir: data_dir.clone(),
+            disable_bundled_sources: true,
+        },
+    )
+    .expect("restarted backend");
+
+    wait_until("the title after restart", || backend.item(id).is_some());
+    let item = backend.item(id).expect("the title");
+    assert!(
+        item.downloading,
+        "a media download must survive a restart"
+    );
+    assert_eq!(item.kept_files, vec![0]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&scratch);
 }

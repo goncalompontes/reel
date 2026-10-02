@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 
 use reel_catalog::{
     ArchiveOrgBackend, CatalogCache, CatalogEntry, CatalogSettings, FileInput, LookupQuery,
-    Metadata, MetadataProvider, Release, SearchAggregator, SearchResults, TmdbClient, WatchHistory,
-    WatchProgress, analyse, default_data_dir, provider_from_key,
+    MediaRef, MediaStore, Metadata, MetadataProvider, Release, SearchAggregator, SearchResults,
+    TmdbClient, WatchHistory, WatchProgress, analyse, default_data_dir, provider_from_key,
 };
 use reel_core::model::{FileView, StatsView, StreamTarget, TorrentView};
 use reel_core::title::clean_title;
@@ -137,6 +137,19 @@ pub enum BackendEvent {
     SearchFailed { query: String, message: String },
 }
 
+/// One media's download request: the logical media key plus the file(s) that
+/// currently back it. The backend resolves this to a stable
+/// [`reel_catalog::MediaRef`] and persists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaDownload {
+    /// e.g. `meta:tmdb:603#movie` or `meta:tmdb:1396#s01e02`.
+    pub key: String,
+    /// The live torrent holding the file right now.
+    pub torrent_id: usize,
+    /// File ids within that torrent.
+    pub files: Vec<usize>,
+}
+
 pub trait Backend {
     fn capabilities(&self) -> &BackendCapabilities;
     fn base_url(&self) -> &str;
@@ -164,16 +177,16 @@ pub trait Backend {
     /// too.
     fn start_files(&self, id: usize, files: &[usize]);
 
-    /// Keep these files: fetch them to the download folder with persistent
-    /// storage, switching the title out of streaming mode if it was in it.
-    fn download_files(&self, id: usize, files: &[usize]);
+    /// Keep this media, backed by these files. The record is keyed by the
+    /// media (`work.key#s01e02`, `work.key#movie`), not the torrent, and
+    /// replaces any previous copy — so switching the chosen release moves the
+    /// download rather than duplicating it.
+    fn download_media(&self, items: Vec<MediaDownload>);
 
-    /// Stop keeping a download: delete its files and go back to streaming-only.
-    fn stop_download(&self, id: usize);
-
-    /// Stop keeping specific files (an episode, a season, a film copy) while
-    /// leaving any other kept files alone.
-    fn stop_download_files(&self, id: usize, files: &[usize]);
+    /// Stop keeping these files. When a media's last file goes, the media is no
+    /// longer a download; its source deletes the files and goes back to
+    /// streaming.
+    fn stop_media_download(&self, items: Vec<MediaDownload>);
 
     /// Playback has stopped. A title that is not being downloaded is released
     /// so its temporary storage goes away; a download is left alone.
@@ -280,6 +293,9 @@ pub struct EngineBackend {
     catalog: Arc<CatalogState>,
     /// The durable library, independent of which torrents are in the session.
     library: Arc<Mutex<LibraryStore>>,
+    /// Media-keyed download state. This is the source of truth for what is
+    /// being kept; `LibraryEntry::selected_files` is derived from it.
+    media: Arc<Mutex<MediaStore>>,
     /// Stream-only titles whose buffer is being kept for a fast replay, with
     /// the last time each was watched (oldest is evicted first).
     stream_cache: Mutex<HashMap<usize, Instant>>,
@@ -398,6 +414,7 @@ impl EngineBackend {
         });
 
         let library = Arc::new(Mutex::new(LibraryStore::load(&data_dir.join("library.json"))));
+        let media = Arc::new(Mutex::new(MediaStore::load(&MediaStore::path(&data_dir))));
 
         let backend = Self {
             runtime,
@@ -408,10 +425,16 @@ impl EngineBackend {
             shutdown: Mutex::new(Some(shutdown_tx)),
             catalog,
             library,
+            media,
             stream_cache: Mutex::new(HashMap::new()),
             playing: Mutex::new(None),
         };
 
+        // The media store owns what is being kept. Adopt any old per-torrent
+        // state once, then derive `selected_files`/`downloading` from it before
+        // re-adding the downloads.
+        backend.adopt_legacy_downloads();
+        backend.rehydrate_downloads();
         // Bring back the titles the user asked to keep, then enrich.
         backend.restore_downloads();
         backend.enrich_library();
@@ -601,17 +624,113 @@ impl EngineBackend {
         }
     }
 
-    /// Record which files the user asked to keep. A title with none is a
-    /// stream; a title with some is a download that survives a restart.
-    fn set_kept(&self, id: usize, keep: &[usize]) {
-        let mut store = self.library.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = store.entry_mut(id) {
-            entry.selected_files = keep.to_vec();
-            entry.downloading = !keep.is_empty();
+    /// Persist the media-keyed download store.
+    fn save_media(&self) {
+        let media = self.media.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = media.save(&MediaStore::path(&self.catalog.data_dir)) {
+            tracing::warn!(error = %e, "could not save the media store");
         }
-        let snapshot = store.clone();
-        drop(store);
-        let _ = snapshot.save(&self.library_path());
+    }
+
+    /// Adopt state written before downloads were media-keyed. Runs once, when
+    /// the media store is still empty.
+    fn adopt_legacy_downloads(&self) {
+        let mut media = self.media.lock().unwrap_or_else(|e| e.into_inner());
+        if !media.is_empty() {
+            return;
+        }
+        let entries: Vec<LibraryEntry> = self.snapshot().iter().cloned().collect();
+        let mut adopted = false;
+        for entry in &entries {
+            if !entry.downloading || entry.selected_files.is_empty() {
+                continue;
+            }
+            let files: Vec<MediaRef> = entry
+                .files
+                .iter()
+                .filter(|file| entry.selected_files.contains(&file.id))
+                .map(|file| MediaRef::new(entry.info_hash.clone(), file.path.clone()))
+                .collect();
+            if files.is_empty() {
+                continue;
+            }
+            media.adopt_legacy(&entry.info_hash, files, now_unix());
+            adopted = true;
+        }
+        drop(media);
+        if adopted {
+            self.save_media();
+        }
+    }
+
+    /// Recompute each library entry's file selection from the media store.
+    ///
+    /// `selected_files` and `downloading` are a cache for the UI and the
+    /// engine; the media store is the source of truth. A reference resolves by
+    /// path, so a torrent that was re-added or reordered still finds its files.
+    fn rehydrate_downloads(&self) {
+        let media = self
+            .media
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut library = self.library.lock().unwrap_or_else(|e| e.into_inner());
+        let mut changed = false;
+        for entry in library.entries.iter_mut() {
+            let selected = Self::selected_from_store(entry, &media);
+            if entry.selected_files != selected {
+                entry.selected_files = selected;
+                changed = true;
+            }
+            let downloading = !entry.selected_files.is_empty();
+            if entry.downloading != downloading {
+                entry.downloading = downloading;
+                changed = true;
+            }
+        }
+        if changed {
+            if let Err(e) = library.save(&self.library_path()) {
+                tracing::warn!(error = %e, "could not save the library");
+            }
+        }
+    }
+
+    /// The file ids of `entry` wanted by the media store.
+    fn selected_from_store(entry: &LibraryEntry, media: &MediaStore) -> Vec<usize> {
+        let wanted: HashSet<&str> = media
+            .refs_for_info_hash(&entry.info_hash)
+            .map(|file| file.path.as_str())
+            .collect();
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let mut ids: Vec<usize> = entry
+            .files
+            .iter()
+            .filter(|file| wanted.contains(file.path.as_str()))
+            .map(|file| file.id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Apply the derived download state to the engine for the affected sources.
+    ///
+    /// A source with wanted files switches to filesystem storage and runs; one
+    /// with none deletes its files and goes back to a temporary stream.
+    fn apply_download_state(&self, affected: &[String]) {
+        for info_hash in affected {
+            let Some(entry) = self.snapshot().by_hash(info_hash).cloned() else {
+                continue;
+            };
+            let keep = entry.selected_files.clone();
+            if keep.is_empty() {
+                self.recycle(entry, false, None, true);
+            } else {
+                self.recycle(entry, true, Some(keep), false);
+            }
+        }
     }
 
     /// Remember that a stream was watched, for cache eviction order.
@@ -1265,71 +1384,83 @@ impl Backend for EngineBackend {
         }
     }
 
-    fn download_files(&self, id: usize, files: &[usize]) {
-        let Some(entry) = self.snapshot().entry(id).cloned() else {
+    fn download_media(&self, items: Vec<MediaDownload>) {
+        if items.is_empty() {
             return;
-        };
-        // Keep this episode/season/film in addition to whatever is already kept.
-        let mut keep = entry.selected_files.clone();
-        for file in files {
-            if !keep.contains(file) {
-                keep.push(*file);
+        }
+        let snapshot = self.snapshot();
+        let now = now_unix();
+        let mut affected: HashSet<String> = HashSet::new();
+        {
+            let mut media = self.media.lock().unwrap_or_else(|e| e.into_inner());
+            // A key can name files held by more than one torrent; merge them.
+            let mut by_key: HashMap<String, Vec<MediaRef>> = HashMap::new();
+            for item in &items {
+                let Some(entry) = snapshot.entry(item.torrent_id) else {
+                    continue;
+                };
+                affected.insert(entry.info_hash.clone());
+                for id in &item.files {
+                    if let Some(file) = entry.files.iter().find(|file| file.id == *id) {
+                        by_key
+                            .entry(item.key.clone())
+                            .or_default()
+                            .push(MediaRef::new(entry.info_hash.clone(), file.path.clone()));
+                    }
+                }
+            }
+            for (key, files) in by_key {
+                if files.is_empty() {
+                    continue;
+                }
+                // If this media was previously kept from another source, that
+                // source is affected too and has to drop the download.
+                if let Some(old) = media.get(&key) {
+                    for file in &old.files {
+                        affected.insert(file.info_hash.clone());
+                    }
+                }
+                media.keep(key, files, now);
             }
         }
-        keep.sort_unstable();
-        keep.dedup();
-        self.set_kept(id, &keep);
-
-        let entry = self.snapshot().entry(id).cloned().unwrap_or(entry);
-        // Filesystem storage, only the kept files selected, running.
-        self.recycle(entry, true, Some(keep), false);
+        self.save_media();
+        self.rehydrate_downloads();
+        self.apply_download_state(&affected.into_iter().collect::<Vec<_>>());
     }
 
-    fn stop_download_files(&self, id: usize, files: &[usize]) {
-        let Some(entry) = self.snapshot().entry(id).cloned() else {
-            return;
-        };
-        let mut keep: Vec<usize> = entry
-            .selected_files
-            .iter()
-            .copied()
-            .filter(|file| !files.contains(file))
-            .collect();
-        keep.sort_unstable();
-        self.set_kept(id, &keep);
-
-        let entry = self.snapshot().entry(id).cloned().unwrap_or(entry);
-        if keep.is_empty() {
-            // Nothing is kept any more: delete the files and go back to a
-            // temporary, paused stream.
-            self.recycle(entry, false, None, true);
+    fn stop_media_download(&self, items: Vec<MediaDownload>) {
+        if items.is_empty() {
             return;
         }
-        // Keep the rest. A running download just narrows; otherwise re-add it.
-        let live_id = self
-            .live_map()
-            .get(&entry.info_hash.to_ascii_lowercase())
-            .copied();
-        match live_id {
-            Some(engine_id) => {
-                let engine = self.engine.clone();
-                self.spawn_result("stop download", async move {
-                    engine.set_only_files(engine_id, &keep).await
-                });
+        let snapshot = self.snapshot();
+        let mut affected: HashSet<String> = HashSet::new();
+        {
+            let mut media = self.media.lock().unwrap_or_else(|e| e.into_inner());
+            for item in &items {
+                let Some(entry) = snapshot.entry(item.torrent_id) else {
+                    continue;
+                };
+                // If this is the media's last file, the whole record goes and
+                // every source it referenced is affected.
+                if let Some(record) = media.get(&item.key) {
+                    for file in &record.files {
+                        affected.insert(file.info_hash.clone());
+                    }
+                }
+                affected.insert(entry.info_hash.clone());
+                for id in &item.files {
+                    if let Some(file) = entry.files.iter().find(|file| file.id == *id) {
+                        media.stop_file(
+                            &item.key,
+                            &MediaRef::new(entry.info_hash.clone(), file.path.clone()),
+                        );
+                    }
+                }
             }
-            None => self.recycle(entry, true, Some(keep), false),
         }
-    }
-
-    fn stop_download(&self, id: usize) {
-        let kept = self
-            .snapshot()
-            .entry(id)
-            .map(|entry| entry.selected_files.clone())
-            .unwrap_or_default();
-        if !kept.is_empty() {
-            self.stop_download_files(id, &kept);
-        }
+        self.save_media();
+        self.rehydrate_downloads();
+        self.apply_download_state(&affected.into_iter().collect::<Vec<_>>());
     }
 
     fn stop_streaming(&self, id: usize) {
@@ -1668,6 +1799,8 @@ impl Drop for EngineBackend {
 /// An in-memory backend for tests and for `--demo` runs.
 pub struct FakeBackend {
     items: Mutex<Vec<LibraryItem>>,
+    /// Media key -> the files that back it, mirroring the real store.
+    downloads: Mutex<HashMap<String, Vec<(usize, usize)>>>,
     events: Mutex<Vec<BackendEvent>>,
     capabilities: BackendCapabilities,
     base_url: String,
@@ -1679,6 +1812,7 @@ impl FakeBackend {
     pub fn new(items: Vec<LibraryItem>) -> Self {
         Self {
             items: Mutex::new(items),
+            downloads: Mutex::new(HashMap::new()),
             events: Mutex::new(Vec::new()),
             settings: Mutex::new(CatalogSettings::default()),
             capabilities: BackendCapabilities {
@@ -1779,42 +1913,79 @@ impl Backend for FakeBackend {
         }
     }
 
-    fn download_files(&self, id: usize, files: &[usize]) {
-        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(item) = items.iter_mut().find(|i| i.torrent.id == id) {
-            for file in files {
-                if !item.kept_files.contains(file) {
-                    item.kept_files.push(*file);
+    fn download_media(&self, items: Vec<MediaDownload>) {
+        let mut downloads = self.downloads.lock().unwrap_or_else(|e| e.into_inner());
+        let mut library = self.items.lock().unwrap_or_else(|e| e.into_inner());
+        let mut dirty: Vec<usize> = Vec::new();
+        for request in items {
+            let mut files = Vec::new();
+            for id in &request.files {
+                files.push((request.torrent_id, *id));
+            }
+            if files.is_empty() {
+                continue;
+            }
+            downloads.insert(request.key.clone(), files);
+            dirty.push(request.torrent_id);
+        }
+        dirty.sort_unstable();
+        dirty.dedup();
+        for id in dirty {
+            let wanted: HashSet<usize> = downloads
+                .values()
+                .filter(|files| files.iter().any(|(torrent, _)| *torrent == id))
+                .flat_map(|files| files.iter())
+                .filter(|(torrent, _)| *torrent == id)
+                .map(|(_, file)| *file)
+                .collect();
+            if let Some(item) = library.iter_mut().find(|i| i.torrent.id == id) {
+                item.kept_files = wanted.iter().copied().collect();
+                item.kept_files.sort_unstable();
+                item.downloading = !item.kept_files.is_empty();
+                item.torrent.stats.state = "live".to_string();
+                item.torrent.state = "live".to_string();
+                for file in &mut item.torrent.files {
+                    file.included = item.kept_files.contains(&file.id);
                 }
             }
-            item.kept_files.sort_unstable();
-            item.downloading = true;
-            item.torrent.stats.state = "live".to_string();
-            item.torrent.state = "live".to_string();
-            for file in &mut item.torrent.files {
-                file.included = item.kept_files.contains(&file.id);
-            }
         }
     }
 
-    fn stop_download_files(&self, id: usize, files: &[usize]) {
-        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(item) = items.iter_mut().find(|i| i.torrent.id == id) {
-            item.kept_files.retain(|file| !files.contains(file));
-            item.downloading = !item.kept_files.is_empty();
-            if !item.downloading {
-                item.torrent.stats.state = "paused".to_string();
-                item.torrent.state = "paused".to_string();
-            }
-            for file in &mut item.torrent.files {
-                file.included = item.kept_files.contains(&file.id);
+    fn stop_media_download(&self, items: Vec<MediaDownload>) {
+        let mut downloads = self.downloads.lock().unwrap_or_else(|e| e.into_inner());
+        let mut affected: HashSet<usize> = HashSet::new();
+        for item in &items {
+            affected.insert(item.torrent_id);
+            if let Some(files) = downloads.get_mut(&item.key) {
+                files.retain(|(torrent, file)| {
+                    !(*torrent == item.torrent_id && item.files.contains(file))
+                });
+                if files.is_empty() {
+                    downloads.remove(&item.key);
+                }
             }
         }
-    }
-
-    fn stop_download(&self, id: usize) {
-        let kept = self.item(id).map(|item| item.kept_files).unwrap_or_default();
-        self.stop_download_files(id, &kept);
+        let mut library = self.items.lock().unwrap_or_else(|e| e.into_inner());
+        for id in affected {
+            let wanted: HashSet<usize> = downloads
+                .values()
+                .flat_map(|files| files.iter())
+                .filter(|(torrent, _)| *torrent == id)
+                .map(|(_, file)| *file)
+                .collect();
+            if let Some(item) = library.iter_mut().find(|i| i.torrent.id == id) {
+                item.kept_files = wanted.iter().copied().collect();
+                item.kept_files.sort_unstable();
+                item.downloading = !item.kept_files.is_empty();
+                if !item.downloading {
+                    item.torrent.stats.state = "paused".to_string();
+                    item.torrent.state = "paused".to_string();
+                }
+                for file in &mut item.torrent.files {
+                    file.included = item.kept_files.contains(&file.id);
+                }
+            }
+        }
     }
 
     fn stop_streaming(&self, id: usize) {

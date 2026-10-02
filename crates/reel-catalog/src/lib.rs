@@ -28,6 +28,7 @@ pub mod cache;
 pub mod error;
 pub mod history;
 pub mod matching;
+pub mod media;
 pub mod model;
 pub mod provider;
 pub mod release;
@@ -42,6 +43,9 @@ pub use cache::CatalogCache;
 pub use error::CatalogError;
 pub use history::WatchHistory;
 pub use matching::{LookupQuery, MatchScore};
+pub use media::{
+    DownloadRecord, MediaRef, MediaStore, episode_key, episode_key_parts, legacy_key, movie_key,
+};
 pub use model::{
     Artwork, ArtworkKind, ArtworkRef, ArtworkSize, Candidate, CatalogEntry, Metadata, WatchProgress,
 };

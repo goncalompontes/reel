@@ -11,11 +11,11 @@ use std::time::{Duration, Instant};
 use egui::{Color32, CornerRadius, Rect, Sense, Vec2};
 use reel_catalog::{
     ArtworkKind, ArtworkRef, CatalogSettings, RowKind, SearchHit, Work, WorkEpisode, WorkMember,
-    build_work_rows, build_works, separate_works,
+    build_work_rows, build_works, episode_key, movie_key, separate_works,
 };
 use reel_core::fmt;
 
-use crate::backend::{Backend, BackendEvent, LibraryItem, PlayerCapability};
+use crate::backend::{Backend, BackendEvent, LibraryItem, MediaDownload, PlayerCapability};
 use crate::player::{PlaybackInfo, PlaybackStats, PlayerController};
 use crate::theme;
 
@@ -664,24 +664,26 @@ impl App {
         self.invalidate();
     }
 
-    /// The episodes of a season as `(torrent, files)` batches, using the chosen
+    /// The episodes of a season as media-keyed downloads, using the chosen
     /// copy of each episode (or the best one).
-    fn season_selection(&self, work: &Work, season: Option<u32>) -> Vec<(usize, Vec<usize>)> {
-        let mut batches: Vec<(usize, Vec<usize>)> = Vec::new();
+    fn season_downloads(&self, work: &Work, season: Option<u32>) -> Vec<MediaDownload> {
+        let mut items = Vec::new();
         for group in work.seasons() {
             if group.number != season {
                 continue;
             }
             for episode in &group.episodes {
-                let variant = self.chosen_variant(work, episode);
-                let Some(variant) = variant else { continue };
-                match batches.iter_mut().find(|(id, _)| *id == variant.torrent_id) {
-                    Some((_, files)) => files.push(variant.file_id),
-                    None => batches.push((variant.torrent_id, vec![variant.file_id])),
-                }
+                let Some(variant) = self.chosen_variant(work, episode) else {
+                    continue;
+                };
+                items.push(MediaDownload {
+                    key: episode_key(work, episode),
+                    torrent_id: variant.torrent_id,
+                    files: vec![variant.file_id],
+                });
             }
         }
-        batches
+        items
     }
 
     /// The copy of an episode the user picked, else the best one.
@@ -1741,18 +1743,32 @@ impl App {
                     self.play_file(&ctx, torrent_id, file_id);
                 }
             }
-            Some(DetailAction::Download(torrent_id, file_id)) => {
-                self.backend.download_files(torrent_id, &[file_id]);
+            Some(DetailAction::Download {
+                key,
+                torrent_id,
+                file_id,
+            }) => {
+                self.backend.download_media(vec![MediaDownload {
+                    key,
+                    torrent_id,
+                    files: vec![file_id],
+                }]);
                 self.invalidate();
             }
-            Some(DetailAction::CancelDownload(torrent_id, file_id)) => {
-                self.backend.stop_download_files(torrent_id, &[file_id]);
+            Some(DetailAction::CancelDownload {
+                key,
+                torrent_id,
+                file_id,
+            }) => {
+                self.backend.stop_media_download(vec![MediaDownload {
+                    key,
+                    torrent_id,
+                    files: vec![file_id],
+                }]);
                 self.invalidate();
             }
-            Some(DetailAction::DownloadEpisodes(selections)) => {
-                for (torrent_id, files) in &selections {
-                    self.backend.download_files(*torrent_id, files);
-                }
+            Some(DetailAction::DownloadEpisodes(items)) => {
+                self.backend.download_media(items);
                 self.invalidate();
             }
             None => {}
@@ -1838,6 +1854,7 @@ impl App {
                             }
                             download_buttons(
                                 ui,
+                                &movie_key(work),
                                 version.torrent_id,
                                 version.file_id,
                                 state,
@@ -1954,21 +1971,25 @@ impl App {
         self.pause_notice(ui, work);
         ui.add_space(8.0);
 
-        if ui
-            .small_button("Download all episodes")
-            .on_hover_text("Fetch the best copy of every episode")
-            .clicked()
         {
-            let mut batches: Vec<(usize, Vec<usize>)> = Vec::new();
-            for episode in &episodes {
-                if let Some(variant) = self.chosen_variant(work, episode) {
-                    match batches.iter_mut().find(|(id, _)| *id == variant.torrent_id) {
-                        Some((_, files)) => files.push(variant.file_id),
-                        None => batches.push((variant.torrent_id, vec![variant.file_id])),
-                    }
-                }
+            let downloads: Vec<MediaDownload> = episodes
+                .iter()
+                .filter_map(|episode| {
+                    let variant = self.chosen_variant(work, episode)?;
+                    Some(MediaDownload {
+                        key: episode_key(work, episode),
+                        torrent_id: variant.torrent_id,
+                        files: vec![variant.file_id],
+                    })
+                })
+                .collect();
+            if ui
+                .small_button("Download all episodes")
+                .on_hover_text("Fetch the best copy of every episode")
+                .clicked()
+            {
+                *action = Some(DetailAction::DownloadEpisodes(downloads));
             }
-            *action = Some(DetailAction::DownloadEpisodes(batches));
         }
         ui.add_space(8.0);
 
@@ -1992,7 +2013,7 @@ impl App {
                         .clicked()
                     {
                         *action = Some(DetailAction::DownloadEpisodes(
-                            self.season_selection(work, season.number),
+                            self.season_downloads(work, season.number),
                         ));
                     }
                 });
@@ -2127,10 +2148,11 @@ impl App {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if let Some((torrent_id, file_id)) = chosen_pair {
+                            let key = episode_key(work, episode);
                             if ui.small_button("Play").clicked() {
                                 *action = Some(DetailAction::Play(torrent_id, file_id));
                             }
-                            download_buttons(ui, torrent_id, file_id, state, action);
+                            download_buttons(ui, &key, torrent_id, file_id, state, action);
                         }
 
                         if variants.len() > 1 {
@@ -2256,9 +2278,18 @@ enum DetailAction {
     Play(usize, usize),
     PlayWork,
     PlayWorkFromStart,
-    Download(usize, usize),
-    CancelDownload(usize, usize),
-    DownloadEpisodes(Vec<(usize, Vec<usize>)>),
+    Download {
+        key: String,
+        torrent_id: usize,
+        file_id: usize,
+    },
+    CancelDownload {
+        key: String,
+        torrent_id: usize,
+        file_id: usize,
+    },
+    /// Keep every episode of a season (or the whole work) at once.
+    DownloadEpisodes(Vec<MediaDownload>),
 }
 
 /// The stable key an episode's chosen copy is remembered under, for a session.
@@ -2471,6 +2502,7 @@ pub fn download_state(item: &LibraryItem, file_id: usize) -> DownloadState {
 /// on disk — a plain "Downloaded" with a way to remove it.
 fn download_buttons(
     ui: &mut egui::Ui,
+    key: &str,
     torrent_id: usize,
     file_id: usize,
     state: DownloadState,
@@ -2488,21 +2520,33 @@ fn download_buttons(
                 .on_hover_text("Delete the downloaded file")
                 .clicked()
             {
-                *action = Some(DetailAction::CancelDownload(torrent_id, file_id));
+                *action = Some(DetailAction::CancelDownload {
+                    key: key.to_string(),
+                    torrent_id,
+                    file_id,
+                });
             }
         } else if ui
             .small_button("Stop download")
             .on_hover_text("Cancel this download")
             .clicked()
         {
-            *action = Some(DetailAction::CancelDownload(torrent_id, file_id));
+            *action = Some(DetailAction::CancelDownload {
+                key: key.to_string(),
+                torrent_id,
+                file_id,
+            });
         }
     } else if ui
         .small_button("Download")
         .on_hover_text("Keep this on disk")
         .clicked()
     {
-        *action = Some(DetailAction::Download(torrent_id, file_id));
+        *action = Some(DetailAction::Download {
+            key: key.to_string(),
+            torrent_id,
+            file_id,
+        });
     }
 }
 
@@ -3563,7 +3607,11 @@ mod tests {
     fn downloading_one_episode_keeps_only_that_episode() {
         let mut app = app_with_season_pack();
 
-        app.backend.download_files(9, &[1]);
+        app.backend.download_media(vec![MediaDownload {
+            key: "test#episode".into(),
+            torrent_id: 9,
+            files: vec![1],
+        }]);
         app.refresh();
         let item = app.item(9).expect("the pack");
         assert!(item.downloading);
@@ -3578,7 +3626,11 @@ mod tests {
         assert_eq!(included, vec![1], "and only it is fetched");
 
         // Stopping that episode clears the title completely.
-        app.backend.stop_download_files(9, &[1]);
+        app.backend.stop_media_download(vec![MediaDownload {
+            key: "test#episode".into(),
+            torrent_id: 9,
+            files: vec![1],
+        }]);
         app.refresh();
         let item = app.item(9).expect("the pack");
         assert!(!item.downloading);
