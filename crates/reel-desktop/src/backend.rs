@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 use reel_catalog::{
     ArchiveOrgBackend, CatalogCache, CatalogEntry, CatalogSettings, FileInput, LookupQuery,
     MediaRef, MediaStore, Metadata, MetadataProvider, Release, SearchAggregator, SearchResults,
-    TmdbClient, WatchHistory, WatchProgress, analyse, default_data_dir, provider_from_key,
+    TmdbClient, WatchHistory, WatchProgress, Work, WorkMember, analyse, default_data_dir,
+    episode_key_parts, provider_from_key,
 };
 use reel_core::model::{FileView, StatsView, StreamTarget, TorrentView};
 use reel_core::title::clean_title;
@@ -632,14 +633,23 @@ impl EngineBackend {
         }
     }
 
+    /// The media key a file of a torrent belongs to, or `None` if the torrent
+    /// is not in the library.
+    fn media_watch_key(&self, info_hash: &str, file_id: usize) -> Option<String> {
+        let entry = self.snapshot().by_hash(info_hash)?.clone();
+        let release = analyse_entry(&entry);
+        let work_key = self.work_key_for(&entry, &release);
+        Some(Self::media_key_for_release(&work_key, &release, file_id))
+    }
+
     /// Adopt state written before downloads were media-keyed. Runs once, when
-    /// the media store is still empty.
+    /// the media store has no downloads yet.
     fn adopt_legacy_downloads(&self) {
+        let entries: Vec<LibraryEntry> = self.snapshot().iter().cloned().collect();
         let mut media = self.media.lock().unwrap_or_else(|e| e.into_inner());
-        if !media.is_empty() {
+        if media.has_downloads() {
             return;
         }
-        let entries: Vec<LibraryEntry> = self.snapshot().iter().cloned().collect();
         let mut adopted = false;
         for entry in &entries {
             if !entry.downloading || entry.selected_files.is_empty() {
@@ -965,9 +975,22 @@ impl EngineBackend {
             .cloned();
 
         let history = self.catalog.history.lock().unwrap_or_else(|e| e.into_inner());
-        let watch_by_file = history.per_file(&entry.info_hash);
+        let mut watch_by_file = history.per_file(&entry.info_hash);
         let watch = history.get(&entry.info_hash).cloned();
         drop(history);
+
+        // A media-keyed position wins over the per-file one: it follows the
+        // episode to whichever release now holds it.
+        let work_key = self.work_key_for(entry, &release);
+        {
+            let media = self.media.lock().unwrap_or_else(|e| e.into_inner());
+            for file in &entry.files {
+                let key = Self::media_key_for_release(&work_key, &release, file.id);
+                if let Some(progress) = media.watch(&key) {
+                    watch_by_file.insert(file.id, progress.clone());
+                }
+            }
+        }
 
         let mut torrent = match live {
             Some(view) => {
@@ -993,6 +1016,53 @@ impl EngineBackend {
                 release,
                 watch_by_file,
             },
+        }
+    }
+
+    /// The work key the UI groups this entry under.
+    ///
+    /// `Work::single` applies the same identity a merged group does, so the
+    /// media key computed here matches the one the UI computes from its `Work`.
+    fn work_key_for(&self, entry: &LibraryEntry, release: &Release) -> String {
+        let (display_title, year) = if release.title.is_empty() {
+            display_title_for_entry(entry)
+        } else {
+            (release.title.clone(), release.year)
+        };
+        let metadata = self
+            .catalog
+            .metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&entry.info_hash)
+            .cloned();
+        let catalog_entry = CatalogEntry {
+            torrent_id: entry.id,
+            info_hash: entry.info_hash.clone(),
+            display_title,
+            year,
+            metadata,
+            watch: None,
+            release: release.clone(),
+            watch_by_file: Default::default(),
+        };
+        Work::single(WorkMember::new(catalog_entry, entry.primary_file_id)).key
+    }
+
+    /// The media key one file belongs to.
+    fn media_key_for_release(work_key: &str, release: &Release, file_id: usize) -> String {
+        match release
+            .episodes
+            .iter()
+            .find(|episode| episode.file_id == file_id)
+        {
+            Some(episode) => episode_key_parts(
+                work_key,
+                episode.season,
+                episode.episode,
+                episode.air_date.as_deref(),
+            ),
+            None => format!("{work_key}#movie"),
         }
     }
 }
@@ -1539,12 +1609,26 @@ impl Backend for EngineBackend {
         position: f64,
         duration: Option<f64>,
     ) {
+        let progress = WatchProgress {
+            position,
+            duration: duration.filter(|d| d.is_finite() && *d > 0.0),
+            updated_at: now_unix(),
+            file_name: file_name.clone(),
+            title: title.clone(),
+        };
         let mut history = self.catalog.history.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = history.record_file(info_hash, file_id, file_name, title, position, duration) {
             tracing::warn!(error = %e, "could not record watch position");
             return;
         }
         drop(history);
+
+        // Also record it against the media, so the position follows the episode
+        // to whichever release holds it next.
+        if let Some(key) = self.media_watch_key(info_hash, file_id) {
+            let mut media = self.media.lock().unwrap_or_else(|e| e.into_inner());
+            media.record_watch(key, progress);
+        }
 
         // `record` writes every time; throttle it so a playing film does not
         // rewrite the file several times a second.
@@ -1559,6 +1643,8 @@ impl Backend for EngineBackend {
             if let Err(e) = history.save() {
                 tracing::warn!(error = %e, "could not save watch history");
             }
+            drop(history);
+            self.save_media();
         }
     }
 
@@ -1568,7 +1654,14 @@ impl Backend for EngineBackend {
             tracing::warn!(error = %e, "could not mark as finished");
             return;
         }
+        let finished = history.get_file(info_hash, file_id).cloned();
         drop(history);
+        if let (Some(key), Some(progress)) = (self.media_watch_key(info_hash, file_id), finished) {
+            let mut media = self.media.lock().unwrap_or_else(|e| e.into_inner());
+            media.record_watch(key, progress);
+            drop(media);
+            self.save_media();
+        }
         self.push(BackendEvent::WatchUpdated);
     }
 
@@ -1576,6 +1669,12 @@ impl Backend for EngineBackend {
         let mut history = self.catalog.history.lock().unwrap_or_else(|e| e.into_inner());
         let _ = history.forget_file(info_hash, file_id);
         drop(history);
+        if let Some(key) = self.media_watch_key(info_hash, file_id) {
+            let mut media = self.media.lock().unwrap_or_else(|e| e.into_inner());
+            media.forget_watch(&key);
+            drop(media);
+            self.save_media();
+        }
         self.push(BackendEvent::WatchUpdated);
     }
 

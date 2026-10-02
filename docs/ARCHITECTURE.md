@@ -270,13 +270,18 @@ entry that depends on `PATH`. The key is therefore stored in
 editable from the settings page. The environment still wins when it is set, so
 scripts and one-off runs are unaffected.
 
-### Watch positions are per file
+### Watch positions are per file and per media
 
 `WatchHistory` keys entries as `<info hash>#<file id>`. A series is one torrent
 with many episodes, and a single position per torrent would resume episode one at
 episode two's timestamp. Entries without a `#` are the older format and are still
 read, so an existing history is not lost. `History::recent` collapses to one
 entry per torrent, because "continue watching" is about the show, not the file.
+
+Alongside it, the media store (`media.json`) keeps the position by *media key*
+(`work.key#s01e02`), computed the same way the UI's `Work` grouping is. That is
+what lets a resume follow the episode to a different release: the media-keyed
+position is read first, and the per-file history is the fallback.
 
 ### Fetching one file at a time
 
@@ -300,6 +305,21 @@ watched. With realistic sizes — gigabytes per episode, 2 MiB pieces — that i
 negligible; the first version of the test used 700 KB fixtures against the 2 MiB
 default, which put the entire torrent in two pieces and made selection look
 broken when it was working exactly as designed.
+
+### Downloads and resume belong to the media
+
+A download is not a property of a torrent. It is recorded in a media store
+(`reel-catalog/src/media.rs`, persisted as `media.json`) keyed by the media —
+`work.key#movie`, `work.key#s01e02`, or an air date — and it references files by
+`(info hash, path)`, never by the engine's positional `file_id`. The backend
+then *derives* each source's engine selection from the store, so a download
+survives the torrent being re-added, reordered, or replaced by another release,
+and each copy of a film or episode stays independently downloadable. The old
+per-torrent state is adopted once on first run.
+
+Storage was once a hand-rolled `TorrentStorage` (whole files in RAM, spilled to
+scratch). It is now librqbit's own filesystem storage, pointed at a per-stream
+temp directory: sparse files written at their offsets, no whole-file buffer.
 
 ## reel-desktop
 
@@ -325,6 +345,12 @@ broken when it was working exactly as designed.
 * **The catalog cache is where posters render from.** Metadata and images are
   fetched once, written to disk, and referenced as `file://` URIs, so a restart
   costs no API calls and no image downloads.
+* **Downloads are owned by the media, not the torrent.** A `MediaStore`
+  (`media.json`) records what the user asked to keep against a film or episode
+  and the backend reconciles each source from it. The UI passes a media key, and
+  every stream path is built by one tested helper — a two-segment path would
+  make the router read the file name as a file id and answer `400`, which showed
+  up as mpv's "loading failed".
 
 ## Where this goes next
 

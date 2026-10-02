@@ -537,3 +537,81 @@ fn a_media_download_survives_a_restart() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+/// A resume position belongs to the episode, not the torrent, so watching it
+/// in one release must resume the same episode in another release of the show.
+#[test]
+fn a_watch_position_follows_the_episode_to_another_release() {
+    let dir = scratch_dir("watch-follow");
+
+    // Two releases of the same episode: same file name, different bytes, so
+    // they have different info hashes but the same work and episode.
+    let mut torrents = Vec::new();
+    for (name, seed) in [("release-a", 1u8), ("release-b", 2u8)] {
+        let root = dir.join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Show.S01E01.mkv"), vec![seed; 96 * 1024]).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let created = runtime
+            .block_on(reel_core::create_torrent_file(
+                &root,
+                None,
+                Vec::new(),
+                Some(16 * 1024),
+            ))
+            .expect("create torrent");
+        let path = dir.join(format!("{name}.torrent"));
+        std::fs::write(&path, &created.bytes).unwrap();
+        torrents.push(path);
+    }
+
+    let scratch = scratch_dir("watch-follow-state");
+    let backend = EngineBackend::start_with_options(
+        EngineConfig {
+            disable_dht: true,
+            disable_trackers: true,
+            persist_session: false,
+            stream_scratch_dir: Some(scratch.clone()),
+            ..EngineConfig::new(&dir.join("downloads"))
+        },
+        CatalogOptions {
+            api_key: None,
+            settings: Default::default(),
+            data_dir: dir.join("catalog"),
+            disable_bundled_sources: true,
+        },
+    )
+    .expect("backend");
+
+    for torrent in &torrents {
+        backend.add(torrent.to_str().unwrap(), true);
+    }
+    wait_until("both releases", || backend.library().len() == 2);
+
+    let library = backend.library();
+    let first = &library[0];
+    let second = &library[1];
+    let first_hash = first.entry.info_hash.clone();
+    let second_id = second.torrent.id;
+
+    backend.record_watch(&first_hash, 0, None, None, 420.0, Some(1000.0));
+    backend.take_events();
+
+    let follow = backend
+        .item(second_id)
+        .expect("the other release")
+        .entry
+        .watch_by_file
+        .get(&0)
+        .cloned();
+    let resume_matches = follow
+        .as_ref()
+        .is_some_and(|progress| (progress.position - 420.0).abs() < 0.001);
+    assert!(
+        resume_matches,
+        "the other release should resume at the same episode position, got {follow:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&scratch);
+}

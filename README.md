@@ -46,10 +46,11 @@ documented, tested extension point: see
 | Bundled sources | one: the Internet Archive (public domain / CC film) |
 | Settings file as the canonical configuration (not env) | done |
 | Merge copies of a film or show into one title | done |
-| Temporary streaming: memory first, spills to scratch, freed on stop | done |
+| Temporary streaming: sparse scratch storage, freed on stop | done |
 | Streams only the window around the playhead (patched librqbit) | done |
 | Never seeds — upload is compiled out and the session flag is set | done |
-| Downloads are per item, with a Downloaded state and removal | done |
+| Downloads are per media, with a Downloaded state and removal | done |
+| Media store: downloads/resume owned by the film or episode, not the torrent | done |
 | Library survives independently of the torrent session | done |
 | Subtitles: embedded tracks, sidecar files, track and delay controls | done |
 | Audio track, speed and aspect controls; fullscreen + shortcuts | done |
@@ -348,11 +349,11 @@ Two things resume, and they resume independently:
   per torrent: a series is one torrent with many episodes, and one position for
   all of them would resume episode one at episode two's timestamp. Each episode
   row shows its own resume point, and *Continue watching* points at the newest.
-* **What you had already downloaded.** The session is persisted by default, so a
-  part-fetched episode comes back as a part-fetched episode and continues, not
-  as an empty file. Verified by stopping a throttled download partway,
-  restarting, and checking both that progress was retained and that the retained
-  bytes matched the source.
+* **What you asked to keep, per media.** A download is owned by the *media* —
+  a film, an episode, a season — not by the torrent that happens to hold it. It
+  is recorded in a media store keyed by the title and episode, referencing files
+  by path, so it survives the torrent being re-added, reordered, or replaced by
+  another release. See *Streaming is temporary* and *Downloads are per media*.
 
 ## Streaming is temporary
 
@@ -366,45 +367,42 @@ library, the bytes do not.
   ranges, so upstream would fetch a whole episode even for a stream. A small
   vendored patch (`vendor/librqbit`) makes a stream-only torrent fetch **only the
   window around the playhead** — never the beginning of a file you resumed
-  halfway through, and never the whole file. Seeking moves the window.
-* **Storage.** A streamed torrent uses temporary storage: pieces stay in RAM up
-  to a budget (512 MiB by default) and spill, whole files at a time, to a scratch
-  directory under the system temp dir. Nothing is written to your download
-  folder, and the scratch is deleted when the stream is released.
-* **Nothing survives a crash either.** Spill files are unlinked as soon as they
-  are created, so the bytes live only while the process holds them: even
-  `kill -9` frees the space. Empty scratch directories left by a dead process are
-  swept on the next start.
-* **Why not a pure RAM cache.** librqbit's reader trusts the chunk tracker's
-  have-bit and reads storage directly, so an evicted piece is a hard stream
-  error; a bounded cache that evicts is unsafe for a seeker. Keeping whole files
-  while they fit, and spilling the rest, is bounded *and* seek-safe.
-* **Released on stop.** When you leave the player, a title that is not being
-  downloaded is removed from the engine and re-added paused, so its temporary
-  storage is freed. The library keeps the title; playing it again brings it back
-  from the saved `.torrent` (offline, instantly) and the player waits for it.
-* **Downloading is per item.** There is one way to download — a version, an
-  episode, or a whole season — and **Download** / **Stop download** toggle it
-  on that row. The backend keeps the set of files you asked for, and manages
-  storage, re-adding and cleanup behind that. Downloading one episode of a pack
-  keeps that episode and nothing else; playing another episode does not cancel
-  what is already being kept.
+  halfway through, and never the whole file. Seeking moves the window, and the
+  window size is the **Stream buffer (MB)** setting.
+* **Storage is librqbit's own, pointed at a scratch directory.** A streamed
+  torrent does not use a custom storage engine: it uses the engine's filesystem
+  storage in a per-stream directory under the system temp dir. Files are created
+  at their full length and written at their offsets, so unwritten ranges stay
+  sparse holes and only the fetched bytes allocate — there is no whole-file
+  buffer and nothing is written to your download folder.
+* **A crash leaves only the scratch directory.** The scratch files are not
+  secret: a killed process can leave its per-PID directory behind. It is swept on
+  the next start, and releasing the stream deletes it.
+* **Released or cached on stop.** When you leave the player, a stream-only title
+  is kept in the session so replay is instant; it fetches nothing while idle (the
+  picker has no window without an active stream), and the session cache bound
+  (default 1 GiB) evicts the least recently watched. A download is left alone.
+* **Downloads are per media.** There is one way to download — a version, an
+  episode, or a whole season — and **Download** / **Stop download** toggle it on
+  that row. The backend records the intent against the media, resolves it to the
+  files of whichever source holds them, and manages storage, re-adding and
+  cleanup behind that. Downloading one episode of a pack keeps that episode and
+  nothing else; each copy is independently downloadable and removable.
 * **A clear download state.** Each row carries its own progress bar while it
   downloads, and turns into **Downloaded** with a *Remove download* button once
   the file is complete — not a forever "Stop download" at 100%.
 * **Replay is instant in the same session.** Leaving the player keeps the stream
-  instead of discarding it: a stream-only torrent with no active stream fetches
-  nothing, so it costs no bandwidth, and the buffer *and* the peer connections
-  both survive — pressing play again does not have to reconnect. **Settings →
-  Playback → Session cache (MB)** bounds how much is kept
-  across titles (default 1 GiB); when it overflows the least recently watched
-  streams are released, but the one you just left is kept even if it alone
-  exceeds the cap — evicting what you are about to resume would be the wrong
-  choice. `0` releases each stream as soon as playback stops.
-* **The library is durable.** Since a streamed torrent is removed when it stops,
+  instead of discarding it: the buffer *and* the peer connections both survive,
+  and pressing play again does not have to reconnect. **Settings → Playback →
+  Session cache (MB)** bounds how much is kept across titles (default 1 GiB);
+  when it overflows the least recently watched streams are released, but the one
+  you just left is kept even if it alone exceeds the cap — evicting what you are
+  about to resume would be the wrong choice. `0` releases each stream as soon as
+  playback stops.
+* **The library is durable.** A streamed torrent can be removed when it stops, so
   a persisted `library.json` (plus a saved `.torrent` per title) is what makes a
-  title stay in the library. Downloads are re-added at startup; streams wait
-  until you play them.
+  title stay in the library, and a persisted `media.json` is what makes a
+  download and its resume point survive independently of it.
 
 ## One title, several torrents
 
@@ -495,8 +493,11 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the reasoning.
 * **Metadata enrichment runs in the background.** At most two lookups are in
   flight at once, each title is attempted once per session, and results arrive
   as events, so a library of two hundred titles does not stall the first frame.
-* **Watch positions are keyed by info hash**, not torrent id, so they survive a
-  restart, and writes are throttled to a few seconds.
+* **Watch positions are keyed by info hash and by media**, so they survive a
+  restart and follow an episode to whichever release holds it; writes are
+  throttled to a few seconds. **Downloads are keyed by media** (a film or an
+  episode) and reference files by path, so they survive a torrent being
+  re-added or replaced by another release.
 
 ## Notes and caveats
 
