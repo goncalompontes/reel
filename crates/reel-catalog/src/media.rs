@@ -77,6 +77,10 @@ pub struct MediaStore {
     /// an episode to whichever release now holds it.
     #[serde(default)]
     pub watch: BTreeMap<String, WatchProgress>,
+    /// The source the user last chose for a media, so the copy chooser is not
+    /// a per-session in-memory thing.
+    #[serde(default)]
+    pub chosen: BTreeMap<String, MediaRef>,
 }
 
 impl MediaStore {
@@ -121,6 +125,16 @@ impl MediaStore {
 
     pub fn forget_watch(&mut self, key: &str) {
         self.watch.remove(key);
+    }
+
+    /// Remember which source the user chose for a media.
+    pub fn choose(&mut self, key: impl Into<String>, source: MediaRef) {
+        self.chosen.insert(key.into(), source);
+    }
+
+    /// The source the user last chose for a media.
+    pub fn chosen(&self, key: &str) -> Option<&MediaRef> {
+        self.chosen.get(key)
     }
 
     /// Whether any media has a saved position (used by the migration check).
@@ -387,6 +401,22 @@ mod tests {
         assert_ne!(
             episode_key_parts("show", Some(1), Some(2), None),
             episode_key_parts("show", Some(1), Some(3), None)
+        );
+    }
+
+    #[test]
+    fn a_chosen_source_is_remembered() {
+        let mut store = MediaStore::default();
+        store.choose("show#s01e01", MediaRef::new("bbb", "E01.mkv"));
+        assert_eq!(
+            store.chosen("show#s01e01"),
+            Some(&MediaRef::new("bbb", "E01.mkv"))
+        );
+        // Choosing again replaces it; the chooser is not a per-session thing.
+        store.choose("show#s01e01", MediaRef::new("ccc", "E01.mkv"));
+        assert_eq!(
+            store.chosen("show#s01e01"),
+            Some(&MediaRef::new("ccc", "E01.mkv"))
         );
     }
 

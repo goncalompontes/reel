@@ -5,7 +5,7 @@
 //! comes from [`Backend`], so the same UI runs against a real engine or an
 //! in-memory fake in tests.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use egui::{Color32, CornerRadius, Rect, Sense, Vec2};
@@ -47,8 +47,6 @@ pub struct App {
     works: Vec<Work>,
     /// Row layout, resolved to work (lead torrent) ids.
     rows: Vec<RowLayout>,
-    /// Which copy of an episode the user picked, keyed by work and episode.
-    episode_choice: HashMap<String, (usize, usize)>,
     /// The remove dialog: which work, and which of its torrents are ticked.
     show_remove: Option<usize>,
     remove_selected: HashSet<usize>,
@@ -114,7 +112,6 @@ impl App {
             library: Vec::new(),
             works: Vec::new(),
             rows: Vec::new(),
-            episode_choice: HashMap::new(),
             show_remove: None,
             remove_selected: HashSet::new(),
             remove_files: false,
@@ -692,12 +689,12 @@ impl App {
         work: &'a Work,
         episode: &'a WorkEpisode,
     ) -> Option<&'a reel_catalog::EpisodeVariant> {
-        let key = episode_choice_key(work, episode);
-        if let Some((torrent_id, file_id)) = self.episode_choice.get(&key) {
+        let key = episode_key(work, episode);
+        if let Some((torrent_id, file_id)) = self.backend.chosen_source(&key) {
             if let Some(variant) = episode
                 .variants
                 .iter()
-                .find(|variant| variant.torrent_id == *torrent_id && variant.file_id == *file_id)
+                .find(|variant| variant.torrent_id == torrent_id && variant.file_id == file_id)
             {
                 return Some(variant);
             }
@@ -2055,7 +2052,7 @@ impl App {
                 fraction: 0.0,
             });
 
-        let key = episode_choice_key(work, episode);
+        let key = episode_key(work, episode);
         let code = episode.code();
         let name = info
             .as_ref()
@@ -2166,9 +2163,10 @@ impl App {
                                         fmt::human_bytes(variant.size)
                                     );
                                     if ui.selectable_label(selected, label).clicked() {
-                                        self.episode_choice.insert(
+                                        self.backend.choose_source(
                                             key.clone(),
-                                            (variant.torrent_id, variant.file_id),
+                                            variant.torrent_id,
+                                            variant.file_id,
                                         );
                                         ui.close();
                                     }
@@ -2290,17 +2288,6 @@ enum DetailAction {
     },
     /// Keep every episode of a season (or the whole work) at once.
     DownloadEpisodes(Vec<MediaDownload>),
-}
-
-/// The stable key an episode's chosen copy is remembered under, for a session.
-fn episode_choice_key(work: &Work, episode: &WorkEpisode) -> String {
-    format!(
-        "{}|{:?}|{:?}|{}",
-        work.key,
-        episode.season,
-        episode.episode,
-        episode.air_date.as_deref().unwrap_or("")
-    )
 }
 
 /// Subtitle files that belong to a video file.

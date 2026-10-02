@@ -189,6 +189,13 @@ pub trait Backend {
     /// streaming.
     fn stop_media_download(&self, items: Vec<MediaDownload>);
 
+    /// Remember which source the user chose for a media, so the copy chooser
+    /// survives a restart.
+    fn choose_source(&self, key: String, torrent_id: usize, file_id: usize);
+
+    /// The user's chosen source for a media, as `(torrent id, file id)`.
+    fn chosen_source(&self, key: &str) -> Option<(usize, usize)>;
+
     /// Playback has stopped. A title that is not being downloaded is released
     /// so its temporary storage goes away; a download is left alone.
     fn stop_streaming(&self, id: usize);
@@ -1580,6 +1587,33 @@ impl Backend for EngineBackend {
         self.apply_download_state(&modes);
     }
 
+    fn choose_source(&self, key: String, torrent_id: usize, file_id: usize) {
+        let Some(entry) = self.snapshot().entry(torrent_id).cloned() else {
+            return;
+        };
+        let Some(file) = entry.files.iter().find(|file| file.id == file_id) else {
+            return;
+        };
+        let reference = MediaRef::new(entry.info_hash.clone(), file.path.clone());
+        {
+            let mut media = self.media.lock().unwrap_or_else(|e| e.into_inner());
+            media.choose(key, reference);
+        }
+        self.save_media();
+    }
+
+    fn chosen_source(&self, key: &str) -> Option<(usize, usize)> {
+        let reference = self
+            .media
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .chosen(key)
+            .cloned()?;
+        let entry = self.snapshot().by_hash(&reference.info_hash)?.clone();
+        let file = entry.files.iter().find(|file| file.path == reference.path)?;
+        Some((entry.id, file.id))
+    }
+
     fn stop_streaming(&self, id: usize) {
         let Some(entry) = self.snapshot().entry(id).cloned() else {
             return;
@@ -1947,6 +1981,8 @@ pub struct FakeBackend {
     items: Mutex<Vec<LibraryItem>>,
     /// Media key -> the files that back it, mirroring the real store.
     downloads: Mutex<HashMap<String, Vec<(usize, usize)>>>,
+    /// Media key -> the copy the user chose.
+    chosen: Mutex<HashMap<String, (usize, usize)>>,
     events: Mutex<Vec<BackendEvent>>,
     capabilities: BackendCapabilities,
     base_url: String,
@@ -1959,6 +1995,7 @@ impl FakeBackend {
         Self {
             items: Mutex::new(items),
             downloads: Mutex::new(HashMap::new()),
+            chosen: Mutex::new(HashMap::new()),
             events: Mutex::new(Vec::new()),
             settings: Mutex::new(CatalogSettings::default()),
             capabilities: BackendCapabilities {
@@ -2132,6 +2169,21 @@ impl Backend for FakeBackend {
                 }
             }
         }
+    }
+
+    fn choose_source(&self, key: String, torrent_id: usize, file_id: usize) {
+        self.chosen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, (torrent_id, file_id));
+    }
+
+    fn chosen_source(&self, key: &str) -> Option<(usize, usize)> {
+        self.chosen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .copied()
     }
 
     fn stop_streaming(&self, id: usize) {
