@@ -82,7 +82,11 @@ fn main() {
     let mut textures_uploaded = 0usize;
     let mut last_texture_size = (0usize, 0usize);
 
-    while controller.frames_uploaded() < want_frames {
+    // Wait for `want_frames` frames to reach egui as textures, not for the
+    // player to report that many decoded. The UI coalesces frames when several
+    // are published between two `video_ui` calls, so counting decoded frames
+    // would exit with fewer textures than asked for.
+    while textures_uploaded < want_frames as usize {
         if Instant::now() > deadline {
             println!("backend=embedded");
             println!("error=timed out");
