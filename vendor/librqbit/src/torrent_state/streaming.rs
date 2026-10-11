@@ -412,3 +412,108 @@ impl FileStream {
         self.file_len
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PIECE_LEN: u32 = 16384;
+
+    fn make_lengths(num_pieces: u32) -> Lengths {
+        Lengths::new(PIECE_LEN as u64 * num_pieces as u64, PIECE_LEN).unwrap()
+    }
+
+    fn make_stream(file_abs_offset: u64, file_len: u64, position: u64) -> StreamState {
+        StreamState {
+            file_id: 0,
+            file_len,
+            file_abs_offset,
+            position,
+            waker: None,
+        }
+    }
+
+    fn window(state: &StreamState, lengths: &Lengths, lookahead: u64) -> Vec<u32> {
+        state.queue(lengths, lookahead).map(|p| p.get()).collect()
+    }
+
+    #[test]
+    fn test_stream_window_empty_with_zero_lookahead() {
+        let lengths = make_lengths(10);
+        let s = make_stream(0, lengths.total_length(), 0);
+        assert!(window(&s, &lengths, 0).is_empty());
+    }
+
+    #[test]
+    fn test_stream_window_rounds_up_to_piece_boundaries() {
+        let lengths = make_lengths(10);
+        let s = make_stream(0, lengths.total_length(), 0);
+
+        // Any lookahead short of the next piece boundary still only needs the
+        // piece under the playhead.
+        assert_eq!(window(&s, &lengths, 1), vec![0]);
+        assert_eq!(window(&s, &lengths, PIECE_LEN as u64 - 1), vec![0]);
+        // Landing exactly on the boundary is exclusive (half-open window).
+        assert_eq!(window(&s, &lengths, PIECE_LEN as u64), vec![0]);
+        // One byte past pulls in the next piece.
+        assert_eq!(window(&s, &lengths, PIECE_LEN as u64 + 1), vec![0, 1]);
+    }
+
+    #[test]
+    fn test_stream_window_tracks_playhead() {
+        let lengths = make_lengths(10);
+        let piece_len = PIECE_LEN as u64;
+
+        // Playhead at the start of piece 1 with a one-piece lookahead.
+        let s = make_stream(0, lengths.total_length(), piece_len);
+        assert_eq!(window(&s, &lengths, piece_len), vec![1]);
+
+        // A wider lookahead spans the following pieces.
+        let s = make_stream(0, lengths.total_length(), piece_len);
+        assert_eq!(window(&s, &lengths, piece_len * 3), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_stream_window_clamped_to_file_end() {
+        let lengths = make_lengths(10);
+        let file_len = lengths.total_length();
+
+        // Huge lookahead near the end must not read past the file's last piece.
+        let s = make_stream(0, file_len, file_len - 1);
+        assert_eq!(window(&s, &lengths, u64::MAX), vec![9]);
+    }
+
+    #[test]
+    fn test_stream_window_empty_at_eof() {
+        let lengths = make_lengths(10);
+        let file_len = lengths.total_length();
+        let s = make_stream(0, file_len, file_len);
+        assert!(window(&s, &lengths, PIECE_LEN as u64 * 4).is_empty());
+    }
+
+    #[test]
+    fn test_stream_window_respects_file_offset() {
+        let lengths = make_lengths(10);
+        let piece_len = PIECE_LEN as u64;
+
+        // A 3-piece file starting at piece 1 of a larger torrent.
+        let file_abs_offset = piece_len;
+        let file_len = piece_len * 3;
+        let s = make_stream(file_abs_offset, file_len, 0);
+
+        assert_eq!(window(&s, &lengths, piece_len), vec![1]);
+        assert_eq!(window(&s, &lengths, piece_len * 2), vec![1, 2]);
+        // Even an unbounded lookahead stops at this file's last piece; pieces
+        // belonging to other files are never included.
+        assert_eq!(window(&s, &lengths, u64::MAX), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_stream_current_piece_tracks_playhead() {
+        let lengths = make_lengths(10);
+        let s = make_stream(0, lengths.total_length(), PIECE_LEN as u64 + 5);
+        let cur = s.current_piece(&lengths).unwrap();
+        assert_eq!(cur.id.get(), 1);
+        assert_eq!(cur.piece_remaining, PIECE_LEN - 5);
+    }
+}

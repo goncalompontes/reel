@@ -91,12 +91,24 @@ impl TmdbProvider {
             return Ok(Some(cached));
         }
 
-        let found = match query.kind {
-            MediaKind::Series => self.resolve_series(&query).await?,
-            // A film, or a torrent too ambiguous to call: the film catalogue is
-            // the better guess, and matching will reject a bad one anyway.
-            _ => self.client.resolve(&query).await?,
-        };
+        // The release-name parse decides which catalogue is *preferred*, but it
+        // is a guess: a series pack named without episode markers parses as a
+        // film, and a film named like a show as a series. Trying the other
+        // catalogue when the first finds nothing is what turns a miss into a
+        // match, which is why so many torrents showed no details.
+        let mut found = None;
+        for kind in [query.kind, other_catalogue(query.kind)] {
+            let mut attempt = query.clone();
+            attempt.kind = kind;
+            let result = match kind {
+                MediaKind::Series => self.resolve_series(&attempt).await?,
+                _ => self.client.resolve(&attempt).await?,
+            };
+            if let Some(metadata) = result {
+                found = Some(metadata);
+                break;
+            }
+        }
 
         let Some(mut metadata) = found else {
             return Ok(None);
@@ -431,6 +443,15 @@ impl MetadataProvider for StaticProvider {
 ///
 /// Includes the kind and season: the same title can be both a film and a series,
 /// and two seasons of one series are different lookups.
+/// The catalogue to try when the preferred one finds nothing: film <-> series.
+/// `Unknown` prefers film first, so its fallback is series.
+fn other_catalogue(kind: MediaKind) -> MediaKind {
+    match kind {
+        MediaKind::Series => MediaKind::Movie,
+        _ => MediaKind::Series,
+    }
+}
+
 fn query_index_key(query: &LookupQuery) -> String {
     let title = crate::matching::normalize(&query.title).replace(' ', "-");
     let kind = match query.kind {

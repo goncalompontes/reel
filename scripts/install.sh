@@ -22,6 +22,8 @@ PREFIX="${PREFIX:-$HOME/.local}"
 DESTDIR="${DESTDIR:-}"
 DO_BUILD=1
 WITH_SERVICE=0
+WITH_SOLVER=1
+SOLVER_PORT=""
 UNINSTALL=0
 QUIET=0
 
@@ -43,6 +45,8 @@ Options:
   --destdir DIR     Staging root, for packaging. Default: empty
   --no-build        Do not run cargo; use existing release binaries
   --with-service    Also install a systemd user unit for `reel serve`
+  --without-solver  Do not install the bundled Cloudflare solver (ext.to)
+  --solver-port N   Port the bundled solver listens on. Default: 8391
   --uninstall       Remove everything this script installs
   -q, --quiet       Only print problems
   -h, --help        This message
@@ -59,6 +63,8 @@ while [ $# -gt 0 ]; do
     --destdir) DESTDIR="${2:?--destdir needs a directory}"; shift 2 ;;
     --no-build) DO_BUILD=0; shift ;;
     --with-service) WITH_SERVICE=1; shift ;;
+    --without-solver) WITH_SOLVER=0; shift ;;
+    --solver-port) SOLVER_PORT="${2:?--solver-port needs a number}"; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;
     -q|--quiet) QUIET=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -79,6 +85,7 @@ APP_DIR="$PREFIX/share/applications"
 ICON_SCALABLE_DIR="$PREFIX/share/icons/hicolor/scalable/apps"
 LICENSE_DIR="$PREFIX/share/licenses/reel"
 SERVICE_DIR="$(systemd_user_dir)"
+SOLVER_DIR="$PREFIX/lib/reel/solver"
 
 # Raster sizes installed alongside the scalable icon: not every launcher and
 # taskbar reads SVG.
@@ -147,6 +154,14 @@ do_uninstall() {
     [ -d "$(DEST "$dir")" ] && rmdir --ignore-fail-on-non-empty -p "$(DEST "$dir")" 2>/dev/null || true
   done
 
+  # The bundled solver is a directory tree (a Python venv plus FlareSolverr), so
+  # it is not in `installed_files`.
+  if [ -d "$(DEST "$SOLVER_DIR")" ]; then
+    rm -rf "$(DEST "$SOLVER_DIR")"
+    say "  removed $SOLVER_DIR"
+    rmdir --ignore-fail-on-non-empty -p "$(DEST "$PREFIX/lib/reel")" 2>/dev/null || true
+  fi
+
   refresh_caches
   say "Done. Your data in ~/.local/share/reel was left alone."
 }
@@ -208,6 +223,21 @@ do_install() {
       > "$(DEST "$SERVICE_DIR/reel.service")"
     chmod 644 "$(DEST "$SERVICE_DIR/reel.service")"
     say "  $SERVICE_DIR/reel.service"
+  fi
+
+  # The Cloudflare solver that ext.to needs, installed beside the binary. reel
+  # finds it relative to its own path and starts it on demand.
+  if [ "$WITH_SOLVER" -eq 1 ]; then
+    say ""
+    if [ -n "$DESTDIR" ]; then
+      say "Note: not installing the bundled solver into a staging tree. Run"
+      say "  scripts/install-solver.sh --prefix <real prefix>"
+      say "from the package's post-install step so ext.to works."
+    elif [ -n "$SOLVER_PORT" ]; then
+      "$HERE/install-solver.sh" --prefix "$PREFIX" --port "$SOLVER_PORT"
+    else
+      "$HERE/install-solver.sh" --prefix "$PREFIX"
+    fi
   fi
 
   refresh_caches

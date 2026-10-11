@@ -101,6 +101,7 @@ impl WatchHistory {
                     .collect(),
                 Err(e) => {
                     tracing::warn!(path = %path.display(), error = %e, "ignoring unreadable watch history");
+                    reel_core::quarantine_corrupt(&path);
                     BTreeMap::new()
                 }
             },

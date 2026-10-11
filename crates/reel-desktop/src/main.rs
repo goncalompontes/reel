@@ -101,10 +101,7 @@ fn init_tracing(verbosity: u8) {
 }
 
 fn default_download_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join("Downloads").join("reel");
-    }
-    PathBuf::from("./reel-downloads")
+    reel_core::paths::download_dir()
 }
 
 fn main() -> eframe::Result<()> {

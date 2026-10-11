@@ -19,10 +19,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use reel_catalog::{
-    ArchiveOrgBackend, CatalogCache, CatalogEntry, CatalogSettings, FileInput, LookupQuery,
-    MediaRef, MediaStore, Metadata, MetadataProvider, Release, SearchAggregator, SearchResults,
-    TmdbClient, WatchHistory, WatchProgress, Work, WorkMember, analyse, default_data_dir,
-    episode_key_parts, provider_from_key,
+    CatalogCache, CatalogEntry, CatalogSettings, FileInput, LookupQuery, MediaRef, MediaStore,
+    Metadata, MetadataProvider, Release, SearchAggregator, SearchResults, TmdbClient, WatchHistory,
+    WatchProgress, Work, WorkMember, analyse, default_data_dir, episode_key_parts,
+    provider_from_key,
 };
 use reel_core::model::{FileView, StatsView, StreamTarget, TorrentView};
 use reel_core::title::clean_title;
@@ -34,8 +34,38 @@ use reel_core::{
 /// a library can be large.
 const MAX_CONCURRENT_LOOKUPS: usize = 2;
 
+/// How many distinct works from one search to look up. A search may return many
+/// releases for one work; they share one lookup, and a broad query must not
+/// create an unbounded stream of TMDB requests.
+const MAX_SEARCH_LOOKUPS: usize = 16;
+
+/// Search metadata is nonessential UI enrichment; serialize requests so a large
+/// result set does not burst at the provider.
+const MAX_SEARCH_CONCURRENCY: usize = 1;
+/// Minimum spacing between starting search metadata lookups.
+const SEARCH_LOOKUP_DELAY: Duration = Duration::from_millis(400);
+
+/// How many extra pages a search streams in after the first batch. A source
+/// that paginates keeps filling the list until it runs out; this bounds a
+/// source that never stops.
+const MAX_SEARCH_ROUNDS: usize = 20;
+
 /// Minimum gap between writing watch positions to disk.
 const HISTORY_WRITE_INTERVAL: Duration = Duration::from_secs(3);
+
+/// How long the settings page's cache figures are reused before the cache
+/// directory is walked again. The walk is cheap but not free, and the page is
+/// redrawn many times a second; the numbers are trivia, so a little staleness
+/// is invisible and a disk walk per frame is not.
+const CACHE_STATS_TTL: Duration = Duration::from_secs(2);
+
+/// The cache figures the settings page shows, and when they were measured.
+#[derive(Debug, Clone, Copy)]
+struct CacheStats {
+    measured_at: Instant,
+    metadata_files: usize,
+    bytes: u64,
+}
 
 /// How video will be shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,21 +151,84 @@ impl LibraryItem {
 pub enum BackendEvent {
     Info(String),
     Error(String),
-    Added { id: usize, title: String },
+    Added {
+        id: usize,
+        title: String,
+    },
     /// Metadata arrived for a torrent, so the UI should refresh.
-    Metadata { info_hash: String },
+    Metadata {
+        info_hash: String,
+    },
+    /// Metadata arrived for a search result, so the list should refresh.
+    SearchMetadata,
+    /// Wake the search metadata dispatcher after a miss or a pacing delay.
+    SearchLookupReady,
     /// A title that had to be brought back into the session is now live and can
     /// be streamed. Payback may have been requested before that.
-    Ready { info_hash: String },
+    Ready {
+        info_hash: String,
+    },
+    /// A search result was added to play: its files have resolved, so the UI
+    /// should open the player on this file.
+    PlayReady {
+        torrent_id: usize,
+        file_id: usize,
+    },
+    /// Progress for an add/play initiated from a search result.
+    SearchActionProgress {
+        key: String,
+        phase: SearchActionPhase,
+    },
+    /// A search-result add/play has either completed or failed.
+    SearchActionFinished {
+        key: String,
+    },
     /// Watch positions changed.
     WatchUpdated,
     /// The result of checking an API key.
-    ApiKeyChecked { ok: bool, message: String },
+    ApiKeyChecked {
+        ok: bool,
+        message: String,
+    },
     /// Results for a search. Carries the query so a stale answer for an older
     /// query can be recognised and dropped.
-    SearchResults { query: String, results: SearchResults },
+    SearchResults {
+        query: String,
+        results: SearchResults,
+    },
+    /// More results for a search already shown, streamed in as later pages
+    /// arrive. Carries the query for the same stale-answer reason.
+    SearchHitsAdded {
+        query: String,
+        hits: Vec<reel_catalog::SearchHit>,
+    },
+    /// No more results are coming for a search.
+    SearchStreamEnded {
+        query: String,
+    },
     /// A search that could not run at all.
-    SearchFailed { query: String, message: String },
+    SearchFailed {
+        query: String,
+        message: String,
+    },
+}
+
+/// User-visible stages while adding or playing a search result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchActionPhase {
+    ResolvingMagnet,
+    Adding,
+    PreparingPlayback,
+}
+
+impl SearchActionPhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ResolvingMagnet => "Fetching magnet…",
+            Self::Adding => "Adding…",
+            Self::PreparingPlayback => "Starting playback…",
+        }
+    }
 }
 
 /// One media's download request: the logical media key plus the file(s) that
@@ -232,7 +325,36 @@ pub trait Backend {
     fn forget_watch(&self, info_hash: &str, file_id: usize);
 
     /// Start a search. Results arrive as [`BackendEvent::SearchResults`].
-    fn search(&self, query: &str);
+    ///
+    /// The whole query — text plus any year/season/episode filters — is passed,
+    /// so backends that understand a filter can use it.
+    fn search(&self, query: &reel_catalog::SearchQuery);
+    /// Add a search result. A hit with no magnet yet (an index site that hides
+    /// it behind the torrent's page) is resolved first, then added.
+    fn add_search_hit(&self, hit: reel_catalog::SearchHit, media_only: bool);
+
+    /// Add a search result and start streaming it: resolve the magnet if
+    /// needed, add the torrent, and open the player on its best file once the
+    /// files resolve. Emits [`BackendEvent::PlayReady`] when it is time.
+    fn play_search_hit(&self, _hit: reel_catalog::SearchHit, _media_only: bool) {}
+
+    /// Start metadata lookups for search results, so the list can show a rating
+    /// and a year next to each. Best-effort and bounded; the results are read
+    /// back with [`Backend::search_metadata`].
+    fn enrich_search(&self, _hits: &[reel_catalog::SearchHit]) {}
+
+    /// Metadata matched to a search result, once [`Backend::enrich_search`] has
+    /// had a chance to run.
+    fn search_metadata(&self, _hit: &reel_catalog::SearchHit) -> Option<Metadata> {
+        None
+    }
+
+    /// How many metadata lookups are still running. The UI keeps repainting
+    /// while any are, so results appear as they arrive without a mouse move.
+    fn pending_lookups(&self) -> usize {
+        0
+    }
+
     /// The configured search sources, for the settings page.
     fn search_sources(&self) -> Vec<SourceInfo>;
 
@@ -265,9 +387,27 @@ struct CatalogState {
     metadata: Mutex<HashMap<String, Metadata>>,
     in_flight: Mutex<HashSet<String>>,
     attempted: Mutex<HashSet<String>>,
+    /// Metadata matched to search results, keyed by title and year, and the set
+    /// of keys already looked up so a miss is not retried every refresh.
+    search_metadata: Mutex<HashMap<String, Metadata>>,
+    /// Memoized raw-release-name -> parsed-work key. The UI asks for metadata on
+    /// every visible row every frame, so parsing the release name must not recur
+    /// on that hot path.
+    search_key_cache: Mutex<HashMap<String, String>>,
+    search_attempted: Mutex<HashSet<String>>,
+    /// Distinct metadata identities considered for the current search. Unlike
+    /// the process-wide attempt cache, this is reset for each new query and is
+    /// the actual per-search request budget.
+    search_budget_used: Mutex<HashSet<String>>,
+    /// Search metadata lookups still running.
+    search_in_flight: Mutex<usize>,
+    /// Last time a search metadata request started, shared across searches.
+    search_lookup_started: Mutex<Option<Instant>>,
+    /// Ensures only one timer wakes the UI to dispatch the next paced request.
+    search_retry_scheduled: Mutex<bool>,
     history: Mutex<WatchHistory>,
     last_history_write: Mutex<Instant>,
-    search: SearchAggregator,
+    search: Mutex<Arc<SearchAggregator>>,
 }
 
 impl CatalogState {
@@ -275,6 +415,30 @@ impl CatalogState {
         self.provider
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The current search backends. Swapped when the search settings change.
+    fn search(&self) -> Arc<SearchAggregator> {
+        self.search
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn search_key(&self, hit: &reel_catalog::SearchHit) -> String {
+        let raw_key = format!(
+            "{}|{}",
+            hit.title,
+            hit.year.map_or_else(String::new, |year| year.to_string())
+        );
+        let mut cache = self
+            .search_key_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache
+            .entry(raw_key)
+            .or_insert_with(|| search_metadata_key(hit))
             .clone()
     }
 
@@ -309,6 +473,9 @@ pub struct EngineBackend {
     stream_cache: Mutex<HashMap<usize, Instant>>,
     /// The title currently playing, which is never evicted.
     playing: Mutex<Option<usize>>,
+    /// Last measured cache figures, so the settings page does not walk the
+    /// cache directory on every frame.
+    cache_stats: Mutex<Option<CacheStats>>,
 }
 
 impl EngineBackend {
@@ -347,6 +514,18 @@ impl EngineBackend {
             buffer_mb.saturating_mul(1024 * 1024)
         };
 
+        // Network settings from the Settings tab. They are fixed at engine
+        // start, so a change takes effect on the next run.
+        {
+            let settings = &catalog_options.settings;
+            config.listen_port = settings.listen_port.filter(|port| *port != 0);
+            config.disable_dht = !settings.dht_enabled;
+            config.disable_trackers = !settings.trackers_enabled;
+            config.enable_upnp = settings.enable_upnp;
+            config.ipv4_only = settings.ipv4_only;
+            config.peer_limit = settings.peer_limit;
+        }
+
         let engine = runtime.block_on(Engine::new(config))?;
 
         let listener = runtime.block_on(reel_http::bind(([127, 0, 0, 1], 0).into()))?;
@@ -379,7 +558,9 @@ impl EngineBackend {
                         Some(note),
                     ),
                     Err(_) => (
-                        PlayerCapability::Unavailable { reason: note.clone() },
+                        PlayerCapability::Unavailable {
+                            reason: note.clone(),
+                        },
                         Some(note),
                     ),
                 }
@@ -399,14 +580,22 @@ impl EngineBackend {
             player_note,
         };
 
-        // The one backend we ship: the Internet Archive, which serves
-        // public-domain and Creative Commons film. Anything else is the
-        // operator's to add — see docs/ADDING_A_SOURCE.md.
-        let mut backends: Vec<Box<dyn reel_catalog::search::SearchBackend>> = Vec::new();
-        if !catalog_options.disable_bundled_sources {
-            backends.push(Box::new(ArchiveOrgBackend::new()));
+        // ext.to is the only bundled backend. Whether it is registered and its
+        // credentials come from saved settings; `disable_bundled_sources` is the
+        // test/CLI master switch that turns it off.
+        let search = Arc::new(build_search(
+            &catalog_options.settings,
+            catalog_options.disable_bundled_sources,
+        ));
+
+        // Warm the sources in the background: ext.to clears its Cloudflare
+        // challenge here, so the first search is not the one that waits for it.
+        {
+            let warm = search.clone();
+            runtime.spawn(async move {
+                warm.warm().await;
+            });
         }
-        let search = SearchAggregator::new(backends);
 
         let catalog = Arc::new(CatalogState {
             provider: Mutex::new(provider),
@@ -416,12 +605,21 @@ impl EngineBackend {
             metadata: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashSet::new()),
             attempted: Mutex::new(HashSet::new()),
+            search_metadata: Mutex::new(HashMap::new()),
+            search_key_cache: Mutex::new(HashMap::new()),
+            search_attempted: Mutex::new(HashSet::new()),
+            search_budget_used: Mutex::new(HashSet::new()),
+            search_in_flight: Mutex::new(0),
+            search_lookup_started: Mutex::new(None),
+            search_retry_scheduled: Mutex::new(false),
             history: Mutex::new(history),
             last_history_write: Mutex::new(Instant::now() - HISTORY_WRITE_INTERVAL),
-            search,
+            search: Mutex::new(search),
         });
 
-        let library = Arc::new(Mutex::new(LibraryStore::load(&data_dir.join("library.json"))));
+        let library = Arc::new(Mutex::new(LibraryStore::load(
+            &data_dir.join("library.json"),
+        )));
         let media = Arc::new(Mutex::new(MediaStore::load(&MediaStore::path(&data_dir))));
 
         let backend = Self {
@@ -436,6 +634,7 @@ impl EngineBackend {
             media,
             stream_cache: Mutex::new(HashMap::new()),
             playing: Mutex::new(None),
+            cache_stats: Mutex::new(None),
         };
 
         // The media store owns what is being kept. Adopt any old per-torrent
@@ -497,6 +696,39 @@ impl EngineBackend {
         }
     }
 
+    /// Clear the saved pause on these sources, because the user asked them to
+    /// run again (a new download, or a resume).
+    fn clear_paused(&self, hashes: &std::collections::HashSet<String>) {
+        let mut store = self.library.lock().unwrap_or_else(|e| e.into_inner());
+        let mut changed = false;
+        for entry in store.entries.iter_mut() {
+            if entry.paused && hashes.contains(&entry.info_hash) {
+                entry.paused = false;
+                changed = true;
+            }
+        }
+        if changed {
+            let snapshot = store.clone();
+            drop(store);
+            let _ = snapshot.save(&self.library_path());
+        }
+    }
+
+    /// The per-torrent rate caps from settings, in bytes per second. `0`/unset
+    /// means unlimited.
+    fn rate_limits(&self) -> (Option<u32>, Option<u32>) {
+        let settings = self.settings();
+        let kib = |value: Option<u32>| {
+            value
+                .filter(|kib| *kib > 0)
+                .map(|kib| kib.saturating_mul(1024))
+        };
+        (
+            kib(settings.upload_limit_kib),
+            kib(settings.download_limit_kib),
+        )
+    }
+
     fn snapshot(&self) -> LibraryStore {
         self.library
             .lock()
@@ -538,6 +770,7 @@ impl EngineBackend {
         let engine = self.engine.clone();
         let events = self.events.clone();
         let data_dir = self.catalog.data_dir.clone();
+        let (upload_limit_bps, download_limit_bps) = self.rate_limits();
 
         self.runtime.spawn(async move {
             // Re-add under the same engine id so any stream URL a player
@@ -571,16 +804,14 @@ impl EngineBackend {
             // Add it already in the state it should end in. Trying to resume a
             // just-added torrent does not work (it is still initialising), and
             // with the selection applied at add there is no burst to guard
-            // against anyway.
-            let running = start.is_some() || downloading;
-            let selection = start
-                .clone()
-                .filter(|files| !files.is_empty())
-                .or_else(|| {
-                    downloading
-                        .then(|| entry.selected_files.clone())
-                        .filter(|files| !files.is_empty())
-                });
+            // against anyway. A play (`start`) always runs; a restored download
+            // honours a pause the user set before the last shutdown.
+            let running = start.is_some() || (downloading && !entry.paused);
+            let selection = start.clone().filter(|files| !files.is_empty()).or_else(|| {
+                downloading
+                    .then(|| entry.selected_files.clone())
+                    .filter(|files| !files.is_empty())
+            });
             let options = AddOptions {
                 media_only: selection.is_none(),
                 only_files: selection,
@@ -589,6 +820,8 @@ impl EngineBackend {
                 ephemeral: !downloading,
                 pause_multi_file: false,
                 preferred_id,
+                upload_limit_bps,
+                download_limit_bps,
                 ..Default::default()
             };
 
@@ -611,9 +844,15 @@ impl EngineBackend {
             queue.push(BackendEvent::Metadata {
                 info_hash: entry.info_hash.clone(),
             });
-            queue.push(BackendEvent::Ready {
-                info_hash: entry.info_hash.clone(),
-            });
+            // Only a running (unpaused, selected) torrent can actually be
+            // streamed. A demote to idle streaming is re-added paused with no
+            // selection, and announcing it as ready would let a racing play open
+            // a URL that never produces bytes.
+            if running {
+                queue.push(BackendEvent::Ready {
+                    info_hash: entry.info_hash.clone(),
+                });
+            }
         });
     }
 
@@ -686,11 +925,7 @@ impl EngineBackend {
     /// engine; the media store is the source of truth. A reference resolves by
     /// path, so a torrent that was re-added or reordered still finds its files.
     fn rehydrate_downloads(&self) {
-        let media = self
-            .media
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let media = self.media.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let mut library = self.library.lock().unwrap_or_else(|e| e.into_inner());
         let mut changed = false;
         for entry in library.entries.iter_mut() {
@@ -781,6 +1016,31 @@ impl EngineBackend {
             .insert(id, Instant::now());
     }
 
+    /// Cached metadata-file count and total bytes, re-measured only when the
+    /// memoized value is older than [`CACHE_STATS_TTL`].
+    fn cache_stats(&self) -> (usize, u64) {
+        let mut slot = self.cache_stats.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh = slot
+            .as_ref()
+            .filter(|stats| stats.measured_at.elapsed() < CACHE_STATS_TTL)
+            .map(|stats| (stats.metadata_files, stats.bytes));
+        if let Some(figures) = fresh {
+            return figures;
+        }
+        let stats = CacheStats {
+            measured_at: Instant::now(),
+            metadata_files: self.catalog.cache.metadata_count(),
+            bytes: self.catalog.cache.total_bytes(),
+        };
+        *slot = Some(stats);
+        (stats.metadata_files, stats.bytes)
+    }
+
+    /// Forget the memoized cache figures, so the next status read re-measures.
+    fn invalidate_cache_stats(&self) {
+        *self.cache_stats.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     /// Release the least recently watched stream buffers once the session cache
     /// is over its limit. Streams with downloads attached are left alone; the
     /// title currently playing is never evicted.
@@ -789,6 +1049,11 @@ impl EngineBackend {
         let cap = cap_mb as u64 * 1024 * 1024;
         let store = self.snapshot();
         let playing = *self.playing.lock().unwrap_or_else(|e| e.into_inner());
+
+        // A cap of zero means "keep nothing": every stopped stream is released,
+        // so the just-stopped title is not protected the way it is under a real
+        // cap.
+        let protect_keep = cap_mb != 0;
 
         let mut used = 0u64;
         let mut candidates: Vec<(Instant, u64, usize, String)> = Vec::new();
@@ -807,7 +1072,7 @@ impl EngineBackend {
             // episode may exceed the cap on its own, and evicting the title you
             // are about to resume is exactly the wrong choice. Older streams go
             // first.
-            if Some(entry.id) != playing && Some(entry.id) != keep {
+            if Some(entry.id) != playing && (!protect_keep || Some(entry.id) != keep) {
                 let last = self
                     .stream_cache
                     .lock()
@@ -826,6 +1091,12 @@ impl EngineBackend {
         for (_, bytes, store_id, hash) in candidates {
             if cap_mb != 0 && used <= cap {
                 break;
+            }
+            // Re-read `playing`: a stream can start between building the
+            // candidate list and evicting, and evicting what just started would
+            // 404 the player's next range request.
+            if Some(store_id) == *self.playing.lock().unwrap_or_else(|e| e.into_inner()) {
+                continue;
             }
             let engine = self.engine.clone();
             self.runtime.spawn(async move {
@@ -878,13 +1149,21 @@ impl EngineBackend {
                 continue;
             }
             {
-                let in_flight = self.catalog.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                let in_flight = self
+                    .catalog
+                    .in_flight
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if in_flight.contains(&key) || in_flight.len() >= MAX_CONCURRENT_LOOKUPS {
                     continue;
                 }
             }
             {
-                let mut attempted = self.catalog.attempted.lock().unwrap_or_else(|e| e.into_inner());
+                let mut attempted = self
+                    .catalog
+                    .attempted
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if !attempted.insert(key.clone()) {
                     continue;
                 }
@@ -894,7 +1173,7 @@ impl EngineBackend {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(key.clone());
-            to_start.push((key, analyse_entry(&entry)));
+            to_start.push((key, analyse_entry(entry)));
         }
 
         for (info_hash, release) in to_start {
@@ -938,6 +1217,79 @@ impl EngineBackend {
                 Ok(None) => tracing::debug!(%info_hash, "no metadata match"),
                 Err(e) => tracing::debug!(%info_hash, error = %e, "metadata lookup failed"),
             }
+        });
+    }
+
+    fn schedule_search_retry(&self, delay: Duration) {
+        let mut scheduled = self
+            .catalog
+            .search_retry_scheduled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *scheduled {
+            return;
+        }
+        *scheduled = true;
+        drop(scheduled);
+
+        let state = self.catalog.clone();
+        let events = self.events.clone();
+        self.runtime.spawn(async move {
+            tokio::time::sleep(delay).await;
+            *state
+                .search_retry_scheduled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = false;
+            events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(BackendEvent::SearchLookupReady);
+        });
+    }
+
+    /// Look up one search result's title in the background and remember it.
+    fn spawn_search_lookup(&self, key: String, hit: reel_catalog::SearchHit) {
+        let provider = self.catalog.provider();
+        let state = self.catalog.clone();
+        let events = self.events.clone();
+
+        self.runtime.spawn(async move {
+            let query = search_lookup_query(&hit);
+            let metadata_updated = match provider.lookup(query).await {
+                Ok(Some(metadata)) => {
+                    tracing::debug!(title = %metadata.title, "matched search metadata");
+                    state
+                        .search_metadata
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(key, metadata);
+                    true
+                }
+                Ok(None) => {
+                    tracing::debug!(%key, "no metadata match for a search result");
+                    false
+                }
+                Err(e) => {
+                    tracing::debug!(%key, error = %e, "search metadata lookup failed");
+                    false
+                }
+            };
+
+            let mut in_flight = state
+                .search_in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *in_flight = in_flight.saturating_sub(1);
+            drop(in_flight);
+
+            events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(if metadata_updated {
+                    BackendEvent::SearchMetadata
+                } else {
+                    BackendEvent::SearchLookupReady
+                });
         });
     }
 
@@ -1004,7 +1356,11 @@ impl EngineBackend {
             .get(&entry.info_hash)
             .cloned();
 
-        let history = self.catalog.history.lock().unwrap_or_else(|e| e.into_inner());
+        let history = self
+            .catalog
+            .history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut watch_by_file = history.per_file(&entry.info_hash);
         let watch = history.get(&entry.info_hash).cloned();
         drop(history);
@@ -1110,8 +1466,52 @@ pub(crate) fn analyse_torrent(torrent: &TorrentView) -> Release {
     analyse(&files)
 }
 
-/// The same judgement, from the library's stored file list, so metadata can be
-/// looked up for a title that is not currently in the session.
+/// Build the lightweight TMDB query used for search cards. Search cards need
+/// work-level metadata (poster, rating and overview), not episode stills; a
+/// season or episode in the release therefore must not turn one show into many
+/// separate TMDB requests.
+fn search_lookup_query(hit: &reel_catalog::SearchHit) -> LookupQuery {
+    let release = reel_catalog::release::analyse_name(&hit.title);
+    let mut query = LookupQuery::from_release(&release);
+    if query.title.trim().is_empty() {
+        query.title = hit.title.clone();
+    }
+    if let Some(year) = hit.year {
+        query.year = Some(year);
+    }
+    query.season = None;
+    query.seasons.clear();
+    query.air_dates.clear();
+    query.episodes.clear();
+    query
+}
+
+/// The metadata key for a search result is its parsed work identity, not the
+/// raw release name. `The.Bear.S03E01.1080p...` and `The.Bear.S03E02.720p...`
+/// should share one lookup.
+fn search_metadata_key(hit: &reel_catalog::SearchHit) -> String {
+    let query = search_lookup_query(hit);
+    let title = reel_catalog::matching::normalize(&query.title);
+    let kind = match query.kind {
+        reel_catalog::MediaKind::Movie => "movie",
+        reel_catalog::MediaKind::Series => "series",
+        reel_catalog::MediaKind::Unknown => "unknown",
+    };
+    format!(
+        "{kind}|{title}|{}",
+        query.year.map_or_else(String::new, |year| year.to_string())
+    )
+}
+
+fn claim_search_lookup_budget(budget: &mut HashSet<String>, key: &str) -> bool {
+    budget.len() < MAX_SEARCH_LOOKUPS && budget.insert(key.to_string())
+}
+
+fn search_lookup_delay_remaining(last_started: Instant, now: Instant) -> Option<Duration> {
+    let elapsed = now.saturating_duration_since(last_started);
+    (elapsed < SEARCH_LOOKUP_DELAY).then(|| SEARCH_LOOKUP_DELAY - elapsed)
+}
+
 pub(crate) fn analyse_entry(entry: &LibraryEntry) -> Release {
     let files: Vec<FileInput> = entry
         .files
@@ -1168,10 +1568,203 @@ impl CatalogOptions {
         let settings = CatalogSettings::load(&data_dir);
         Self {
             api_key: settings.api_key(),
-            disable_bundled_sources: !settings.enable_bundled_sources,
+            // Tests can still set this directly to force an empty source set.
+            disable_bundled_sources: !settings.ext_to_enabled,
             settings,
             data_dir,
         }
+    }
+}
+
+/// Build the search aggregator from settings. `disable_bundled_sources` is the
+/// test/CLI override that registers nothing.
+fn build_search(settings: &CatalogSettings, disable_bundled_sources: bool) -> SearchAggregator {
+    if disable_bundled_sources {
+        return SearchAggregator::new(Vec::new());
+    }
+    SearchAggregator::new(reel_catalog::backends::bundled(settings))
+}
+
+/// Whether a settings change affects the search sources, so the aggregator must
+/// be rebuilt.
+fn search_settings_differ(a: &CatalogSettings, b: &CatalogSettings) -> bool {
+    a.ext_to_enabled != b.ext_to_enabled
+        || a.ext_to_base_url != b.ext_to_base_url
+        || a.ext_to_cookie != b.ext_to_cookie
+        || a.ext_to_user_agent != b.ext_to_user_agent
+        || a.ext_to_solver_url != b.ext_to_solver_url
+}
+
+/// The handles every add needs, so `add_source` keeps a manageable signature.
+#[derive(Clone)]
+struct AddContext {
+    engine: Arc<Engine>,
+    events: Arc<Mutex<Vec<BackendEvent>>>,
+    library: Arc<Mutex<LibraryStore>>,
+    data_dir: std::path::PathBuf,
+}
+
+impl EngineBackend {
+    fn add_context(&self) -> AddContext {
+        AddContext {
+            engine: self.engine.clone(),
+            events: self.events.clone(),
+            library: self.library.clone(),
+            data_dir: self.catalog.data_dir.clone(),
+        }
+    }
+}
+
+fn report_search_action(ctx: &AddContext, key: &str, phase: Option<SearchActionPhase>) {
+    let event = match phase {
+        Some(phase) => BackendEvent::SearchActionProgress {
+            key: key.to_string(),
+            phase,
+        },
+        None => BackendEvent::SearchActionFinished {
+            key: key.to_string(),
+        },
+    };
+    ctx.events
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(event);
+}
+
+/// Add one source: resolve metadata, save the `.torrent`, and record it in the
+/// durable library. Shared by a plain add and a resolved search hit. Returns the
+/// library id (what the UI keys on) and the info hash, so a caller that wants to
+/// play it can wait for its files.
+async fn add_source(
+    ctx: AddContext,
+    source: String,
+    media_only: bool,
+    downloading: bool,
+    upload_limit_bps: Option<u32>,
+    download_limit_bps: Option<u32>,
+) -> Option<(usize, String)> {
+    let re_add_source = source.clone();
+    let options = AddOptions {
+        media_only,
+        pause_multi_file: !downloading,
+        ephemeral: !downloading,
+        upload_limit_bps,
+        download_limit_bps,
+        ..Default::default()
+    };
+    let parsed = match AddSource::detect(&source) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            ctx.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(BackendEvent::Error(format!("{e}")));
+            return None;
+        }
+    };
+    let outcome = match ctx.engine.add(parsed, options).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            ctx.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(BackendEvent::Error(format!("could not add torrent: {e}")));
+            return None;
+        }
+    };
+    let view = outcome.torrent;
+
+    if let Some(bytes) = ctx.engine.torrent_bytes(view.id) {
+        let dir = ctx.data_dir.join("torrents");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(
+            dir.join(format!("{}.torrent", view.info_hash.to_ascii_lowercase())),
+            bytes,
+        );
+    }
+
+    let (id, snapshot) = {
+        let mut store = ctx.library.lock().unwrap_or_else(|e| e.into_inner());
+        let id = store.upsert(
+            &view.info_hash,
+            &re_add_source,
+            view.name.clone(),
+            now_unix(),
+        );
+        if let Some(entry) = store.entry_mut(id) {
+            entry.files = view.files.iter().map(StoredFile::from_view).collect();
+            entry.primary_file_id = view.primary_file_id;
+            // A stream keeps nothing; a download keeps what the add selected
+            // (the media files).
+            entry.selected_files = if downloading {
+                view.files
+                    .iter()
+                    .filter(|file| file.included)
+                    .map(|file| file.id)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            entry.downloading = downloading;
+        }
+        (id, store.clone())
+    };
+    let _ = snapshot.save(&ctx.data_dir.join("library.json"));
+
+    let title = view.name.clone().unwrap_or_else(|| view.info_hash.clone());
+    ctx.events
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(BackendEvent::Added { id, title });
+    // The library id (what the UI keys on) and the info hash (to find the
+    // engine view, whose id space is its own).
+    Some((id, view.info_hash.clone()))
+}
+
+/// Wait for a freshly added torrent's files to resolve, then ask the UI to open
+/// the player on its best file.
+///
+/// A magnet has no files until its metadata arrives, so this is what makes
+/// "Play" on a search row work for a page-only result as well as a magnet.
+async fn play_when_ready(ctx: AddContext, torrent_id: usize, info_hash: String) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        // Find the engine view by info hash: the engine's id space is its own,
+        // and the id the UI uses is the library's.
+        if let Some(view) = ctx
+            .engine
+            .list()
+            .into_iter()
+            .find(|view| view.info_hash.eq_ignore_ascii_case(&info_hash))
+        {
+            let file_id = view.primary_file_id.or_else(|| {
+                view.files
+                    .iter()
+                    .filter(|file| file.is_video)
+                    .max_by_key(|file| file.length)
+                    .map(|file| file.id)
+            });
+            if let Some(file_id) = file_id {
+                tracing::debug!(torrent_id, file_id, "search play is ready");
+                ctx.events.lock().unwrap_or_else(|e| e.into_inner()).push(
+                    BackendEvent::PlayReady {
+                        torrent_id,
+                        file_id,
+                    },
+                );
+                return;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            ctx.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(BackendEvent::Error(
+                    "the torrent's files did not resolve in time".to_string(),
+                ));
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 }
 
@@ -1240,94 +1833,293 @@ impl Backend for EngineBackend {
     }
 
     fn add(&self, source: &str, media_only: bool) {
-        let engine = self.engine.clone();
-        let events = self.events.clone();
-        let library = self.library.clone();
-        let data_dir = self.catalog.data_dir.clone();
-        let source = source.to_string();
         // Streaming is the primary way to use the app: a new title is temporary
         // unless the user has turned that off, in which case it is a download.
         let downloading = !self.settings().stream_only;
-        let re_add_source = source.clone();
+        let (upload_limit_bps, download_limit_bps) = self.rate_limits();
+        self.runtime.spawn(add_source(
+            self.add_context(),
+            source.to_string(),
+            media_only,
+            downloading,
+            upload_limit_bps,
+            download_limit_bps,
+        ));
+    }
+
+    fn add_search_hit(&self, hit: reel_catalog::SearchHit, media_only: bool) {
+        let hit_key = hit.key();
+        tracing::debug!(
+            source = %hit.source,
+            has_magnet = hit.magnet.is_some(),
+            has_detail = hit.detail_url.is_some(),
+            "adding a search result"
+        );
+        let downloading = !self.settings().stream_only;
+        let (upload_limit_bps, download_limit_bps) = self.rate_limits();
+        let ctx = self.add_context();
+        let catalog = self.catalog.clone();
 
         self.runtime.spawn(async move {
-            let options = AddOptions {
-                media_only,
-                pause_multi_file: !downloading,
-                ephemeral: !downloading,
-                ..Default::default()
-            };
-            let parsed = match AddSource::detect(&source) {
-                Ok(parsed) => parsed,
-                Err(e) => {
-                    events
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(BackendEvent::Error(format!("{e}")));
-                    return;
-                }
-            };
-            let outcome = match engine.add(parsed, options).await {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    events
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(BackendEvent::Error(format!("could not add torrent: {e}")));
-                    return;
-                }
-            };
-            let view = outcome.torrent;
-
-            if let Some(bytes) = engine.torrent_bytes(view.id) {
-                let dir = data_dir.join("torrents");
-                let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(
-                    dir.join(format!("{}.torrent", view.info_hash.to_ascii_lowercase())),
-                    bytes,
-                );
+            // A hit that already carries a magnet or .torrent URL is added
+            // straight away; one that only has a page (ext.to) is resolved
+            // first, which costs one extra page load.
+            if let Some(source) = hit.magnet.clone().or_else(|| hit.torrent_url.clone()) {
+                report_search_action(&ctx, &hit_key, Some(SearchActionPhase::Adding));
+                add_source(
+                    ctx.clone(),
+                    source,
+                    media_only,
+                    downloading,
+                    upload_limit_bps,
+                    download_limit_bps,
+                )
+                .await;
+                report_search_action(&ctx, &hit_key, None);
+                return;
             }
 
-            let (id, snapshot) = {
-                let mut store = library.lock().unwrap_or_else(|e| e.into_inner());
-                let id = store.upsert(
-                    &view.info_hash,
-                    &re_add_source,
-                    view.name.clone(),
-                    now_unix(),
-                );
-                if let Some(entry) = store.entry_mut(id) {
-                    entry.files = view.files.iter().map(StoredFile::from_view).collect();
-                    entry.primary_file_id = view.primary_file_id;
-                    // A stream keeps nothing; a download keeps what the add
-                    // selected (the media files).
-                    entry.selected_files = if downloading {
-                        view.files
-                            .iter()
-                            .filter(|file| file.included)
-                            .map(|file| file.id)
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    entry.downloading = downloading;
+            report_search_action(&ctx, &hit_key, Some(SearchActionPhase::ResolvingMagnet));
+            let search = catalog.search();
+            let resolved = search.magnet_for(&hit).await;
+            match resolved {
+                Ok(Some(source)) => {
+                    report_search_action(&ctx, &hit_key, Some(SearchActionPhase::Adding));
+                    add_source(
+                        ctx.clone(),
+                        source,
+                        media_only,
+                        downloading,
+                        upload_limit_bps,
+                        download_limit_bps,
+                    )
+                    .await;
                 }
-                (id, store.clone())
-            };
-            let _ = snapshot.save(&data_dir.join("library.json"));
+                Ok(None) => {
+                    ctx.events
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(BackendEvent::Error(
+                            "This result has nothing to add".to_string(),
+                        ))
+                }
+                Err(e) => {
+                    ctx.events
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(BackendEvent::Error(format!(
+                            "could not resolve the magnet: {e}"
+                        )))
+                }
+            }
+            report_search_action(&ctx, &hit_key, None);
+        });
+    }
 
-            let title = view.name.clone().unwrap_or_else(|| view.info_hash.clone());
-            events
+    fn play_search_hit(&self, hit: reel_catalog::SearchHit, media_only: bool) {
+        let hit_key = hit.key();
+        tracing::debug!(source = %hit.source, "playing a search result");
+        let downloading = !self.settings().stream_only;
+        let (upload_limit_bps, download_limit_bps) = self.rate_limits();
+        let ctx = self.add_context();
+        let catalog = self.catalog.clone();
+
+        self.runtime.spawn(async move {
+            // Resolve the magnet first when the row only carries a page.
+            let source = match hit.magnet.clone().or_else(|| hit.torrent_url.clone()) {
+                Some(source) => Some(source),
+                None => {
+                    report_search_action(&ctx, &hit_key, Some(SearchActionPhase::ResolvingMagnet));
+                    match catalog.search().magnet_for(&hit).await {
+                        Ok(source) => source,
+                        Err(e) => {
+                            ctx.events.lock().unwrap_or_else(|e| e.into_inner()).push(
+                                BackendEvent::Error(format!("could not resolve the magnet: {e}")),
+                            );
+                            report_search_action(&ctx, &hit_key, None);
+                            return;
+                        }
+                    }
+                }
+            };
+            let Some(source) = source else {
+                ctx.events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(BackendEvent::Error(
+                        "This result has nothing to play".to_string(),
+                    ));
+                report_search_action(&ctx, &hit_key, None);
+                return;
+            };
+
+            report_search_action(&ctx, &hit_key, Some(SearchActionPhase::Adding));
+            if let Some((library_id, info_hash)) = add_source(
+                ctx.clone(),
+                source,
+                media_only,
+                downloading,
+                upload_limit_bps,
+                download_limit_bps,
+            )
+            .await
+            {
+                tracing::debug!(library_id, "search play: added");
+                report_search_action(&ctx, &hit_key, Some(SearchActionPhase::PreparingPlayback));
+                play_when_ready(ctx.clone(), library_id, info_hash).await;
+            }
+            report_search_action(&ctx, &hit_key, None);
+        });
+    }
+
+    fn enrich_search(&self, hits: &[reel_catalog::SearchHit]) {
+        if !self.catalog.provider().is_configured() {
+            return;
+        }
+        if self
+            .catalog
+            .search_budget_used
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+            >= MAX_SEARCH_LOOKUPS
+        {
+            return;
+        }
+        for hit in hits {
+            let key = self.catalog.search_key(hit);
+            if self
+                .catalog
+                .search_metadata
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push(BackendEvent::Added { id, title });
-        });
+                .contains_key(&key)
+            {
+                continue;
+            }
+            if self
+                .catalog
+                .search_attempted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&key)
+            {
+                continue;
+            }
+
+            {
+                let budget = self
+                    .catalog
+                    .search_budget_used
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if budget.contains(&key) {
+                    continue;
+                }
+                if budget.len() >= MAX_SEARCH_LOOKUPS {
+                    break;
+                }
+            }
+
+            // Do not flood the provider: start a few at a time, and let the
+            // next refresh pick up when a slot is free.
+            let in_flight = *self
+                .catalog
+                .search_in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if in_flight >= MAX_SEARCH_CONCURRENCY {
+                break;
+            }
+
+            let now = Instant::now();
+            let retry_after = self
+                .catalog
+                .search_lookup_started
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .and_then(|last| search_lookup_delay_remaining(last, now));
+            if let Some(delay) = retry_after {
+                self.schedule_search_retry(delay);
+                return;
+            }
+
+            {
+                let mut budget = self
+                    .catalog
+                    .search_budget_used
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if !claim_search_lookup_budget(&mut budget, &key) {
+                    if budget.len() >= MAX_SEARCH_LOOKUPS {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            if !self
+                .catalog
+                .search_attempted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key.clone())
+            {
+                continue;
+            }
+            *self
+                .catalog
+                .search_in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) += 1;
+            *self
+                .catalog
+                .search_lookup_started
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(now);
+            self.spawn_search_lookup(key, hit.clone());
+        }
+    }
+
+    fn search_metadata(&self, hit: &reel_catalog::SearchHit) -> Option<Metadata> {
+        let key = self.catalog.search_key(hit);
+        self.catalog
+            .search_metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
+    }
+
+    fn pending_lookups(&self) -> usize {
+        let library = self
+            .catalog
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        let search = *self
+            .catalog
+            .search_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        library + search
     }
 
     fn set_paused(&self, id: usize, paused: bool) {
         let Some(entry) = self.snapshot().entry(id).cloned() else {
             return;
         };
+        // Remember the choice: a download the user paused must not quietly
+        // resume the next time the app starts.
+        {
+            let mut store = self.library.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = store.entry_mut(id) {
+                entry.paused = paused;
+            }
+            let snapshot = store.clone();
+            drop(store);
+            let _ = snapshot.save(&self.library_path());
+        }
         let engine = self.engine.clone();
         let downloading = entry.downloading;
         match self
@@ -1471,11 +2263,26 @@ impl Backend for EngineBackend {
                     if was_paused {
                         if let Err(e) = engine.resume(engine_id).await {
                             tracing::warn!(error = %e, "could not start the stream");
+                            events.lock().unwrap_or_else(|e| e.into_inner()).push(
+                                BackendEvent::Error(format!("could not start the stream: {e}")),
+                            );
+                            return;
                         }
                     }
                     if let Err(e) = engine.set_only_files(engine_id, &selection).await {
                         tracing::warn!(error = %e, "could not set the stream selection");
+                        events
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(BackendEvent::Error(format!(
+                                "could not set the stream selection: {e}"
+                            )));
+                        return;
                     }
+                    // Only now, with the torrent resumed and the selection
+                    // applied, is it safe to tell the UI to open the player. A
+                    // Ready on a paused or wrongly-selected torrent hands mpv a
+                    // URL that answers 200 and then never produces bytes.
                     events
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -1530,12 +2337,16 @@ impl Backend for EngineBackend {
             }
         }
         self.save_media();
+        // Asking to download is asking for it to run, so drop an earlier pause.
+        self.clear_paused(&affected);
         let modes: Vec<(String, bool)> = affected
             .iter()
             .map(|hash| {
                 (
                     hash.clone(),
-                    snapshot.by_hash(hash).is_some_and(|entry| entry.downloading),
+                    snapshot
+                        .by_hash(hash)
+                        .is_some_and(|entry| entry.downloading),
                 )
             })
             .collect();
@@ -1579,7 +2390,9 @@ impl Backend for EngineBackend {
             .map(|hash| {
                 (
                     hash.clone(),
-                    snapshot.by_hash(hash).is_some_and(|entry| entry.downloading),
+                    snapshot
+                        .by_hash(hash)
+                        .is_some_and(|entry| entry.downloading),
                 )
             })
             .collect();
@@ -1610,7 +2423,10 @@ impl Backend for EngineBackend {
             .chosen(key)
             .cloned()?;
         let entry = self.snapshot().by_hash(&reference.info_hash)?.clone();
-        let file = entry.files.iter().find(|file| file.path == reference.path)?;
+        let file = entry
+            .files
+            .iter()
+            .find(|file| file.path == reference.path)?;
         Some((entry.id, file.id))
     }
 
@@ -1691,8 +2507,14 @@ impl Backend for EngineBackend {
             file_name: file_name.clone(),
             title: title.clone(),
         };
-        let mut history = self.catalog.history.lock().unwrap_or_else(|e| e.into_inner());
-        if let Err(e) = history.record_file(info_hash, file_id, file_name, title, position, duration) {
+        let mut history = self
+            .catalog
+            .history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Err(e) =
+            history.record_file(info_hash, file_id, file_name, title, position, duration)
+        {
             tracing::warn!(error = %e, "could not record watch position");
             return;
         }
@@ -1714,7 +2536,11 @@ impl Backend for EngineBackend {
             .unwrap_or_else(|e| e.into_inner());
         if last.elapsed() >= HISTORY_WRITE_INTERVAL {
             *last = Instant::now();
-            let history = self.catalog.history.lock().unwrap_or_else(|e| e.into_inner());
+            let history = self
+                .catalog
+                .history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Err(e) = history.save() {
                 tracing::warn!(error = %e, "could not save watch history");
             }
@@ -1724,7 +2550,11 @@ impl Backend for EngineBackend {
     }
 
     fn mark_finished(&self, info_hash: &str, file_id: usize, title: Option<String>) {
-        let mut history = self.catalog.history.lock().unwrap_or_else(|e| e.into_inner());
+        let mut history = self
+            .catalog
+            .history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Err(e) = history.mark_file_finished(info_hash, file_id, None, title) {
             tracing::warn!(error = %e, "could not mark as finished");
             return;
@@ -1741,7 +2571,11 @@ impl Backend for EngineBackend {
     }
 
     fn forget_watch(&self, info_hash: &str, file_id: usize) {
-        let mut history = self.catalog.history.lock().unwrap_or_else(|e| e.into_inner());
+        let mut history = self
+            .catalog
+            .history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _ = history.forget_file(info_hash, file_id);
         drop(history);
         if let Some(key) = self.media_watch_key(info_hash, file_id) {
@@ -1753,65 +2587,127 @@ impl Backend for EngineBackend {
         self.push(BackendEvent::WatchUpdated);
     }
 
-    fn search(&self, query: &str) {
-        let query = query.trim().to_string();
-        if query.is_empty() {
+    fn search(&self, query: &reel_catalog::SearchQuery) {
+        if query.text.trim().is_empty() {
             return;
         }
+        self.catalog
+            .search_budget_used
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        // The describe string is the key the UI matches answers against, so two
+        // searches for the same text with different filters are not confused.
+        let key = query.describe();
+        let query = query.clone();
 
         let state = self.catalog.clone();
         let events = self.events.clone();
 
         self.runtime.spawn(async move {
-            let request = reel_catalog::SearchQuery::new(query.clone());
-            let outcome = state.search.search(&request).await;
+            let search = state.search();
+            let outcome = search.search(&query).await;
 
-            let event = match outcome {
+            match outcome {
                 Ok(results) => {
                     tracing::info!(
-                        query = %query,
+                        query = %key,
                         hits = results.hits.len(),
                         failures = results.failures.len(),
                         "search finished"
                     );
-                    BackendEvent::SearchResults {
-                        query: query.clone(),
-                        results,
-                    }
+                    events.lock().unwrap_or_else(|e| e.into_inner()).push(
+                        BackendEvent::SearchResults {
+                            query: key.clone(),
+                            results,
+                        },
+                    );
                 }
-                Err(e) => BackendEvent::SearchFailed {
-                    query: query.clone(),
-                    message: e.to_string(),
-                },
-            };
+                Err(e) => {
+                    events.lock().unwrap_or_else(|e| e.into_inner()).push(
+                        BackendEvent::SearchFailed {
+                            query: key.clone(),
+                            message: e.to_string(),
+                        },
+                    );
+                    return;
+                }
+            }
 
-            events.lock().unwrap_or_else(|e| e.into_inner()).push(event);
+            // Keep pulling pages and stream them in, so a source that paginates
+            // fills the list instead of stopping at a page count.
+            let mut streamed = 0usize;
+            for round in 1..=MAX_SEARCH_ROUNDS {
+                let more = search.search_more(&query, round).await;
+                if more.hits.is_empty() {
+                    break;
+                }
+                streamed += more.hits.len();
+                events.lock().unwrap_or_else(|e| e.into_inner()).push(
+                    BackendEvent::SearchHitsAdded {
+                        query: key.clone(),
+                        hits: more.hits,
+                    },
+                );
+            }
+            if streamed > 0 {
+                tracing::info!(query = %key, streamed, "search streamed more results");
+            }
+            events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(BackendEvent::SearchStreamEnded { query: key.clone() });
         });
     }
 
     fn search_sources(&self) -> Vec<SourceInfo> {
-        self.catalog
-            .search
+        let search = self.catalog.search();
+        let configured = search.configured();
+        search
             .names()
             .into_iter()
             .map(|name| SourceInfo {
-                configured: self.catalog.search.configured().contains(&name),
+                configured: configured.contains(&name),
                 name: name.to_string(),
             })
             .collect()
     }
 
     fn catalog_status(&self) -> CatalogStatus {
-        let items = self.library();
-        let enriched = items.iter().filter(|i| i.entry.metadata.is_some()).count();
+        // This is read on every frame the settings page is open, so it must not
+        // re-read the engine or walk the cache directory each time. The library
+        // count comes from the store we already hold, and the cache figures are
+        // memoized for a couple of seconds.
+        let enriched = {
+            let store = self.library.lock().unwrap_or_else(|e| e.into_inner());
+            let metadata = self
+                .catalog
+                .metadata
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            store
+                .iter()
+                .filter(|entry| metadata.contains_key(&entry.info_hash))
+                .count()
+        };
         let pending = {
-            let in_flight = self.catalog.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            let in_flight = self
+                .catalog
+                .in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             in_flight.len()
         };
 
-        let settings = self.catalog.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let settings = self
+            .catalog
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let source = settings.key_source();
         drop(settings);
+
+        let (cached_metadata, cache_bytes) = self.cache_stats();
 
         CatalogStatus {
             provider: self.catalog.provider().name().to_string(),
@@ -1821,8 +2717,8 @@ impl Backend for EngineBackend {
             // even when the environment supplied the current one.
             can_set_key: true,
             note: self.catalog.note(),
-            cached_metadata: self.catalog.cache.metadata_count(),
-            cache_bytes: self.catalog.cache.total_bytes(),
+            cached_metadata,
+            cache_bytes,
             cache_dir: self.catalog.cache.root().display().to_string(),
             enriched,
             pending,
@@ -1842,16 +2738,31 @@ impl Backend for EngineBackend {
 
         let previous = self.settings();
         let key_changed = previous.stored_key() != settings.stored_key();
+        let search_changed = search_settings_differ(&previous, &settings);
 
         {
-            let mut current = self.catalog.settings.lock().unwrap_or_else(|e| e.into_inner());
+            let mut current = self
+                .catalog
+                .settings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Err(e) = settings.save(&self.catalog.data_dir) {
-                self.push(BackendEvent::Error(format!(
-                    "could not save settings: {e}"
-                )));
+                self.push(BackendEvent::Error(format!("could not save settings: {e}")));
                 return;
             }
             *current = settings.clone();
+        }
+
+        // Search sources take effect immediately: rebuild the aggregator so a
+        // newly registered source (and its credentials) is used by the next
+        // search rather than only after a restart.
+        if search_changed {
+            let rebuilt = build_search(&settings, false);
+            *self
+                .catalog
+                .search
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Arc::new(rebuilt);
         }
 
         if key_changed {
@@ -1909,9 +2820,14 @@ impl Backend for EngineBackend {
 
     fn clear_catalog_cache(&self) {
         if let Err(e) = self.catalog.cache.clear() {
-            self.push(BackendEvent::Error(format!("clearing the catalog cache: {e}")));
+            self.push(BackendEvent::Error(format!(
+                "clearing the catalog cache: {e}"
+            )));
             return;
         }
+        // The figures the settings page shows are now wrong; re-measure on the
+        // next read rather than waiting out the memoization window.
+        self.invalidate_cache_stats();
         self.catalog
             .metadata
             .lock()
@@ -1961,7 +2877,11 @@ impl Drop for EngineBackend {
         }
 
         {
-            let history = self.catalog.history.lock().unwrap_or_else(|e| e.into_inner());
+            let history = self
+                .catalog
+                .history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Err(e) = history.save() {
                 tracing::warn!(error = %e, "could not save watch history on exit");
             }
@@ -2034,10 +2954,7 @@ impl Backend for FakeBackend {
     }
 
     fn library(&self) -> Vec<LibraryItem> {
-        self.items
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.items.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn item(&self, id: usize) -> Option<LibraryItem> {
@@ -2053,6 +2970,32 @@ impl Backend for FakeBackend {
             .push(BackendEvent::Info(format!(
                 "add {source} (media_only={media_only})"
             )));
+    }
+
+    fn add_search_hit(&self, hit: reel_catalog::SearchHit, media_only: bool) {
+        let key = hit.key();
+        match hit.magnet.or(hit.torrent_url) {
+            Some(source) => self.add(&source, media_only),
+            None => {
+                self.events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(BackendEvent::Error(
+                        "This result has nothing to add".to_string(),
+                    ))
+            }
+        }
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(BackendEvent::SearchActionFinished { key });
+    }
+
+    fn play_search_hit(&self, hit: reel_catalog::SearchHit, _media_only: bool) {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(BackendEvent::SearchActionFinished { key: hit.key() });
     }
 
     fn set_paused(&self, id: usize, paused: bool) {
@@ -2262,25 +3205,32 @@ impl Backend for FakeBackend {
         }
     }
 
-    fn search(&self, query: &str) {
+    fn search(&self, query: &reel_catalog::SearchQuery) {
         // Answer with fixtures, so the UI can be driven without a network.
+        let text = query.text.to_lowercase();
         let mut results = SearchResults::default();
         for hit in crate::testing::sample_search_hits() {
-            if hit.title.to_lowercase().contains(&query.to_lowercase())
-                || query.trim().is_empty()
-            {
+            if hit.title.to_lowercase().contains(&text) || query.text.trim().is_empty() {
                 results.hits.push(hit);
             }
         }
-        results.hits.sort_by_key(|hit| std::cmp::Reverse(hit.sort_key()));
+        results
+            .hits
+            .sort_by_key(|hit| std::cmp::Reverse(hit.sort_key()));
 
         self.events
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(BackendEvent::SearchResults {
-                query: query.to_string(),
+                query: query.describe(),
                 results,
             });
+        // The demo answers in one batch, so the stream is already over.
+        self.events.lock().unwrap_or_else(|e| e.into_inner()).push(
+            BackendEvent::SearchStreamEnded {
+                query: query.describe(),
+            },
+        );
     }
 
     fn search_sources(&self) -> Vec<SourceInfo> {
@@ -2292,7 +3242,7 @@ impl Backend for FakeBackend {
 
     fn catalog_status(&self) -> CatalogStatus {
         let mut status = self.catalog_status.clone();
-        let items = self.library();
+        let items = self.items.lock().unwrap_or_else(|e| e.into_inner());
         status.enriched = items.iter().filter(|i| i.entry.metadata.is_some()).count();
         status
     }
@@ -2372,6 +3322,7 @@ mod tests {
             primary_file_id: None,
             selected_files: Vec::new(),
             downloading: false,
+            paused: false,
             added_at: 0,
         }
     }
@@ -2401,7 +3352,10 @@ mod tests {
     fn an_empty_name_is_treated_as_no_name() {
         let mut entry = entry_without_name();
         entry.name = Some("   ".to_string());
-        assert_eq!(display_title_for_entry(&entry).0, "Resolving magnet\u{2026}");
+        assert_eq!(
+            display_title_for_entry(&entry).0,
+            "Resolving magnet\u{2026}"
+        );
     }
 
     #[test]
@@ -2411,5 +3365,72 @@ mod tests {
         let (title, year) = display_title_for_entry(&entry);
         assert_eq!(title, "The Matrix");
         assert_eq!(year, Some(1999));
+    }
+
+    #[test]
+    fn search_metadata_deduplicates_release_variants_of_a_series() {
+        let mut first =
+            reel_catalog::SearchHit::new("The.Bear.S03E01.1080p.WEB-DL.H264-GROUP", "ext.to");
+        first.year = Some(2022);
+        let mut second =
+            reel_catalog::SearchHit::new("The.Bear.S03E02.720p.WEBRip.x265-OTHER", "ext.to");
+        second.year = Some(2022);
+
+        assert_eq!(search_metadata_key(&first), search_metadata_key(&second));
+
+        let query = search_lookup_query(&first);
+        assert_eq!(query.title, "The Bear");
+        assert_eq!(query.year, Some(2022));
+        assert_eq!(query.kind, reel_catalog::MediaKind::Series);
+        assert!(query.seasons.is_empty());
+        assert!(query.episodes.is_empty());
+        assert!(query.air_dates.is_empty());
+    }
+
+    #[test]
+    fn search_metadata_keeps_distinct_work_identities_separate() {
+        let bear = reel_catalog::SearchHit::new("The.Bear.S03E01.1080p", "ext.to");
+        let different_year = reel_catalog::SearchHit {
+            year: Some(2022),
+            ..bear.clone()
+        };
+        let movie = reel_catalog::SearchHit::new("The.Bear.2022.1080p.BluRay", "ext.to");
+
+        assert_ne!(
+            search_metadata_key(&bear),
+            search_metadata_key(&different_year)
+        );
+        assert_ne!(search_metadata_key(&bear), search_metadata_key(&movie));
+    }
+
+    #[test]
+    fn search_metadata_lookup_budget_is_unique_and_bounded() {
+        let mut budget = HashSet::new();
+        for index in 0..MAX_SEARCH_LOOKUPS {
+            assert!(claim_search_lookup_budget(
+                &mut budget,
+                &format!("work-{index}")
+            ));
+        }
+        assert_eq!(budget.len(), MAX_SEARCH_LOOKUPS);
+        assert!(!claim_search_lookup_budget(&mut budget, "one-more-work"));
+        assert!(!claim_search_lookup_budget(&mut budget, "work-0"));
+    }
+
+    #[test]
+    fn search_metadata_lookups_are_spaced_by_the_configured_delay() {
+        let start = Instant::now();
+        assert_eq!(
+            search_lookup_delay_remaining(start, start),
+            Some(SEARCH_LOOKUP_DELAY)
+        );
+        assert_eq!(
+            search_lookup_delay_remaining(start, start + Duration::from_millis(250)),
+            Some(Duration::from_millis(150))
+        );
+        assert_eq!(
+            search_lookup_delay_remaining(start, start + SEARCH_LOOKUP_DELAY),
+            None
+        );
     }
 }

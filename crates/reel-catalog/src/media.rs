@@ -34,8 +34,8 @@ pub struct MediaRef {
 impl MediaRef {
     pub fn new(info_hash: impl Into<String>, path: impl Into<String>) -> Self {
         Self {
-            info_hash: info_hash.into().into(),
-            path: path.into().into(),
+            info_hash: info_hash.into(),
+            path: path.into(),
         }
     }
 }
@@ -88,6 +88,7 @@ impl MediaStore {
         match std::fs::read(path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                 tracing::warn!(path = %path.display(), error = %e, "ignoring unreadable media store");
+                reel_core::quarantine_corrupt(path);
                 Self::default()
             }),
             Err(_) => Self::default(),

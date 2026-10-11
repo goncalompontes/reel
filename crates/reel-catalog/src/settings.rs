@@ -11,6 +11,8 @@
 //! first-run fallback when nothing has been saved yet, so scripts keep working
 //! but saving in the app always takes effect.
 
+// `Write` is only needed by the private-mode writer below, which is Unix-only.
+#[cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -41,9 +43,27 @@ pub struct CatalogSettings {
     #[serde(default = "default_true")]
     pub subtitles_enabled: bool,
 
-    /// Register the bundled search sources (the Internet Archive).
+    /// Register the ext.to search source.
     #[serde(default = "default_true")]
-    pub enable_bundled_sources: bool,
+    pub ext_to_enabled: bool,
+
+    /// ext.to base URL, for a mirror. `None` uses `https://ext.to`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext_to_base_url: Option<String>,
+
+    /// ext.to Cloudflare clearance cookie (`cf_clearance=…; …`). The app solves
+    /// the challenge itself; this is an override for when that is not enough.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext_to_cookie: Option<String>,
+
+    /// The user agent bound to `ext_to_cookie`; Cloudflare ties clearance to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext_to_user_agent: Option<String>,
+
+    /// Optional FlareSolverr-compatible solver endpoint, used only when the
+    /// built-in solver cannot clear a challenge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext_to_solver_url: Option<String>,
 
     /// Merge torrents that are the same film or show into one library title.
     #[serde(default = "default_true")]
@@ -68,6 +88,40 @@ pub struct CatalogSettings {
     /// released. `0` releases each stream as soon as playback stops.
     #[serde(default = "default_stream_cache_mb")]
     pub stream_cache_mb: u32,
+
+    /// TCP/uTP port for peers. `None` lets the OS pick. Takes effect on the
+    /// next start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_port: Option<u16>,
+
+    /// Use the DHT for peer discovery.
+    #[serde(default = "default_true")]
+    pub dht_enabled: bool,
+
+    /// Announce to trackers.
+    #[serde(default = "default_true")]
+    pub trackers_enabled: bool,
+
+    /// Ask the router to open the listen port with UPnP.
+    #[serde(default)]
+    pub enable_upnp: bool,
+
+    /// Restrict all torrent networking to IPv4.
+    #[serde(default)]
+    pub ipv4_only: bool,
+
+    /// Hard cap on connected peers per torrent. `None` is the engine default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_limit: Option<usize>,
+
+    /// Download cap in KiB/s. `None` (or `0`) is unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_limit_kib: Option<u32>,
+
+    /// Upload cap in KiB/s. `None` (or `0`) is unlimited; uploads stay off
+    /// regardless unless seeding is enabled outside the app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_limit_kib: Option<u32>,
 }
 
 fn default_true() -> bool {
@@ -86,6 +140,13 @@ fn default_stream_cache_mb() -> u32 {
     1024
 }
 
+/// Trim a text setting and treat an empty result as unset.
+fn trim_blank(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 impl Default for CatalogSettings {
     fn default() -> Self {
         Self {
@@ -93,12 +154,24 @@ impl Default for CatalogSettings {
             download_dir: None,
             stream_only: default_true(),
             subtitles_enabled: default_true(),
-            enable_bundled_sources: default_true(),
+            ext_to_enabled: default_true(),
+            ext_to_base_url: None,
+            ext_to_cookie: None,
+            ext_to_user_agent: None,
+            ext_to_solver_url: None,
             merge_works: default_true(),
             subtitle_language: None,
             default_volume: default_volume(),
             stream_buffer_mb: default_stream_buffer_mb(),
             stream_cache_mb: default_stream_cache_mb(),
+            listen_port: None,
+            dht_enabled: default_true(),
+            trackers_enabled: default_true(),
+            enable_upnp: false,
+            ipv4_only: false,
+            peer_limit: None,
+            download_limit_kib: None,
+            upload_limit_kib: None,
         }
     }
 }
@@ -115,6 +188,7 @@ impl CatalogSettings {
         match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                 tracing::warn!(path = %path.display(), error = %e, "ignoring unreadable settings");
+                reel_core::quarantine_corrupt(&path);
                 Self::default()
             }),
             Err(_) => Self::default(),
@@ -197,6 +271,10 @@ impl CatalogSettings {
             .take()
             .map(|dir| dir.trim().to_string())
             .filter(|dir| !dir.is_empty());
+        self.ext_to_base_url = trim_blank(self.ext_to_base_url.take());
+        self.ext_to_cookie = trim_blank(self.ext_to_cookie.take());
+        self.ext_to_user_agent = trim_blank(self.ext_to_user_agent.take());
+        self.ext_to_solver_url = trim_blank(self.ext_to_solver_url.take());
     }
 }
 
@@ -336,11 +414,44 @@ mod tests {
             download_dir: Some("  /tmp/x  ".into()),
             subtitle_language: Some("  en ".into()),
             default_volume: 999.0,
+            ext_to_cookie: Some("   ".into()),
+            ext_to_base_url: Some("  https://mirror.example  ".into()),
             ..Default::default()
         };
         settings.normalise();
         assert_eq!(settings.download_dir.as_deref(), Some("/tmp/x"));
         assert_eq!(settings.subtitle_language.as_deref(), Some("en"));
         assert_eq!(settings.default_volume, 130.0);
+        // A blank credential is unset, not an empty string.
+        assert_eq!(settings.ext_to_cookie, None);
+        assert_eq!(
+            settings.ext_to_base_url.as_deref(),
+            Some("https://mirror.example")
+        );
+    }
+
+    #[test]
+    fn the_search_source_settings_round_trip() {
+        let dir = scratch("search");
+        let settings = CatalogSettings {
+            ext_to_enabled: true,
+            ext_to_cookie: Some("cf_clearance=abc".into()),
+            ..Default::default()
+        };
+        settings.save(&dir).unwrap();
+        let loaded = CatalogSettings::load(&dir);
+        assert!(loaded.ext_to_enabled);
+        assert_eq!(loaded.ext_to_cookie.as_deref(), Some("cf_clearance=abc"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_archive_source_setting_cannot_register_a_backend() {
+        let loaded: CatalogSettings = serde_json::from_str(
+            r#"{"archive_org_enabled":true,"ext_to_enabled":false}"#,
+        )
+        .unwrap();
+        assert!(!loaded.ext_to_enabled);
+        assert!(crate::backends::bundled(&loaded).is_empty());
     }
 }

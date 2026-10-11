@@ -5,6 +5,7 @@
 //! [`PlayerController::video_ui`] and [`PlayerController::controls_ui`].
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use egui::{Color32, CornerRadius, Painter, Sense, Vec2};
 use reel_player::{Backend, Player, PlayerConfig, PlayerState};
@@ -62,6 +63,10 @@ pub struct PlayerController {
     /// Non-empty while the user drags the seek bar, so the reported position
     /// does not fight the drag.
     scrub_position: Option<f64>,
+    /// When the user last seeked. A big seek has to refill the demuxer cache
+    /// from a new position, which can take many seconds on a large file; the
+    /// stall watchdog must not mistake that for a wedge.
+    last_seek: Option<Instant>,
     created_with: Option<PlayerCapability>,
     preferences: PlaybackPreferences,
     /// How many times the underlying mpv core has been built. A replay reuses
@@ -87,6 +92,7 @@ impl PlayerController {
             error: None,
             volume: 100.0,
             scrub_position: None,
+            last_seek: None,
             created_with: None,
             rebuilds: 0,
             preferences: PlaybackPreferences {
@@ -278,10 +284,18 @@ impl PlayerController {
         }
     }
 
-    pub fn seek_relative(&self, delta: f64) {
+    pub fn seek_relative(&mut self, delta: f64) {
         if let Some(player) = self.player.as_ref() {
             let _ = player.seek_relative(delta);
+            self.last_seek = Some(Instant::now());
         }
+    }
+
+    /// Whether the user seeked within `within`. The stall watchdog uses this to
+    /// give a seek time to buffer before deciding the stream is wedged.
+    pub fn seeked_within(&self, within: std::time::Duration) -> bool {
+        self.last_seek
+            .is_some_and(|at| at.elapsed() < within)
     }
 
     pub fn set_volume(&mut self, volume: f32) {
@@ -726,6 +740,7 @@ impl PlayerController {
         if let Some(target) = seek_to {
             if let Some(player) = self.player.as_ref() {
                 let _ = player.seek_absolute(target);
+                self.last_seek = Some(Instant::now());
             }
         }
     }

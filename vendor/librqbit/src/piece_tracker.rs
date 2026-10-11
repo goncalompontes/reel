@@ -406,6 +406,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true, // Peer has all pieces
             can_steal: |_| true,
+            streaming_only: false,
         });
 
         // Should reserve piece 0 (first in queue)
@@ -439,6 +440,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |p| p.get() >= 2,
             can_steal: |_| true,
+            streaming_only: false,
         });
 
         match result {
@@ -467,6 +469,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            streaming_only: false,
         });
 
         let piece = match result {
@@ -500,6 +503,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            streaming_only: false,
         });
 
         let piece = match result {
@@ -528,6 +532,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |p| p == piece, // Only has the failed piece
             can_steal: |_| true,
+            streaming_only: false,
         });
 
         match result2 {
@@ -557,6 +562,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            streaming_only: false,
         }) {
             AcquireResult::Reserved(p) => p,
             _ => panic!("Expected Reserved"),
@@ -569,6 +575,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            streaming_only: false,
         }) {
             AcquireResult::Reserved(p) => p,
             _ => panic!("Expected Reserved"),
@@ -583,6 +590,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            streaming_only: false,
         }) {
             AcquireResult::Reserved(p) => p,
             _ => panic!("Expected Reserved"),
@@ -622,6 +630,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            streaming_only: false,
         });
         tracker.acquire_piece(AcquireRequest {
             peer: peer(1),
@@ -631,6 +640,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            streaming_only: false,
         });
 
         assert_eq!(tracker.inflight_count(), 2);
@@ -648,6 +658,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            streaming_only: false,
         });
 
         // Should get piece 0 again (was requeued)
@@ -686,6 +697,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            streaming_only: false,
         });
 
         // Should get piece 3 (first priority piece)
@@ -712,6 +724,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| false, // Peer has nothing
             can_steal: |_| true,
+            streaming_only: false,
         });
 
         match result {
@@ -760,6 +773,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            streaming_only: false,
         }) {
             AcquireResult::Reserved(p) => {
                 assert_eq!(p.get(), 0);
@@ -776,6 +790,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            streaming_only: false,
         }) {
             AcquireResult::Reserved(p) => {
                 assert_eq!(p.get(), 4);
@@ -798,6 +813,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |p| p.get() == 4, // Peer B only has piece 4
             can_steal: |_| true,
+            streaming_only: false,
         });
 
         // Should steal piece 4 (which peer B has), NOT piece 0 (which peer B doesn't have)
@@ -810,5 +826,134 @@ mod tests {
             }
             _ => panic!("Expected Stolen, got {:?}", result),
         }
+    }
+
+    #[test]
+    fn test_streaming_only_refuses_ordered_queue() {
+        let chunks = make_test_chunk_tracker(5);
+        let mut tracker = PieceTracker::new(chunks);
+
+        let file_infos = make_test_file_infos(5);
+        let file_priorities = make_default_file_priorities(&file_infos);
+
+        // No priority window: a streaming-only acquire must not fall back to the
+        // naturally ordered queue, which would otherwise hand out piece 0.
+        let result = tracker.acquire_piece(AcquireRequest {
+            peer: peer(1),
+            peer_avg_time: None,
+            priority_pieces: std::iter::empty(),
+            file_priorities: &file_priorities,
+            file_infos: &file_infos,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+            streaming_only: true,
+        });
+
+        match result {
+            AcquireResult::NoneAvailable => {}
+            _ => panic!("streaming_only must not use the ordered queue, got {:?}", result),
+        }
+        assert_eq!(tracker.inflight_count(), 0);
+
+        // The same request with streaming_only off does fall back to piece 0,
+        // proving the flag is what suppresses the ordered queue.
+        let result = tracker.acquire_piece(AcquireRequest {
+            peer: peer(1),
+            peer_avg_time: None,
+            priority_pieces: std::iter::empty(),
+            file_priorities: &file_priorities,
+            file_infos: &file_infos,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+            streaming_only: false,
+        });
+        match result {
+            AcquireResult::Reserved(p) => assert_eq!(p.get(), 0),
+            _ => panic!("non-streaming acquire should reserve from the queue, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_streaming_only_serves_only_priority_window() {
+        let chunks = make_test_chunk_tracker(5);
+        let mut tracker = PieceTracker::new(chunks);
+
+        let file_infos = make_test_file_infos(5);
+        let file_priorities = make_default_file_priorities(&file_infos);
+
+        let piece3 = tracker.chunks().get_lengths().validate_piece_index(3).unwrap();
+        let piece2 = tracker.chunks().get_lengths().validate_piece_index(2).unwrap();
+
+        // The window is [3, 2]; each acquire draws from it in order.
+        for expected in [3u32, 2u32] {
+            let result = tracker.acquire_piece(AcquireRequest {
+                peer: peer(1),
+                peer_avg_time: None,
+                priority_pieces: [piece3, piece2].into_iter(),
+                file_priorities: &file_priorities,
+                file_infos: &file_infos,
+                peer_has_piece: |_| true,
+                can_steal: |_| true,
+                streaming_only: true,
+            });
+            match result {
+                AcquireResult::Reserved(p) => assert_eq!(p.get(), expected),
+                _ => panic!("expected Reserved({expected}), got {:?}", result),
+            }
+        }
+
+        // Window exhausted: must return NoneAvailable rather than pull piece 0
+        // (or any other queued piece) into the stream.
+        let result = tracker.acquire_piece(AcquireRequest {
+            peer: peer(1),
+            peer_avg_time: None,
+            priority_pieces: [piece3, piece2].into_iter(),
+            file_priorities: &file_priorities,
+            file_infos: &file_infos,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+            streaming_only: true,
+        });
+        match result {
+            AcquireResult::NoneAvailable => {}
+            _ => panic!("exhausted stream window should yield nothing, got {:?}", result),
+        }
+
+        assert_eq!(tracker.inflight_count(), 2);
+        // Pieces outside the window were never touched.
+        for outside in [0u32, 1, 4] {
+            let p = tracker.chunks().get_lengths().validate_piece_index(outside).unwrap();
+            assert!(!tracker.is_inflight(p), "piece {outside} outside the window was fetched");
+        }
+    }
+
+    #[test]
+    fn test_streaming_only_ignores_pieces_outside_window() {
+        let chunks = make_test_chunk_tracker(5);
+        let mut tracker = PieceTracker::new(chunks);
+
+        let file_infos = make_test_file_infos(5);
+        let file_priorities = make_default_file_priorities(&file_infos);
+
+        let piece3 = tracker.chunks().get_lengths().validate_piece_index(3).unwrap();
+        let piece0 = tracker.chunks().get_lengths().validate_piece_index(0).unwrap();
+
+        // The window only contains piece 3, but the peer only has piece 0. Even
+        // though the peer could serve piece 0, streaming_only must not fetch it.
+        let result = tracker.acquire_piece(AcquireRequest {
+            peer: peer(1),
+            peer_avg_time: None,
+            priority_pieces: std::iter::once(piece3),
+            file_priorities: &file_priorities,
+            file_infos: &file_infos,
+            peer_has_piece: |p| p == piece0,
+            can_steal: |_| true,
+            streaming_only: true,
+        });
+        match result {
+            AcquireResult::NoneAvailable => {}
+            _ => panic!("peer can't serve the window, must wait, got {:?}", result),
+        }
+        assert_eq!(tracker.inflight_count(), 0);
     }
 }

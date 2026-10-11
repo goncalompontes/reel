@@ -202,7 +202,7 @@ fn search_finds_results_and_can_add_one() {
         "the result title should be on screen"
     );
     assert!(
-        harness.query_all_by_label_contains("archive.org").next().is_some(),
+        harness.query_all_by_label_contains("demo").next().is_some(),
         "the source should be shown"
     );
 }

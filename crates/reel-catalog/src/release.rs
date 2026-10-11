@@ -76,6 +76,9 @@ pub struct ReleaseAttributes {
     pub release_group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edition: Option<String>,
+    /// Audio languages the release advertises, e.g. `["English", "French"]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub languages: Vec<String>,
 }
 
 impl ReleaseAttributes {
@@ -326,7 +329,8 @@ impl Release {
 /// Returns `(title, year, kind)`; `title` falls back to the input with obvious
 /// separators tidied when nothing was recognised.
 pub fn parse_one(name: &str) -> (String, Option<u16>, MediaKind) {
-    let parsed = hunch::hunch(name);
+    let cleaned = strip_stream_dimensions(name);
+    let parsed = hunch::hunch(&cleaned);
     let kind = match parsed.media_type() {
         Some(MediaType::Episode) => MediaKind::Series,
         Some(MediaType::Movie) => MediaKind::Movie,
@@ -337,13 +341,27 @@ pub fn parse_one(name: &str) -> (String, Option<u16>, MediaKind) {
     let title = parsed
         .title()
         .map(str::trim)
-        .filter(|t| !t.is_empty())
+        .filter(|t| !t.is_empty() && !is_extension_title(t))
         .map(str::to_string)
         .unwrap_or_else(|| tidy_fallback(name));
 
     let year = parsed.year().and_then(|y| u16::try_from(y).ok());
 
     (title, year, kind)
+}
+
+/// Analyse a single release name, as a search result gives it.
+///
+/// The name is treated as one video file, so a search list can show what a
+/// result is — film or series, its season and episode, its quality and its
+/// languages — without the user adding it first.
+pub fn analyse_name(name: &str) -> Release {
+    let file = if reel_core::is_video_file(name) {
+        name.to_string()
+    } else {
+        format!("{name}.mkv")
+    };
+    analyse(&[FileInput::new(0, file, 0)])
 }
 
 /// Analyse a torrent's files together.
@@ -372,14 +390,18 @@ pub fn analyse(files: &[FileInput]) -> Release {
 
     // Sibling context helps: hunch can use the other names in a pack to
     // recognise numbering that a single name would leave ambiguous.
-    let names: Vec<&str> = videos.iter().map(|f| f.path.as_str()).collect();
+    let cleaned: Vec<String> = videos
+        .iter()
+        .map(|f| strip_stream_dimensions(f.file_name()))
+        .collect();
+    let names: Vec<&str> = cleaned.iter().map(String::as_str).collect();
 
     let mut parsed: Vec<(usize, hunch::HunchResult)> = Vec::with_capacity(videos.len());
-    for (index, file) in videos.iter().enumerate() {
+    for (index, name) in names.iter().enumerate() {
         let result = if names.len() > 1 {
-            hunch::hunch_with_context(&file.path, &names)
+            hunch::hunch_with_context(name, &names)
         } else {
-            hunch::hunch(&file.path)
+            hunch::hunch(name)
         };
         parsed.push((index, result));
     }
@@ -405,7 +427,11 @@ pub fn analyse(files: &[FileInput]) -> Release {
                 episode,
                 air_date,
                 length: file.length,
-                extra: matches!(result.media_type(), Some(MediaType::Extra)),
+                // `hunch` labels an obvious sample or trailer, but not a file
+                // sitting in a `Featurettes/` folder — and a film with bonus
+                // featurettes must not read as a series.
+                extra: matches!(result.media_type(), Some(MediaType::Extra))
+                    || is_extra_path(&file.path),
             }
         })
         .collect();
@@ -461,6 +487,12 @@ fn decide_kind(
     episodes: &[EpisodeFile],
     total_files: usize,
 ) -> MediaKind {
+    // Copies with trailing numbers look like episodes to hunch, once the sibling
+    // names are in view, but a season is the one thing a film copy never has.
+    if episodes.iter().all(|e| e.season.is_none()) && looks_like_copies_of_one_film(episodes) {
+        return MediaKind::Movie;
+    }
+
     let numbered = episodes
         .iter()
         .filter(|e| e.episode.is_some() && !e.extra)
@@ -504,6 +536,35 @@ fn decide_kind(
     }
 }
 
+/// `sintel.mp4`, `sintel1.mp4`, `sintel6.mp4`: several copies of one film, as
+/// some collections hold. Their titles differ only by a trailing number.
+fn looks_like_copies_of_one_film(episodes: &[EpisodeFile]) -> bool {
+    let names: Vec<String> = episodes
+        .iter()
+        .filter(|e| !e.extra)
+        .map(|e| {
+            let base = e.path.rsplit(['/', '\\']).next().unwrap_or(&e.path);
+            let stem = match base.rsplit_once('.') {
+                Some((stem, ext)) if !stem.is_empty() && ext.len() <= 4 => stem,
+                _ => base,
+            };
+            stem.to_ascii_lowercase()
+        })
+        .collect();
+    if names.len() < 2 {
+        return false;
+    }
+
+    // Identical names could be a pack of episodes; names that differ only in a
+    // trailing number are copies.
+    let stems: Vec<&str> = names
+        .iter()
+        .map(|name| name.trim_end_matches(|c: char| c.is_ascii_digit() || c == ' ' || c == '_'))
+        .collect();
+    let all_same_name = names.iter().all(|name| *name == names[0]);
+    !stems[0].is_empty() && !all_same_name && stems.iter().all(|stem| *stem == stems[0])
+}
+
 /// `Film.mkv` next to `Film.sample.mkv`: one real video and some extras.
 fn looks_like_sample_plus_feature(episodes: &[EpisodeFile]) -> bool {
     let real: Vec<&EpisodeFile> = episodes.iter().filter(|e| !e.extra).collect();
@@ -514,6 +575,70 @@ fn looks_like_sample_plus_feature(episodes: &[EpisodeFile]) -> bool {
     let (big, small) = (sizes[0].max(sizes[1]), sizes[0].min(sizes[1]));
     // A sample is an order of magnitude smaller than the feature.
     big > 0 && small * 8 < big
+}
+
+/// Whether a file path marks bonus material that `hunch` does not label itself:
+/// a `Featurettes/`, `Extras/` or `Bonus/` folder, or a file named like a
+/// trailer, sample or deleted scene.
+///
+/// This matters for the film/series decision: a film that ships with two
+/// featurettes has three video files, and without this it reads as a series.
+fn is_extra_path(path: &str) -> bool {
+    let lower = path.replace('\\', "/").to_ascii_lowercase();
+    let mut segments: Vec<&str> = lower.split('/').filter(|s| !s.is_empty()).collect();
+    let file = segments.pop().unwrap_or("");
+    segments.iter().any(|dir| is_bonus_segment(dir)) || is_bonus_name(file)
+}
+
+/// A directory component that is, on its own, a bonus folder.
+fn is_bonus_segment(segment: &str) -> bool {
+    let normalized = alphanumeric(segment);
+    matches!(
+        normalized.as_str(),
+        "featurette"
+            | "featurettes"
+            | "extra"
+            | "extras"
+            | "bonus"
+            | "behindthescenes"
+            | "deletedscenes"
+            | "interview"
+            | "interviews"
+            | "trailer"
+            | "trailers"
+            | "sample"
+            | "samples"
+            | "specials"
+            | "shorts"
+            | "opening"
+            | "ending"
+    )
+}
+
+/// A file name that names bonus material (`Sintel_trailer.mp4`).
+fn is_bonus_name(file: &str) -> bool {
+    let stem = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
+    let normalized = alphanumeric(stem);
+    [
+        "trailer",
+        "sample",
+        "teaser",
+        "deletedscene",
+        "deletedscenes",
+        "behindthescenes",
+        "featurette",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+/// Lowercase, with every non-alphanumeric character dropped, so
+/// `Behind.The.Scenes`, `Behind the Scenes` and `Behind-The-Scenes` agree.
+fn alphanumeric(text: &str) -> String {
+    text.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 /// The season the files agree on, if they do.
@@ -536,7 +661,11 @@ fn dominant_season(episodes: &[EpisodeFile]) -> Option<u32> {
 fn dominant_title(parsed: &[(usize, hunch::HunchResult)]) -> Option<String> {
     let mut counts: Vec<(String, usize)> = Vec::new();
     for (_, result) in parsed {
-        let Some(title) = result.title().map(str::trim).filter(|t| !t.is_empty()) else {
+        let Some(title) = result
+            .title()
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && !is_extension_title(t))
+        else {
             continue;
         };
         match counts.iter_mut().find(|(t, _)| t.eq_ignore_ascii_case(title)) {
@@ -562,6 +691,11 @@ fn best_attributes(parsed: &[(usize, hunch::HunchResult)]) -> ReleaseAttributes 
             audio_codec: clean(result.audio_codec()),
             release_group: clean(result.release_group()),
             edition: clean(result.edition()),
+            languages: result
+                .languages()
+                .into_iter()
+                .map(title_case)
+                .collect::<Vec<_>>(),
         };
         // Prefer the file that told us the most, and otherwise keep the first.
         if best.is_empty() || score(&candidate) > score(&best) {
@@ -580,6 +714,15 @@ fn clean(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_string)
+}
+
+/// `english` -> `English`, for a language chip.
+fn title_case(value: &str) -> String {
+    let mut chars = value.trim().chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 /// Pull an air date out of a name, as `YYYY-MM-DD`.
@@ -630,6 +773,63 @@ pub fn extract_air_date(name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Frame sizes and bitrates that show up in file names (`sintel-2048-stereo`).
+/// hunch reads `2048` as season 20, episode 48, so they are removed before
+/// parsing, unless the name already carries an explicit episode marker.
+const STREAM_DIMENSIONS: [&str; 5] = ["256", "512", "1024", "2048", "4096"];
+
+fn strip_stream_dimensions(name: &str) -> String {
+    if name.split(|c: char| !c.is_ascii_alphanumeric()).any(is_episode_token) {
+        return name.to_string();
+    }
+
+    let mut out = String::with_capacity(name.len());
+    let mut start = 0;
+    for (index, ch) in name.char_indices() {
+        if ch.is_ascii_alphanumeric() {
+            continue;
+        }
+        let token = &name[start..index];
+        if !STREAM_DIMENSIONS.contains(&token) {
+            out.push_str(token);
+        }
+        out.push(ch);
+        start = index + ch.len_utf8();
+    }
+    let tail = &name[start..];
+    if !STREAM_DIMENSIONS.contains(&tail) {
+        out.push_str(tail);
+    }
+    out
+}
+
+/// `S01E02`, `1x02`, `E12` or `Ep12`: a token that names an episode outright.
+fn is_episode_token(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    if let Some(rest) = lower.strip_prefix('s') {
+        if let Some((season, episode)) = rest.split_once('e') {
+            return digits(season) && digits(episode);
+        }
+    }
+    if let Some((season, episode)) = lower.split_once('x') {
+        return digits(season) && digits(episode);
+    }
+    if let Some(rest) = lower.strip_prefix("ep") {
+        return digits(rest);
+    }
+    lower.strip_prefix('e').is_some_and(digits)
+}
+
+/// A video container name that hunch returned as the title, as in `sample.mp4`
+/// where "sample" reads as an extra marker and leaves "mp4".
+fn is_extension_title(title: &str) -> bool {
+    matches!(
+        title.to_ascii_lowercase().as_str(),
+        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "webm" | "m4v" | "ogv" | "ts" | "flv"
+    )
 }
 
 /// Last resort for a display title: drop the extension and tidy separators.
@@ -791,6 +991,33 @@ mod tests {
     }
 
     #[test]
+    fn a_film_with_featurettes_stays_a_film() {
+        // A film plus two bonus featurettes in a `Featurettes/` folder: three
+        // video files, but one film. Without path-aware extras this read as a
+        // series, and the metadata lookup then searched TV and found nothing.
+        let files = [
+            video(0, "Featurettes/Deleted Scenes.mkv", 62_315_853),
+            video(
+                1,
+                "Featurettes/The Lighthouse - A Dark & Stormy Tale.mkv",
+                456_276_453,
+            ),
+            video(
+                2,
+                "The Lighthouse (2019) (1080p BluRay x265 10bit Tigole).mkv",
+                4_897_209_203,
+            ),
+        ];
+        let release = series_release(&files);
+        assert_eq!(
+            release.kind,
+            MediaKind::Movie,
+            "featurettes are not episodes: {release:?}"
+        );
+        assert_eq!(release.episodes.iter().filter(|e| !e.extra).count(), 1);
+    }
+
+    #[test]
     fn no_video_files_is_unknown_rather_than_a_guess() {
         let files = [FileInput::new(0, "disc.iso", 7_000_000_000)];
         let release = analyse(&files);
@@ -944,5 +1171,41 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(attributes.quality_label(), "1080p");
+    }
+
+    #[test]
+    fn a_frame_width_in_a_film_name_is_not_an_episode() {
+        // A Sintel release: "2048" must not be read as season 20, episode 48.
+        let release = series_release(&[
+            video(0, "sintel-2048-stereo.mp4", 900_000_000),
+            video(1, "Sintel_trailer.mp4", 20_000_000),
+        ]);
+        assert_eq!(release.kind, MediaKind::Movie);
+        assert!(release.episodes.iter().all(|e| e.episode.is_none()));
+        assert_eq!(release.season, None);
+    }
+
+    #[test]
+    fn copies_of_one_film_in_a_dated_folder_are_one_film() {
+        let release = series_release(&[
+            video(0, "sintel_20260427/sintel.mp4", 350_000_000),
+            video(1, "sintel_20260427/sintel1.mp4", 90_000_000),
+            video(2, "sintel_20260427/sintel6.mp4", 17_000_000),
+        ]);
+        assert_eq!(release.kind, MediaKind::Movie);
+        assert!(release.episodes.iter().all(|e| e.air_date.is_none()));
+    }
+
+    #[test]
+    fn a_real_episode_marker_is_left_alone() {
+        let (title, _, kind) = parse_one("Some.Show.S02E03.sintel-2048.mkv");
+        assert_eq!(kind, MediaKind::Series);
+        assert_eq!(title, "Some Show");
+    }
+
+    #[test]
+    fn a_bare_sample_file_keeps_its_own_name() {
+        let (title, _, _) = parse_one("sample.mp4");
+        assert_eq!(title, "sample");
     }
 }

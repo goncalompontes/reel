@@ -1,13 +1,11 @@
 //! The discovery seam.
 //!
-//! reel ships **no** search backends. This module defines the shape a backend
-//! must satisfy so that whatever a user configures — a self-hosted indexer, a
-//! private tracker, an archive of public-domain film — is a drop-in addition,
-//! and so the rest of the app (and its tests) can work against the trait rather
-//! than a concrete source.
-//!
-//! Wiring one up is therefore a deliberate act by whoever runs the app, and what
-//! it returns is their responsibility.
+//! This module defines the shape a backend must satisfy so that whatever a user
+//! configures — a self-hosted indexer, a private tracker, an archive of
+//! public-domain film — is a drop-in addition, and so the rest of the app (and
+//! its tests) can work against the trait rather than a concrete source. Two
+//! backends ship in [`crate::backends`]; anything else is a deliberate act by
+//! whoever runs the app, and what it returns is their responsibility.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -74,6 +72,9 @@ pub struct SearchHit {
     pub published_at: Option<i64>,
     /// Free-form detail worth showing, e.g. resolution or codec.
     pub detail: Option<String>,
+    /// The page a person would open in a browser to see this result on its
+    /// source, when the backend knows one.
+    pub detail_url: Option<String>,
 }
 
 impl SearchHit {
@@ -90,6 +91,7 @@ impl SearchHit {
             torrent_url: None,
             published_at: None,
             detail: None,
+            detail_url: None,
         }
     }
 
@@ -112,6 +114,15 @@ impl SearchHit {
             self.size_bytes.unwrap_or(0),
         )
     }
+
+    /// A stable key for deduping hits across pages: the torrent's page, else its
+    /// magnet, else source and title.
+    pub fn key(&self) -> String {
+        self.detail_url
+            .clone()
+            .or_else(|| self.magnet.clone())
+            .unwrap_or_else(|| format!("{}|{}", self.source, self.title))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -127,8 +138,8 @@ pub enum SearchError {
 
 /// A source of torrents.
 ///
-/// Implementations live outside this crate. Nothing in the repository
-/// implements this trait except the test fake.
+/// Implementations live wherever the operator wants them; the ones reel ships
+/// live in [`crate::backends`], and the crate's own tests use a fake.
 pub trait SearchBackend: Send + Sync {
     /// Stable name shown next to results, e.g. the tracker's name.
     fn name(&self) -> &str;
@@ -140,6 +151,40 @@ pub trait SearchBackend: Send + Sync {
     }
 
     fn search<'a>(&'a self, query: &'a SearchQuery) -> BoxFuture<'a, Result<Vec<SearchHit>, SearchError>>;
+
+    /// Fetch one more batch of results for a search already in progress, so a
+    /// source that paginates can stream results in. `round` counts from 1 and
+    /// repeats until an empty batch says there is nothing more.
+    ///
+    /// Backends that return everything at once keep the default, which has
+    /// nothing more to give.
+    fn search_more<'a>(
+        &'a self,
+        _query: &'a SearchQuery,
+        _round: usize,
+    ) -> BoxFuture<'a, Result<Vec<SearchHit>, SearchError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Get whatever the backend needs ready before a search can be fast — for
+    /// ext.to, clearing the Cloudflare challenge. Best-effort: a failure is not
+    /// fatal, the first search just pays for it instead.
+    fn warm<'a>(&'a self) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    /// Resolve the magnet for a hit that carries only a page URL.
+    ///
+    /// Index sites (ext.to) hide the magnet behind a per-detail-page token
+    /// request, so it is fetched on demand — one page load per Add — rather
+    /// than for every row of a search. Backends that already know the magnet
+    /// keep the default, which has nothing to resolve.
+    fn magnet_for<'a>(
+        &'a self,
+        _hit: &'a SearchHit,
+    ) -> BoxFuture<'a, Result<Option<String>, SearchError>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// Queries several backends and merges what they return.
@@ -201,9 +246,13 @@ impl SearchAggregator {
         for backend in configured {
             match backend.search(query).await {
                 Ok(hits) => {
-                    // A backend that cannot supply a magnet or URL is useless to
-                    // us; drop those rather than offering a dead button.
-                    results.hits.extend(hits.into_iter().filter(SearchHit::is_usable));
+                    // A hit with nothing to add and no page to open is useless to
+                    // us; drop it rather than offering a dead row. A page link is
+                    // enough to keep it: the UI shows it with Open and no Add.
+                    results.hits.extend(
+                        hits.into_iter()
+                            .filter(|hit| hit.is_usable() || hit.detail_url.is_some()),
+                    );
                 }
                 Err(e) => results.failures.push((backend.name().to_string(), e.to_string())),
             }
@@ -216,6 +265,49 @@ impl SearchAggregator {
                 .then_with(|| a.title.cmp(&b.title))
         });
         Ok(results)
+    }
+
+    /// Fetch the next batch from every configured backend, for streaming
+    /// results into the UI. A source with nothing more, or one that fails on a
+    /// later page, simply contributes nothing.
+    pub async fn search_more(&self, query: &SearchQuery, round: usize) -> SearchResults {
+        let mut results = SearchResults::default();
+        for backend in self.backends.iter().filter(|b| b.is_configured()) {
+            match backend.search_more(query, round).await {
+                Ok(hits) => results.hits.extend(
+                    hits.into_iter()
+                        .filter(|hit| hit.is_usable() || hit.detail_url.is_some()),
+                ),
+                Err(e) => results.failures.push((backend.name().to_string(), e.to_string())),
+            }
+        }
+        results.hits.sort_by(|a, b| {
+            b.sort_key()
+                .cmp(&a.sort_key())
+                .then_with(|| a.title.cmp(&b.title))
+        });
+        results
+    }
+
+    /// Warm every configured backend, so the first search is not the one that
+    /// pays to clear a challenge.
+    pub async fn warm(&self) {
+        for backend in self.backends.iter().filter(|b| b.is_configured()) {
+            backend.warm().await;
+        }
+    }
+
+    /// Ask the hit's own backend to resolve the magnet it hid behind a page.
+    ///
+    /// `Ok(None)` means the backend has nothing more to offer; the caller keeps
+    /// the hit's page URL as the only handle.
+    pub async fn magnet_for(&self, hit: &SearchHit) -> Result<Option<String>, SearchError> {
+        for backend in &self.backends {
+            if backend.name() == hit.source {
+                return backend.magnet_for(hit).await;
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -280,17 +372,17 @@ mod tests {
 
     #[test]
     fn a_source_without_a_swarm_ranks_by_its_own_popularity() {
-        // A web archive reports no seeders but a large download count; a tracker
-        // reports a small swarm. Both must be orderable.
-        let archive = SearchHit {
+        // A source without swarm data may still have a popularity signal; a
+        // tracker reports a small swarm. Both must be orderable.
+        let popular_source = SearchHit {
             popularity: Some(400_000),
-            ..SearchHit::new("archive item", "archive.org")
+            ..SearchHit::new("popular source item", "fixture")
         };
         let small_swarm = SearchHit {
             seeders: Some(3),
             ..SearchHit::new("tracker item", "tracker")
         };
-        assert!(small_swarm.sort_key() > archive.sort_key());
+        assert!(small_swarm.sort_key() > popular_source.sort_key());
 
         let popular_swarm = SearchHit {
             seeders: Some(500),
@@ -386,6 +478,20 @@ mod tests {
 
         assert_eq!(results.hits.len(), 1);
         assert_eq!(results.hits[0].title, "good");
+    }
+
+    #[tokio::test]
+    async fn a_hit_with_only_a_page_is_kept_for_opening() {
+        let page_only = SearchHit {
+            detail_url: Some("https://example.test/page".into()),
+            ..SearchHit::new("page", "alpha")
+        };
+        let backend = FakeBackend::returning("alpha", vec![page_only]);
+        let aggregator = SearchAggregator::new(vec![Box::new(backend)]);
+        let results = aggregator.search(&SearchQuery::new("x")).await.unwrap();
+
+        assert_eq!(results.hits.len(), 1);
+        assert!(!results.hits[0].is_usable());
     }
 
     #[tokio::test]

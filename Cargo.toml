@@ -36,6 +36,10 @@ egui_extras = { version = "0.36", features = ["image", "file"] }
 
 clap = { version = "4", features = ["derive", "env"] }
 reqwest = { version = "0.13", features = ["json", "blocking", "query"] }
+scraper = "0.24"
+# SHA-256 for the ext.to magnet token (`hmac` field): the site signs
+# `torrent_id|timestamp|page_token` and the backend must reproduce it.
+sha2 = "0.10"
 
 [profile.release]
 lto = "thin"

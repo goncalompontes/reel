@@ -1,3 +1,5 @@
+#[cfg(unix)]
+mod imp {
 //! An interactive, headless control channel for the desktop UI.
 //!
 //! The real `App` runs under `egui_kittest` with no window, and a tiny Unix
@@ -24,7 +26,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use egui::accesskit::Role;
 use egui_kittest::Harness;
@@ -233,7 +235,7 @@ fn click_node(_ui: &Ui, mut nodes: Vec<egui_kittest::Node<'_>>) {
 }
 
 /// Execute one command. Returns true to shut the server down.
-fn execute(ui: &mut Ui, line: &str, dir: &PathBuf, out: &mut String) -> bool {
+fn execute(ui: &mut Ui, line: &str, dir: &Path, out: &mut String) -> bool {
     let mut parts = line.splitn(2, ' ');
     let command = parts.next().unwrap_or("");
     let rest = parts.next().unwrap_or("").trim();
@@ -410,7 +412,7 @@ fn send(sock: PathBuf, command: String) {
     print!("{response}");
 }
 
-fn main() {
+pub fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("serve") => {
@@ -433,4 +435,16 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+}
+
+#[cfg(unix)]
+fn main() {
+    imp::main();
+}
+
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("ui_debug drives reel over a Unix domain socket and is not available on this platform");
 }

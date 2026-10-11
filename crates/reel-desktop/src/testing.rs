@@ -227,21 +227,21 @@ fn file(id: usize, path: &str, length: u64, included: bool) -> FileView {
 /// Search results for the demo backend, so the search screen has something to
 /// show without touching a network.
 pub fn sample_search_hits() -> Vec<SearchHit> {
-    let mut nosferatu = SearchHit::new("Nosferatu, eine Symphonie des Grauens", "archive.org");
+    let mut nosferatu = SearchHit::new("Nosferatu, eine Symphonie des Grauens", "demo");
     nosferatu.year = Some(1922);
     nosferatu.popularity = Some(432_789);
     nosferatu.size_bytes = Some(562_561_084);
     nosferatu.torrent_url =
-        Some("https://archive.org/download/nosferatu/nosferatu_archive.torrent".to_string());
-    nosferatu.detail = Some("archive.org \u{2022} nosferatu".to_string());
+        Some("https://example.test/download/nosferatu.torrent".to_string());
+    nosferatu.detail = Some("demo result \u{2022} nosferatu".to_string());
 
-    let mut caligari = SearchHit::new("The Cabinet of Dr. Caligari", "archive.org");
+    let mut caligari = SearchHit::new("The Cabinet of Dr. Caligari", "demo");
     caligari.year = Some(1920);
     caligari.popularity = Some(95_000);
     caligari.size_bytes = Some(410_000_000);
     caligari.torrent_url =
-        Some("https://archive.org/download/caligari/caligari_archive.torrent".to_string());
-    caligari.detail = Some("archive.org \u{2022} caligari".to_string());
+        Some("https://example.test/download/caligari.torrent".to_string());
+    caligari.detail = Some("demo result \u{2022} caligari".to_string());
 
     vec![nosferatu, caligari]
 }

@@ -5,17 +5,20 @@
 //! comes from [`Backend`], so the same UI runs against a real engine or an
 //! in-memory fake in tests.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, CornerRadius, Rect, Sense, Vec2};
 use reel_catalog::{
-    ArtworkKind, ArtworkRef, CatalogSettings, RowKind, SearchHit, Work, WorkEpisode, WorkMember,
-    build_work_rows, build_works, episode_key, movie_key, separate_works,
+    ArtworkKind, ArtworkRef, CatalogEntry, CatalogSettings, MediaKind, Metadata, Release, RowKind,
+    SearchHit, Work, WorkEpisode, WorkMember, build_work_rows, build_works, episode_key, movie_key,
+    separate_works,
 };
 use reel_core::fmt;
 
-use crate::backend::{Backend, BackendEvent, LibraryItem, MediaDownload, PlayerCapability};
+use crate::backend::{
+    Backend, BackendEvent, LibraryItem, MediaDownload, PlayerCapability, SearchActionPhase,
+};
 use crate::player::{PlaybackInfo, PlaybackStats, PlayerController};
 use crate::theme;
 
@@ -36,6 +39,37 @@ pub struct RowLayout {
     pub kind: RowKind,
     pub title: String,
     pub ids: Vec<usize>,
+}
+
+/// Everything the search page derives from its hits, cached between frames.
+///
+/// The derivation is not cheap — every release name is parsed, every hit's
+/// metadata is cloned, and the hits are regrouped into works — so it is not
+/// something to repeat on every frame of a list that can hold hundreds of rows.
+struct SearchView {
+    signature: SearchSignature,
+    /// Hits after the min-seeders filter and the chosen sort.
+    shown: Vec<SearchHit>,
+    /// Parsed release info for each `shown` hit, by position.
+    releases: Vec<Release>,
+    /// Metadata matched to each `shown` hit, by position.
+    metas: Vec<Option<Metadata>>,
+    /// One card per film or series, in display order (empty when not grouping).
+    works: Vec<Work>,
+}
+
+/// The inputs a [`SearchView`] was built from. When this changes the view is
+/// rebuilt; otherwise the previous one is reused exactly as it was.
+#[derive(Clone, PartialEq, Eq)]
+struct SearchSignature {
+    query: Option<String>,
+    min_seeders: String,
+    sort: SearchSort,
+    grouped: bool,
+    /// Bumped whenever the hit list changes.
+    hits: u64,
+    /// Bumped whenever metadata for a hit arrives.
+    metadata: u64,
 }
 
 pub struct App {
@@ -63,6 +97,48 @@ pub struct App {
     /// Source names and failures worth showing under the results.
     search_note: Option<String>,
     searching: bool,
+    /// Filters that narrow what the backends search for.
+    search_year: String,
+    search_season: String,
+    search_episode: String,
+    /// Hide results below this many seeders. Unknown seeder counts are kept.
+    search_min_seeders: String,
+    /// How the results are ordered for display.
+    search_sort: SearchSort,
+    /// True when the last search failed, so the view says so instead of
+    /// claiming nothing matched.
+    search_failed: bool,
+    /// True while a source may still stream in more results.
+    search_streaming: bool,
+    /// The sources that failed for the current search, kept so the result note
+    /// can be recomputed as more results arrive.
+    search_failures: Vec<(String, String)>,
+    /// Parsed release info per search hit title: film/series, season and
+    /// episode, quality and languages. Computed once per title so the list does
+    /// not re-parse on every frame.
+    search_releases: HashMap<String, Release>,
+    /// Whether results are grouped into one card per film/series.
+    search_grouped: bool,
+    /// Work keys the user expanded in the grouped view.
+    search_expanded: HashSet<String>,
+    /// Category keys (work + tier/season) the user collapsed in the grouped view.
+    search_collapsed_categories: HashSet<String>,
+    /// Per-series choices (season, kind, resolution) in the grouped view.
+    search_series_views: HashMap<String, SeriesView>,
+    /// Search hits currently being added or prepared for playback.
+    search_actions: HashMap<String, SearchActionPhase>,
+    /// Whether the first work has been auto-expanded for the current results.
+    search_expand_initialised: bool,
+    /// Derived search-page data, rebuilt only when its inputs change.
+    search_view: Option<SearchView>,
+    /// Bumped whenever the hit list changes, so the view knows to rebuild.
+    search_revision: u64,
+    /// Bumped whenever metadata for a hit arrives, for the same reason.
+    search_metadata_revision: u64,
+    /// Measured heights of flat result cards, so offscreen ones can be skipped.
+    search_card_heights: Vec<f32>,
+    /// Measured heights of grouped work cards, likewise.
+    search_work_heights: Vec<f32>,
     /// The API key being typed on the settings page. Never filled in from
     /// storage: a credential is written, not displayed.
     api_key_input: String,
@@ -101,6 +177,11 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const TOAST_LIFETIME: Duration = Duration::from_secs(6);
 /// How many entries each catalog row shows.
 const ROW_LIMIT: usize = 30;
+/// Height assumed for a search card before it has been drawn once. The real
+/// height is measured and remembered the first time the card is on screen.
+const SEARCH_CARD_HEIGHT: f32 = 140.0;
+/// Vertical gap between search cards.
+const SEARCH_CARD_GAP: f32 = 8.0;
 /// Record watch progress at most every this many seconds of playback.
 const WATCH_RECORD_INTERVAL: f64 = 5.0;
 
@@ -125,6 +206,26 @@ impl App {
             search_hits: Vec::new(),
             search_note: None,
             searching: false,
+            search_year: String::new(),
+            search_season: String::new(),
+            search_episode: String::new(),
+            search_min_seeders: String::new(),
+            search_sort: SearchSort::Relevance,
+            search_failed: false,
+            search_streaming: false,
+            search_failures: Vec::new(),
+            search_releases: HashMap::new(),
+            search_grouped: true,
+            search_expanded: HashSet::new(),
+            search_collapsed_categories: HashSet::new(),
+            search_series_views: HashMap::new(),
+            search_actions: HashMap::new(),
+            search_expand_initialised: false,
+            search_view: None,
+            search_revision: 0,
+            search_metadata_revision: 0,
+            search_card_heights: Vec::new(),
+            search_work_heights: Vec::new(),
             api_key_input: String::new(),
             settings_draft: None,
             player: PlayerController::new(),
@@ -142,11 +243,12 @@ impl App {
         // Saved settings are canonical: apply playback preferences immediately.
         let settings = app.backend.settings();
         app.player.set_volume(settings.default_volume);
-        app.player.set_preferences(crate::player::PlaybackPreferences {
-            subtitles_enabled: settings.subtitles_enabled,
-            subtitle_language: settings.subtitle_language.clone(),
-            volume: settings.default_volume,
-        });
+        app.player
+            .set_preferences(crate::player::PlaybackPreferences {
+                subtitles_enabled: settings.subtitles_enabled,
+                subtitle_language: settings.subtitle_language.clone(),
+                volume: settings.default_volume,
+            });
         app.refresh();
         app
     }
@@ -210,19 +312,29 @@ impl App {
     }
 
     pub fn submit_search(&mut self) {
-        let query = self.search_query.trim().to_string();
-        if query.is_empty() {
+        let text = self.search_query.trim().to_string();
+        if text.is_empty() {
             self.warn("Type something to search for");
             return;
         }
+
+        let mut query = reel_catalog::SearchQuery::new(text);
+        query.year = self.search_year.trim().parse().ok();
+        query.season = self.search_season.trim().parse().ok();
+        query.episode = self.search_episode.trim().parse().ok();
+
         self.searching = true;
         self.search_note = None;
-        self.search_for = Some(query.clone());
+        self.search_failed = false;
+        self.search_for = Some(query.describe());
         self.backend.search(&query);
     }
 
     pub fn item(&self, id: usize) -> Option<LibraryItem> {
-        self.library.iter().find(|item| item.torrent.id == id).cloned()
+        self.library
+            .iter()
+            .find(|item| item.torrent.id == id)
+            .cloned()
     }
 
     /// The work whose lead torrent is `id`. Screens are keyed by that id.
@@ -256,24 +368,29 @@ impl App {
     }
 
     /// The episode Play should start: the newest resumable one, else the first.
+    ///
+    /// The copy used is the one the user chose for that episode (falling back to
+    /// the best), so "remember the chosen copy" holds when Play starts a series
+    /// and not only when the copy chooser was used.
     pub fn preferred_episode(&self, work: &Work) -> Option<(usize, usize)> {
         let episodes = work.episodes();
         for episode in &episodes {
-            for variant in &episode.variants {
-                // Exact, not the torrent-level fallback: a series must never
-                // treat episode 1's position as episode 2's.
-                let resumable = self
-                    .item(variant.torrent_id)
-                    .and_then(|item| item.entry.watch_by_file.get(&variant.file_id).cloned())
-                    .is_some_and(|progress| progress.is_resumable());
-                if resumable {
-                    return Some((variant.torrent_id, variant.file_id));
-                }
+            let Some(variant) = self.chosen_variant(work, episode) else {
+                continue;
+            };
+            // Exact, not the torrent-level fallback: a series must never treat
+            // episode 1's position as episode 2's.
+            let resumable = self
+                .item(variant.torrent_id)
+                .and_then(|item| item.entry.watch_by_file.get(&variant.file_id).cloned())
+                .is_some_and(|progress| progress.is_resumable());
+            if resumable {
+                return Some((variant.torrent_id, variant.file_id));
             }
         }
         episodes
             .first()
-            .and_then(WorkEpisode::preferred)
+            .and_then(|episode| self.chosen_variant(work, episode))
             .map(|variant| (variant.torrent_id, variant.file_id))
     }
 
@@ -396,11 +513,10 @@ impl App {
             .iter()
             .filter_map(|id| item.torrent.files.iter().find(|f| f.id == *id))
             .map(|sub| {
-                let url = sub
-                    .stream
-                    .url
-                    .clone()
-                    .unwrap_or_else(|| format!("{}{}", self.backend.base_url(), sub.stream.path));
+                let url =
+                    sub.stream.url.clone().unwrap_or_else(|| {
+                        format!("{}{}", self.backend.base_url(), sub.stream.path)
+                    });
                 (url, sub.name.clone())
             })
             .collect();
@@ -448,10 +564,7 @@ impl App {
         self.watch_recording_for = Some(item.entry.info_hash.clone());
 
         tracing::info!(%url, start_at = ?start_at, live = file.included, "opening the player");
-        let ctx = self
-            .pending_ctx
-            .clone()
-            .unwrap_or_else(egui::Context::default);
+        let ctx = self.pending_ctx.clone().unwrap_or_default();
         match self.player.open(&ctx, &capability, &url, info) {
             Ok(()) => {
                 self.screen = Screen::Player;
@@ -478,6 +591,7 @@ impl App {
 
     fn refresh(&mut self) {
         self.library = self.backend.library();
+        self.drive_search_enrich();
 
         // Two torrents of the same film or show become one work, so the library
         // shows versions of a title rather than unrelated cards.
@@ -505,12 +619,138 @@ impl App {
         self.last_refresh = Instant::now();
     }
 
+    /// Keep filling in metadata for search results as lookup slots free up.
+    ///
+    /// Split out of [`Self::refresh`] so a search-metadata event can advance the
+    /// pipeline without rebuilding the library — the settings page, which shows
+    /// none of it, would otherwise do that work on every arrival.
+    fn drive_search_enrich(&mut self) {
+        if !self.searching && !self.search_hits.is_empty() {
+            self.backend.enrich_search(&self.search_hits);
+        }
+    }
+
+    /// Note that the search hits changed, so the derived view is rebuilt.
+    fn bump_search_revision(&mut self) {
+        self.search_revision = self.search_revision.wrapping_add(1);
+    }
+
+    /// The current inputs to the derived search view.
+    fn search_signature(&self) -> SearchSignature {
+        SearchSignature {
+            query: self.search_for.clone(),
+            min_seeders: self.search_min_seeders.clone(),
+            sort: self.search_sort,
+            grouped: self.search_grouped,
+            hits: self.search_revision,
+            metadata: self.search_metadata_revision,
+        }
+    }
+
+    /// Derive the view the search page draws from the raw hits.
+    fn build_search_view(&mut self, signature: SearchSignature) -> SearchView {
+        let min_seeders: u32 = self.search_min_seeders.trim().parse().unwrap_or(0);
+        let mut shown = self.search_hits.clone();
+        if min_seeders > 0 {
+            shown.retain(|hit| hit.seeders.is_none_or(|seeders| seeders >= min_seeders));
+        }
+        self.search_sort.apply(&mut shown);
+
+        // Parse each result once, and remember it by title so a filter change
+        // does not re-parse everything.
+        let releases: Vec<Release> = shown
+            .iter()
+            .map(|hit| match self.search_releases.get(&hit.title) {
+                Some(release) => release.clone(),
+                None => {
+                    let release = reel_catalog::release::analyse_name(&hit.title);
+                    self.search_releases
+                        .insert(hit.title.clone(), release.clone());
+                    release
+                }
+            })
+            .collect();
+
+        // Metadata matched so far, read once per rebuild rather than per frame.
+        let metas: Vec<Option<Metadata>> = shown
+            .iter()
+            .map(|hit| self.backend.search_metadata(hit))
+            .collect();
+
+        let works = if self.search_grouped {
+            self.build_search_works(&shown, &releases, &metas)
+        } else {
+            Vec::new()
+        };
+
+        SearchView {
+            signature,
+            shown,
+            releases,
+            metas,
+            works,
+        }
+    }
+
+    /// Group the shown hits into one work per film or series, best match first.
+    fn build_search_works(
+        &self,
+        shown: &[SearchHit],
+        releases: &[Release],
+        metas: &[Option<Metadata>],
+    ) -> Vec<Work> {
+        // One member per hit; `torrent_id` is its index, so a member maps back
+        // to its hit. Reusing `build_works` keeps the notion of "same title"
+        // identical to the library.
+        let members: Vec<WorkMember> = shown
+            .iter()
+            .enumerate()
+            .map(|(index, hit)| {
+                let entry = CatalogEntry {
+                    torrent_id: index,
+                    info_hash: format!("search-{index}"),
+                    display_title: hit.title.clone(),
+                    year: hit.year,
+                    metadata: metas[index].clone(),
+                    watch: None,
+                    release: releases[index].clone(),
+                    watch_by_file: Default::default(),
+                };
+                WorkMember::new(entry, releases[index].episodes.first().map(|e| e.file_id))
+            })
+            .collect();
+
+        let mut works = build_works(&members);
+        // Order by how well the work's title matches the query, then by the
+        // order the backends returned — so an exact hit stays on top even when a
+        // source ranks a fuzzy match (an episode title, say) above it.
+        let query = self.search_for.clone().unwrap_or_default();
+        works.sort_by_key(|work| {
+            let first = work
+                .members
+                .iter()
+                .map(WorkMember::torrent_id)
+                .min()
+                .unwrap_or(usize::MAX);
+            (std::cmp::Reverse(work_score(work, &query)), first)
+        });
+        works
+    }
+
     fn maybe_refresh(&mut self) {
         // The player needs fresh engine stats for its overlay, and the library
         // needs new metadata as it arrives, so both refresh on one cadence.
         if self.screen != Screen::Settings && self.last_refresh.elapsed() >= REFRESH_INTERVAL {
             self.refresh();
         }
+    }
+
+    /// Whether something is moving without input, so the UI has to keep
+    /// repainting to show it.
+    fn active_transfers(&self) -> bool {
+        self.library.iter().any(|item| {
+            item.torrent.stats.download_bps > 0 || (item.downloading && !item.torrent.finished)
+        })
     }
 
     fn drain_events(&mut self, ctx: &egui::Context) {
@@ -543,7 +783,23 @@ impl App {
                     self.screen = Screen::Detail(work_id);
                 }
                 BackendEvent::Metadata { .. } | BackendEvent::WatchUpdated => {
-                    self.refresh();
+                    // Only these change the library, and the settings page does
+                    // not show it, so it is left alone there.
+                    if self.screen != Screen::Settings {
+                        self.refresh();
+                    }
+                }
+                BackendEvent::SearchMetadata => {
+                    // A rating or poster arrived for a result: the derived view
+                    // has to be rebuilt to pick it up. This does not touch the
+                    // library, so only the search pipeline is advanced.
+                    self.search_metadata_revision = self.search_metadata_revision.wrapping_add(1);
+                    self.drive_search_enrich();
+                }
+                BackendEvent::SearchLookupReady => {
+                    // A lookup slot freed up (or a miss was recorded): let the
+                    // next one start without rebuilding anything.
+                    self.drive_search_enrich();
                 }
                 BackendEvent::Ready { info_hash } => {
                     self.refresh();
@@ -557,6 +813,26 @@ impl App {
                         }
                     }
                 }
+                BackendEvent::PlayReady {
+                    torrent_id,
+                    file_id,
+                } => {
+                    // The files have resolved, so this is a normal play from
+                    // here: start the stream and let `Ready` open the player.
+                    tracing::debug!(
+                        torrent_id,
+                        file_id,
+                        "opening the player for a search result"
+                    );
+                    self.refresh();
+                    self.play_file(ctx, torrent_id, file_id);
+                }
+                BackendEvent::SearchActionProgress { key, phase } => {
+                    self.search_actions.insert(key, phase);
+                }
+                BackendEvent::SearchActionFinished { key } => {
+                    self.search_actions.remove(&key);
+                }
                 BackendEvent::ApiKeyChecked { ok, message } => {
                     self.set_toast(message, !ok);
                 }
@@ -565,15 +841,66 @@ impl App {
                     // user is looking at now.
                     if self.search_for.as_deref() == Some(query.as_str()) {
                         self.searching = false;
+                        // "Nothing matched" and "every source failed" are
+                        // different things and must read differently.
+                        self.search_failed =
+                            results.hits.is_empty() && !results.failures.is_empty();
+                        self.search_failures = results.failures.clone();
                         self.search_note = describe_search(&results);
                         self.search_hits = results.hits;
+                        self.search_releases.clear();
+                        self.search_expanded.clear();
+                        self.search_collapsed_categories.clear();
+                        self.search_series_views.clear();
+                        self.search_expand_initialised = false;
+                        // A new result set means the measured card heights are
+                        // for the wrong rows.
+                        self.search_card_heights.clear();
+                        self.search_work_heights.clear();
+                        self.bump_search_revision();
+                        // A source that paginates keeps sending more.
+                        self.search_streaming = true;
+                        self.backend.enrich_search(&self.search_hits);
+                    }
+                }
+                BackendEvent::SearchHitsAdded { query, hits } => {
+                    if self.search_for.as_deref() == Some(query.as_str()) {
+                        let mut known: HashSet<String> =
+                            self.search_hits.iter().map(SearchHit::key).collect();
+                        let fresh: Vec<SearchHit> = hits
+                            .into_iter()
+                            .filter(|hit| known.insert(hit.key()))
+                            .collect();
+                        if !fresh.is_empty() {
+                            self.backend.enrich_search(&fresh);
+                            self.search_hits.extend(fresh);
+                            self.search_note = describe_search_summary(
+                                self.search_hits.len(),
+                                &self.search_failures,
+                            );
+                            self.bump_search_revision();
+                        }
+                    }
+                }
+                BackendEvent::SearchStreamEnded { query } => {
+                    if self.search_for.as_deref() == Some(query.as_str()) {
+                        self.search_streaming = false;
                     }
                 }
                 BackendEvent::SearchFailed { query, message } => {
                     if self.search_for.as_deref() == Some(query.as_str()) {
                         self.searching = false;
+                        self.search_streaming = false;
                         self.search_hits.clear();
+                        self.search_releases.clear();
+                        self.search_expanded.clear();
+                        self.search_collapsed_categories.clear();
+                        self.search_series_views.clear();
+                        self.search_failed = true;
                         self.search_note = Some(message);
+                        self.search_card_heights.clear();
+                        self.search_work_heights.clear();
+                        self.bump_search_revision();
                     }
                 }
             }
@@ -587,6 +914,26 @@ impl App {
             error,
             shown: Instant::now(),
         });
+    }
+
+    fn start_search_action(&mut self, hit: SearchHit, play: bool) {
+        let phase = if hit.magnet.is_none() && hit.torrent_url.is_none() {
+            SearchActionPhase::ResolvingMagnet
+        } else {
+            SearchActionPhase::Adding
+        };
+        let key = hit.key();
+        let title = reel_core::title::truncate(&hit.title, 40);
+        self.search_actions.insert(key, phase);
+        if play {
+            self.backend.play_search_hit(hit, self.add_media_only);
+        } else {
+            self.backend.add_search_hit(hit, self.add_media_only);
+        }
+        self.set_toast(format!("{} {title}", phase.label()), false);
+        if let Some(ctx) = &self.pending_ctx {
+            ctx.request_repaint();
+        }
     }
 
     fn warn(&mut self, message: impl Into<String>) {
@@ -734,6 +1081,19 @@ impl eframe::App for App {
         self.maybe_refresh();
         self.drain_events(&ctx);
 
+        // Progress, transfer rates and peer counts come from the engine and
+        // change with no input, so keep repainting while anything is active.
+        // Metadata lookups and a search still streaming count too: without that,
+        // a rating or a later page that arrives after the user stops moving the
+        // mouse would not appear until they moved it.
+        if self.active_transfers()
+            || self.backend.pending_lookups() > 0
+            || self.search_streaming
+            || !self.search_actions.is_empty()
+        {
+            ctx.request_repaint_after(REFRESH_INTERVAL);
+        }
+
         // Players get a bare canvas: the video and its controls only.
         if self.screen == Screen::Player {
             self.player_screen(ui, &ctx);
@@ -838,7 +1198,11 @@ impl App {
                 self.toast = None;
                 return;
             }
-            let color = if toast.error { theme::DANGER } else { theme::OK };
+            let color = if toast.error {
+                theme::DANGER
+            } else {
+                theme::OK
+            };
             (toast.message.clone(), color)
         };
 
@@ -880,7 +1244,11 @@ impl App {
         };
         self.remove_selected = match only {
             Some(torrent_id) => HashSet::from([torrent_id]),
-            None => work.members.iter().map(|member| member.torrent_id()).collect(),
+            None => work
+                .members
+                .iter()
+                .map(|member| member.torrent_id())
+                .collect(),
         };
         self.remove_files = false;
         self.show_remove = Some(work_id);
@@ -952,7 +1320,10 @@ impl App {
                     let remove_label = if count == 0 {
                         "Remove selected".to_string()
                     } else {
-                        format!("Remove {count} torrent{}", if count == 1 { "" } else { "s" })
+                        format!(
+                            "Remove {count} torrent{}",
+                            if count == 1 { "" } else { "s" }
+                        )
                     };
                     if ui
                         .add_enabled(
@@ -999,7 +1370,10 @@ impl App {
                 self.backend.remove(torrent_id, self.remove_files);
             }
             self.set_toast(
-                format!("Removed {count} torrent{}", if count == 1 { "" } else { "s" }),
+                format!(
+                    "Removed {count} torrent{}",
+                    if count == 1 { "" } else { "s" }
+                ),
                 false,
             );
             self.refresh();
@@ -1033,7 +1407,8 @@ impl App {
         radius: CornerRadius,
     ) {
         if let Some(uri) = reference.and_then(|artwork| artwork.local_uri()) {
-            ui.painter().rect_filled(rect, radius, theme::SURFACE_RAISED);
+            ui.painter()
+                .rect_filled(rect, radius, theme::SURFACE_RAISED);
             // Crop rather than squash. Providers publish posters at 2:3 and
             // backdrops at 16:9, and a hero banner is far wider than either, so
             // filling the rect directly would visibly distort the image.
@@ -1054,7 +1429,7 @@ impl App {
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
-            reel_core::title::initials(&seed),
+            reel_core::title::initials(seed),
             egui::FontId::proportional(rect.height() * 0.22),
             Color32::from_white_alpha(38),
         );
@@ -1102,7 +1477,10 @@ impl App {
                 .filter(|episode| episode.variants.len() > 1)
                 .count();
             if choices > 0 {
-                format!("{} episodes \u{00b7} {choices} with choices", episodes.len())
+                format!(
+                    "{} episodes \u{00b7} {choices} with choices",
+                    episodes.len()
+                )
             } else {
                 plural(episodes.len(), "episode")
             }
@@ -1111,7 +1489,10 @@ impl App {
                 Some(version) => {
                     let count = work.versions().len();
                     if count > 1 {
-                        format!("{} \u{00b7} {count} versions", version.attributes.quality_label())
+                        format!(
+                            "{} \u{00b7} {count} versions",
+                            version.attributes.quality_label()
+                        )
                     } else {
                         version.attributes.quality_label()
                     }
@@ -1127,15 +1508,13 @@ impl App {
                 egui::pos2(rect.left() + 8.0, rect.bottom() - 36.0),
                 Vec2::new(rect.width() - 16.0, 16.0),
             ),
-            egui::Label::new(
-                egui::RichText::new(subtitle)
-                    .size(10.5)
-                    .color(if work.resume_position().is_some() {
-                        theme::ACCENT
-                    } else {
-                        theme::TEXT_DIM
-                    }),
-            )
+            egui::Label::new(egui::RichText::new(subtitle).size(10.5).color(
+                if work.resume_position().is_some() {
+                    theme::ACCENT
+                } else {
+                    theme::TEXT_DIM
+                },
+            ))
             .selectable(false),
         );
 
@@ -1352,7 +1731,11 @@ impl App {
     fn empty_library(&mut self, ui: &mut egui::Ui) {
         ui.add_space(60.0);
         ui.vertical_centered(|ui| {
-            ui.label(egui::RichText::new("Your library is empty").size(24.0).strong());
+            ui.label(
+                egui::RichText::new("Your library is empty")
+                    .size(24.0)
+                    .strong(),
+            );
             ui.add_space(10.0);
             ui.label(
                 egui::RichText::new(
@@ -1692,8 +2075,16 @@ impl App {
                 // downloads at once, so progress lives on each row. (There is no
                 // "up" stat either — reel never seeds.)
                 ui.horizontal(|ui| {
-                    stat(ui, "downloaded", &fmt::human_bytes(item.torrent.stats.progress_bytes));
-                    stat(ui, "down", &fmt::human_rate(item.torrent.stats.download_bps));
+                    stat(
+                        ui,
+                        "downloaded",
+                        &fmt::human_bytes(item.torrent.stats.progress_bytes),
+                    );
+                    stat(
+                        ui,
+                        "down",
+                        &fmt::human_rate(item.torrent.stats.download_bps),
+                    );
                     stat(ui, "peers", &item.torrent.stats.peers.live.to_string());
                     stat(ui, "eta", &fmt::human_eta(item.torrent.stats.eta_seconds));
                 });
@@ -1876,10 +2267,10 @@ impl App {
     /// Explain the paused-on-add state: the engine holds a fetch plan but is
     /// not fetching, so nothing should look like it is downloading.
     fn pause_notice(&self, ui: &mut egui::Ui, work: &Work) {
-        let downloading = work
-            .members
-            .iter()
-            .any(|member| self.item(member.torrent_id()).is_some_and(|item| item.downloading));
+        let downloading = work.members.iter().any(|member| {
+            self.item(member.torrent_id())
+                .is_some_and(|item| item.downloading)
+        });
         let paused = self
             .lead_item(work)
             .is_some_and(|item| item.torrent.stats.is_paused());
@@ -1902,7 +2293,11 @@ impl App {
             return;
         }
         ui.add_space(6.0);
-        ui.label(egui::RichText::new("Extras").size(13.0).color(theme::TEXT_DIM));
+        ui.label(
+            egui::RichText::new("Extras")
+                .size(13.0)
+                .color(theme::TEXT_DIM),
+        );
         for extra in extras {
             ui.horizontal(|ui| {
                 ui.label(
@@ -1937,7 +2332,10 @@ impl App {
                 heading = format!("{} \u{2014} Season {number}", work.title);
             }
         }
-        heading.push_str(&format!("  \u{2022}  {}", plural(episodes.len(), "episode")));
+        heading.push_str(&format!(
+            "  \u{2022}  {}",
+            plural(episodes.len(), "episode")
+        ));
         if seasons.len() > 1 {
             heading.push_str(&format!("  \u{2022}  {} seasons", seasons.len()));
         }
@@ -2064,7 +2462,9 @@ impl App {
             .map(|variant| variant.attributes.quality_label())
             .unwrap_or_else(|| "quality unknown".to_string());
         let variants = episode.variants.clone();
-        let chosen_pair = chosen.as_ref().map(|variant| (variant.torrent_id, variant.file_id));
+        let chosen_pair = chosen
+            .as_ref()
+            .map(|variant| (variant.torrent_id, variant.file_id));
 
         egui::Frame::NONE
             .fill(theme::SURFACE)
@@ -2120,7 +2520,9 @@ impl App {
                         if let Some(progress) = watched.as_ref() {
                             if progress.is_finished() {
                                 facts.push("watched".to_string());
-                            } else {
+                            } else if progress.is_resumable() {
+                                // Below the resume threshold Play starts from
+                                // the beginning, so do not promise a resume.
                                 facts.push(format!(
                                     "resume {}",
                                     fmt::human_duration(progress.position)
@@ -2155,8 +2557,8 @@ impl App {
                         if variants.len() > 1 {
                             ui.menu_button(format!("copy: {quality}"), |ui| {
                                 for variant in &variants {
-                                    let selected = chosen_pair
-                                        == Some((variant.torrent_id, variant.file_id));
+                                    let selected =
+                                        chosen_pair == Some((variant.torrent_id, variant.file_id));
                                     let label = format!(
                                         "{}  \u{00b7}  {}",
                                         variant.attributes.quality_label(),
@@ -2180,12 +2582,7 @@ impl App {
     }
 
     /// Every source backing the work, with per-source controls.
-    fn work_sources(
-        &mut self,
-        ui: &mut egui::Ui,
-        work: &Work,
-        action: &mut Option<DetailAction>,
-    ) {
+    fn work_sources(&mut self, ui: &mut egui::Ui, work: &Work, action: &mut Option<DetailAction>) {
         ui.add_space(16.0);
         ui.separator();
         ui.add_space(10.0);
@@ -2208,8 +2605,11 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.label(
-                                egui::RichText::new(reel_core::title::truncate(&item.heading(), 56))
-                                    .size(12.5),
+                                egui::RichText::new(reel_core::title::truncate(
+                                    &item.heading(),
+                                    56,
+                                ))
+                                .size(12.5),
                             );
                             ui.label(
                                 egui::RichText::new(format!(
@@ -2264,7 +2664,6 @@ impl App {
                 .size(11.0),
         );
     }
-
 }
 
 enum DetailAction {
@@ -2307,15 +2706,17 @@ pub fn companion_subtitles(
     files
         .iter()
         .filter(|file| file.is_subtitle)
-        .filter(|file| match (episode_token(&file.name), video_token.as_deref()) {
-            // The episode code is the strongest signal: it keeps S01E03's
-            // subtitles away from S01E02 even in a shared folder.
-            (Some(sub), Some(token)) => sub == token,
-            _ => {
-                dir_of(&file.path) == video_dir
-                    && shares_title_prefix(&file_stem(&file.name), &video_stem)
-            }
-        })
+        .filter(
+            |file| match (episode_token(&file.name), video_token.as_deref()) {
+                // The episode code is the strongest signal: it keeps S01E03's
+                // subtitles away from S01E02 even in a shared folder.
+                (Some(sub), Some(token)) => sub == token,
+                _ => {
+                    dir_of(&file.path) == video_dir
+                        && shares_title_prefix(&file_stem(&file.name), &video_stem)
+                }
+            },
+        )
         .map(|file| file.id)
         .collect()
 }
@@ -2457,7 +2858,11 @@ pub fn resume_start_at(item: &LibraryItem, file_id: usize) -> Option<f64> {
         .get(&file_id)
         .filter(|progress| progress.is_resumable())
         .map(|progress| progress.position);
-    per_file.or_else(|| (!item.entry.is_series()).then(|| item.resume_position()).flatten())
+    per_file.or_else(|| {
+        (!item.entry.is_series())
+            .then(|| item.resume_position())
+            .flatten()
+    })
 }
 
 /// What a single file's download is doing, for one row.
@@ -2576,7 +2981,9 @@ impl App {
 
         ui.add_space(12.0);
         let submit = ui
-            .add(egui::Button::new(egui::RichText::new("Add torrent").size(15.0)))
+            .add(egui::Button::new(
+                egui::RichText::new("Add torrent").size(15.0),
+            ))
             .clicked();
         let enter = response.has_focus()
             && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
@@ -2602,7 +3009,11 @@ impl App {
 
         if !self.library.is_empty() {
             ui.add_space(24.0);
-            ui.label(egui::RichText::new("Already in your library").size(16.0).strong());
+            ui.label(
+                egui::RichText::new("Already in your library")
+                    .size(16.0)
+                    .strong(),
+            );
             ui.add_space(6.0);
             for item in self.library.clone() {
                 ui.horizontal(|ui| {
@@ -2650,12 +3061,63 @@ impl App {
             }
         });
 
+        // Filters. Year/season/episode are sent to the backends that understand
+        // them (ext.to does); min-seeders and sort are applied to what comes back.
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Filters:")
+                    .size(11.0)
+                    .color(theme::TEXT_DIM),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search_year)
+                    .hint_text("year")
+                    .desired_width(56.0),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search_season)
+                    .hint_text("season")
+                    .desired_width(56.0),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search_episode)
+                    .hint_text("episode")
+                    .desired_width(56.0),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search_min_seeders)
+                    .hint_text("min seeders")
+                    .desired_width(84.0),
+            );
+            egui::ComboBox::from_id_salt("search-sort")
+                .selected_text(self.search_sort.label())
+                .show_ui(ui, |ui| {
+                    for sort in [
+                        SearchSort::Relevance,
+                        SearchSort::Seeders,
+                        SearchSort::Size,
+                        SearchSort::Newest,
+                    ] {
+                        if ui
+                            .selectable_value(&mut self.search_sort, sort, sort.label())
+                            .clicked()
+                        {
+                            // Re-sort and redraw now rather than on the next input.
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                });
+            ui.separator();
+            ui.checkbox(&mut self.search_grouped, "Group by title")
+                .on_hover_text(
+                    "One card per film or series, with its torrents grouped by quality or season",
+                );
+        });
+
         ui.add_space(6.0);
         if sources.is_empty() {
-            ui.colored_label(
-                theme::WARN,
-                "No search sources are configured. See docs/ADDING_A_SOURCE.md.",
-            );
+            ui.colored_label(theme::WARN, "No search sources are configured.");
         } else {
             let names: Vec<String> = sources
                 .iter()
@@ -2679,24 +3141,76 @@ impl App {
             ui.label(egui::RichText::new(note).size(11.5).color(theme::TEXT_DIM));
         }
 
+        // A paginating source keeps sending pages; say so while they arrive.
+        if self.search_streaming {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    egui::RichText::new("finding more\u{2026}")
+                        .size(11.0)
+                        .color(theme::TEXT_DIM),
+                );
+            });
+        }
+
         ui.add_space(12.0);
 
-        if self.search_hits.is_empty() {
-            ui.label(
-                egui::RichText::new(if self.search_for.is_some() {
-                    "Nothing matched."
-                } else {
-                    "Results will appear here."
-                })
-                .color(theme::TEXT_DIM),
-            );
+        // Everything below is derived from the hits, and deriving it is not
+        // cheap: every release name is parsed, every hit's metadata is cloned,
+        // and the hits are regrouped into works. Cache the result and rebuild it
+        // only when an input changes, never on a plain redraw.
+        let signature = self.search_signature();
+        let stale = self
+            .search_view
+            .as_ref()
+            .is_none_or(|view| view.signature != signature);
+        if stale {
+            let rebuilt = self.build_search_view(signature);
+            self.search_view = Some(rebuilt);
+        }
+
+        // Take the view out of `self` so the card renderers, which need
+        // `&mut self`, can borrow it while drawing. It goes back afterwards.
+        let view = match self.search_view.take() {
+            Some(view) => view,
+            None => return,
+        };
+
+        if view.shown.is_empty() {
+            let (text, color) = if self.search_failed {
+                (
+                    "The search failed \u{2014} see the message above.",
+                    theme::WARN,
+                )
+            } else if self.search_for.is_some() && !self.search_hits.is_empty() {
+                ("No results match the current filters.", theme::TEXT_DIM)
+            } else if self.search_for.is_some() {
+                ("Nothing matched.", theme::TEXT_DIM)
+            } else {
+                ("Results will appear here.", theme::TEXT_DIM)
+            };
+            ui.label(egui::RichText::new(text).color(color));
+            self.search_view = Some(view);
             return;
         }
 
-        let mut add: Option<SearchHit> = None;
+        let shown = &view.shown;
+        let releases = &view.releases;
+        let metas = &view.metas;
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for hit in self.search_hits.clone() {
+        let mut actions = SearchActions::default();
+
+        if self.search_grouped {
+            self.search_grouped_list(ui, &view.works, shown, releases, &mut actions);
+        } else {
+            // Only the cards actually on screen are laid out; the rest are
+            // skipped, with their last measured height reserved.
+            let mut heights = std::mem::take(&mut self.search_card_heights);
+            virtual_list(ui, shown.len(), &mut heights, |ui, index| {
+                let hit = &shown[index];
+                let release = &releases[index];
+                let metadata = metas[index].as_ref();
                 egui::Frame::NONE
                     .fill(theme::SURFACE)
                     .inner_margin(egui::Margin::symmetric(12, 10))
@@ -2710,8 +3224,27 @@ impl App {
                                         .strong(),
                                 );
 
+                                // What it is: film or series, with season and
+                                // episode when the name carries them.
                                 let mut facts = Vec::new();
-                                if let Some(year) = hit.year {
+                                match release.kind {
+                                    MediaKind::Movie => facts.push("Film".to_string()),
+                                    MediaKind::Series => {
+                                        let episode =
+                                            release.episodes.first().and_then(|e| e.episode);
+                                        facts.push(match (release.season, episode) {
+                                            (Some(season), Some(episode)) => {
+                                                format!("Series S{season:02}E{episode:02}")
+                                            }
+                                            (Some(season), None) => {
+                                                format!("Series S{season:02}")
+                                            }
+                                            _ => "Series".to_string(),
+                                        });
+                                    }
+                                    MediaKind::Unknown => {}
+                                }
+                                if let Some(year) = hit.year.or(release.year) {
                                     facts.push(year.to_string());
                                 }
                                 facts.push(hit.source.clone());
@@ -2721,6 +3254,9 @@ impl App {
                                 if let Some(seeders) = hit.seeders {
                                     facts.push(format!("{seeders} seeders"));
                                 }
+                                if let Some(leechers) = hit.leechers {
+                                    facts.push(format!("{leechers} leechers"));
+                                }
                                 if let Some(popularity) = hit.popularity {
                                     facts.push(format!("{popularity} downloads"));
                                 }
@@ -2729,36 +3265,928 @@ impl App {
                                         .size(11.0)
                                         .color(theme::TEXT_DIM),
                                 );
+
+                                // Quality and languages, when the name
+                                // advertises them.
+                                let mut chips = release.attributes.summary();
+                                chips.extend(release.attributes.languages.iter().cloned());
+                                if !chips.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(chips.join("  \u{00b7}  "))
+                                            .size(10.5)
+                                            .color(theme::TEXT_DIM),
+                                    );
+                                }
+
+                                // What the metadata provider says about this
+                                // title, once it has answered.
+                                if let Some(metadata) = metadata {
+                                    let mut facts = Vec::new();
+                                    if let Some(rating) = display_rating(metadata) {
+                                        facts.push(format!("\u{2605} {rating:.1}/10"));
+                                    }
+                                    if let Some(votes) = metadata.vote_count {
+                                        facts.push(format!("{votes} votes"));
+                                    }
+                                    if let Some(runtime) = metadata.runtime_label() {
+                                        facts.push(runtime);
+                                    }
+                                    if !metadata.genres.is_empty() {
+                                        facts.push(metadata.genres.join(", "));
+                                    }
+                                    if !facts.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(facts.join("   \u{2022}   "))
+                                                .size(10.5)
+                                                .color(theme::ACCENT),
+                                        );
+                                    }
+                                    if let Some(overview) = metadata.overview.as_deref() {
+                                        ui.label(
+                                            egui::RichText::new(reel_core::title::truncate(
+                                                overview, 150,
+                                            ))
+                                            .size(10.5)
+                                            .color(theme::TEXT_DIM),
+                                        );
+                                    }
+                                }
+
+                                if let Some(detail) = &hit.detail {
+                                    ui.label(
+                                        egui::RichText::new(reel_core::title::truncate(detail, 90))
+                                            .size(10.5)
+                                            .color(theme::TEXT_DIM),
+                                    );
+                                }
                             });
 
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui
+                                    let can_add = hit.is_usable() || hit.detail_url.is_some();
+                                    let pending = self.search_actions.get(&hit.key()).copied();
+                                    if let Some(phase) = pending {
+                                        search_action_indicator(ui, phase);
+                                    }
+                                    let add_clicked = ui
                                         .add_enabled(
-                                            hit.is_usable(),
+                                            can_add && pending.is_none(),
                                             egui::Button::new("Add"),
                                         )
-                                        .on_disabled_hover_text("This result has no magnet or .torrent URL")
-                                        .clicked()
-                                    {
-                                        add = Some(hit.clone());
+                                        .on_disabled_hover_text(
+                                            "This result has no magnet or .torrent URL",
+                                        )
+                                        .on_hover_text(
+                                            "Add this result; the magnet is fetched from its page",
+                                        )
+                                        .clicked();
+                                    if add_clicked {
+                                        actions.add = Some(hit.clone());
+                                    }
+                                    if let Some(url) = &hit.detail_url {
+                                        if ui.button("Open").clicked() {
+                                            actions.open = Some(url.clone());
+                                        }
+                                    }
+                                    if let Some(magnet) = &hit.magnet {
+                                        if ui
+                                            .button("Copy")
+                                            .on_hover_text("Copy the magnet link")
+                                            .clicked()
+                                        {
+                                            actions.copy = Some(magnet.clone());
+                                        }
                                     }
                                 },
                             );
                         });
                     });
-                ui.add_space(6.0);
+            });
+            self.search_card_heights = heights;
+        }
+
+        self.search_view = Some(view);
+
+        if let Some(url) = actions.open {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        }
+        if let Some(magnet) = actions.copy {
+            ui.ctx().copy_text(magnet);
+            self.set_toast("Magnet copied", false);
+        }
+        if let Some(hit) = actions.add {
+            self.start_search_action(hit, false);
+        }
+        if let Some(hit) = actions.play {
+            self.start_search_action(hit, true);
+        }
+    }
+
+    /// Grouped results: one card per film or series, its torrents grouped by
+    /// quality tier (film) or season (series).
+    fn search_grouped_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        works: &[Work],
+        shown: &[SearchHit],
+        releases: &[Release],
+        actions: &mut SearchActions,
+    ) {
+        // Open the first work so results are visible without a click.
+        if !self.search_expand_initialised {
+            if let Some(first) = works.first() {
+                self.search_expanded.insert(first.key.clone());
+            }
+            self.search_expand_initialised = true;
+        }
+
+        // Only the cards on screen are laid out; cards scrolled past are
+        // skipped, with their last measured height reserved.
+        let mut heights = std::mem::take(&mut self.search_work_heights);
+        virtual_list(ui, works.len(), &mut heights, |ui, index| {
+            self.search_work_card(ui, &works[index], shown, releases, actions);
+        });
+        self.search_work_heights = heights;
+    }
+
+    /// One film or series: artwork, details, and — when open — its torrents.
+    fn search_work_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        work: &Work,
+        shown: &[SearchHit],
+        releases: &[Release],
+        actions: &mut SearchActions,
+    ) {
+        let key = work.key.clone();
+        let expanded = self.search_expanded.contains(&key);
+
+        egui::Frame::NONE
+            .fill(theme::SURFACE)
+            .inner_margin(egui::Margin::symmetric(14, 12))
+            .corner_radius(theme::CARD_RADIUS)
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    let (poster, _) =
+                        ui.allocate_exact_size(Vec2::new(74.0, 111.0), Sense::hover());
+                    Self::paint_art(
+                        ui,
+                        poster,
+                        work.poster(),
+                        &work.title,
+                        ArtworkKind::Poster,
+                        theme::CARD_RADIUS,
+                    );
+
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(work.heading()).size(15.0).strong());
+                            ui.label(
+                                egui::RichText::new(if work.is_series() {
+                                    "Series"
+                                } else {
+                                    "Film"
+                                })
+                                .size(10.5)
+                                .color(theme::ACCENT),
+                            );
+                            if let Some(rating) = work.metadata.as_ref().and_then(display_rating) {
+                                ui.label(
+                                    egui::RichText::new(format!("\u{2605} {rating:.1}/10"))
+                                        .size(11.5)
+                                        .color(theme::ACCENT),
+                                );
+                            }
+                        });
+
+                        let mut facts = Vec::new();
+                        if let Some(metadata) = work.metadata.as_ref() {
+                            if let Some(runtime) = metadata.runtime_label() {
+                                facts.push(runtime);
+                            }
+                            if !metadata.genres.is_empty() {
+                                facts.push(metadata.genres.join(", "));
+                            }
+                        }
+                        facts.push(plural(work.torrent_count(), "torrent"));
+                        ui.label(
+                            egui::RichText::new(facts.join("   \u{2022}   "))
+                                .size(11.0)
+                                .color(theme::TEXT_DIM),
+                        );
+
+                        if let Some(overview) =
+                            work.metadata.as_ref().and_then(|m| m.overview.as_deref())
+                        {
+                            ui.label(
+                                egui::RichText::new(reel_core::title::truncate(overview, 160))
+                                    .size(11.0)
+                                    .color(theme::TEXT_DIM),
+                            );
+                        }
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                        if ui.button(if expanded { "Hide" } else { "Show" }).clicked() {
+                            if expanded {
+                                self.search_expanded.remove(&key);
+                            } else {
+                                self.search_expanded.insert(key.clone());
+                            }
+                        }
+                        // The best release of this title, for a one-click play.
+                        let best = work.members.iter().max_by_key(|member| {
+                            let seeders = shown
+                                .get(member.torrent_id())
+                                .and_then(|hit| hit.seeders)
+                                .unwrap_or(0);
+                            (member.entry.release.attributes.quality_rank(), seeders)
+                        });
+                        if let Some(hit) = best.and_then(|member| shown.get(member.torrent_id())) {
+                            let can_play = hit.is_usable() || hit.detail_url.is_some();
+                            let pending = self.search_actions.get(&hit.key()).copied();
+                            if let Some(phase) = pending {
+                                search_action_indicator(ui, phase);
+                            }
+                            if ui
+                                .add_enabled(
+                                    can_play && pending.is_none(),
+                                    egui::Button::new("Play"),
+                                )
+                                .on_hover_text("Add and play the best release of this title")
+                                .clicked()
+                            {
+                                actions.play = Some(hit.clone());
+                            }
+                        }
+                    });
+                });
+
+                if expanded {
+                    ui.add_space(8.0);
+                    self.search_work_categories(ui, work, shown, releases, actions);
+                }
+            });
+    }
+
+    /// The categories inside a work: resolution tiers for a film, seasons for a
+    /// series. Each is a collapsible section of torrent rows.
+    fn search_work_categories(
+        &mut self,
+        ui: &mut egui::Ui,
+        work: &Work,
+        shown: &[SearchHit],
+        releases: &[Release],
+        actions: &mut SearchActions,
+    ) {
+        if work.is_series() {
+            self.search_series_categories(ui, work, shown, actions);
+            return;
+        }
+
+        // A film: resolution tiers, best first.
+        let mut categories: Vec<(i64, String, Vec<usize>)> = Vec::new();
+        for member in &work.members {
+            let index = member.torrent_id();
+            let release = &member.entry.release;
+            let (order, name) = resolution_category(release.attributes.resolution.as_deref());
+            match categories
+                .iter_mut()
+                .find(|(_, existing, _)| *existing == name)
+            {
+                Some((_, _, indices)) => indices.push(index),
+                None => categories.push((order, name, vec![index])),
+            }
+        }
+        categories.sort_by_key(|(order, _, _)| *order);
+
+        for (_, name, mut indices) in categories {
+            let category_key = format!("{}|{name}", work.key);
+            let collapsed = self.search_collapsed_categories.contains(&category_key);
+            ui.horizontal(|ui| {
+                if ui
+                    .button(if collapsed { "Show" } else { "Hide" })
+                    .on_hover_text(if collapsed { "Expand" } else { "Collapse" })
+                    .clicked()
+                {
+                    if collapsed {
+                        self.search_collapsed_categories.remove(&category_key);
+                    } else {
+                        self.search_collapsed_categories
+                            .insert(category_key.clone());
+                    }
+                }
+                ui.label(
+                    egui::RichText::new(&name)
+                        .size(12.0)
+                        .strong()
+                        .color(theme::TEXT_DIM),
+                );
+                ui.label(
+                    egui::RichText::new(format!("{}", indices.len()))
+                        .size(11.0)
+                        .color(theme::TEXT_DIM),
+                );
+            });
+
+            if collapsed {
+                continue;
+            }
+            // `shown` is already in the chosen order, and an index is its
+            // position in `shown`, so ascending index is the sorted order.
+            indices.sort_unstable();
+            for index in indices {
+                self.search_grouped_row(ui, &shown[index], &releases[index], false, actions);
+            }
+            ui.add_space(4.0);
+        }
+    }
+
+    /// A series: seasons as tabs, then complete-season packs versus single
+    /// episodes, then resolution groups.
+    fn search_series_categories(
+        &mut self,
+        ui: &mut egui::Ui,
+        work: &Work,
+        shown: &[SearchHit],
+        actions: &mut SearchActions,
+    ) {
+        // Seasons in order, as positions into `work.members`.
+        let mut seasons: Vec<(u32, Vec<usize>)> = Vec::new();
+        for (position, member) in work.members.iter().enumerate() {
+            let season = member.entry.release.season.unwrap_or(0);
+            match seasons.iter_mut().find(|(existing, _)| *existing == season) {
+                Some((_, positions)) => positions.push(position),
+                None => seasons.push((season, vec![position])),
+            }
+        }
+        seasons.sort_by_key(|(season, _)| *season);
+
+        let key = work.key.clone();
+        let state = self
+            .search_series_views
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        // Default to a real season, not the "Specials" bucket.
+        let mut chosen_season = state.season.or_else(|| {
+            seasons
+                .iter()
+                .map(|(season, _)| *season)
+                .find(|season| *season > 0)
+                .or_else(|| seasons.first().map(|(season, _)| *season))
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("Seasons")
+                    .size(11.0)
+                    .color(theme::TEXT_DIM),
+            );
+            for (season, _) in &seasons {
+                if ui
+                    .selectable_label(Some(*season) == chosen_season, season_label(*season))
+                    .clicked()
+                {
+                    chosen_season = Some(*season);
+                }
             }
         });
 
-        if let Some(hit) = add {
-            match hit.magnet.clone().or_else(|| hit.torrent_url.clone()) {
-                Some(source) => {
-                    self.backend.add(&source, self.add_media_only);
-                    self.set_toast(format!("Adding {}", reel_core::title::truncate(&hit.title, 40)), false);
+        let Some(season) = chosen_season else {
+            return;
+        };
+        let positions: Vec<usize> = seasons
+            .iter()
+            .find(|(existing, _)| *existing == season)
+            .map(|(_, positions)| positions.clone())
+            .unwrap_or_default();
+
+        // A release with no episode number is a whole-season pack.
+        let packs: Vec<usize> = positions
+            .iter()
+            .copied()
+            .filter(|&position| is_complete_season(&work.members[position]))
+            .collect();
+        let episodes: Vec<usize> = positions
+            .iter()
+            .copied()
+            .filter(|&position| !is_complete_season(&work.members[position]))
+            .collect();
+
+        let mut chosen_kind = state.kind;
+        if chosen_kind == SeriesKind::Complete && packs.is_empty() {
+            chosen_kind = SeriesKind::Episodes;
+        }
+        if chosen_kind == SeriesKind::Episodes && episodes.is_empty() {
+            chosen_kind = SeriesKind::Complete;
+        }
+
+        // Only offer the split when both kinds are present.
+        if !packs.is_empty() && !episodes.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Show")
+                        .size(11.0)
+                        .color(theme::TEXT_DIM),
+                );
+                if ui
+                    .selectable_label(
+                        chosen_kind == SeriesKind::Complete,
+                        format!("Complete season · {}", packs.len()),
+                    )
+                    .clicked()
+                {
+                    chosen_kind = SeriesKind::Complete;
                 }
-                None => self.warn("This result has nothing to add"),
+                if ui
+                    .selectable_label(
+                        chosen_kind == SeriesKind::Episodes,
+                        format!("Episodes · {}", episodes.len()),
+                    )
+                    .clicked()
+                {
+                    chosen_kind = SeriesKind::Episodes;
+                }
+            });
+        }
+
+        let selected = match chosen_kind {
+            SeriesKind::Complete => packs,
+            SeriesKind::Episodes => episodes,
+        };
+
+        // The resolutions this selection actually has.
+        let mut resolutions: Vec<String> = Vec::new();
+        for &position in &selected {
+            let label = member_resolution(&work.members[position]);
+            if !resolutions.contains(&label) {
+                resolutions.push(label);
+            }
+        }
+        resolutions.sort_by_key(|label| std::cmp::Reverse(resolution_rank(label)));
+
+        let mut chosen_resolution = state.resolution.clone();
+        if chosen_resolution
+            .as_ref()
+            .is_some_and(|resolution| !resolutions.contains(resolution))
+        {
+            chosen_resolution = None;
+        }
+        if resolutions.len() > 1 {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new("Quality")
+                        .size(11.0)
+                        .color(theme::TEXT_DIM),
+                );
+                if ui
+                    .selectable_label(chosen_resolution.is_none(), "All")
+                    .clicked()
+                {
+                    chosen_resolution = None;
+                }
+                for resolution in &resolutions {
+                    let selected = chosen_resolution.as_deref() == Some(resolution.as_str());
+                    if ui.selectable_label(selected, resolution).clicked() {
+                        chosen_resolution = Some(resolution.clone());
+                    }
+                }
+            });
+        }
+
+        // Remember the choices for the next frame.
+        self.search_series_views.insert(
+            key,
+            SeriesView {
+                season: Some(season),
+                kind: chosen_kind,
+                resolution: chosen_resolution.clone(),
+            },
+        );
+
+        // Group the selected releases under a resolution header.
+        let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+        for &position in &selected {
+            let label = member_resolution(&work.members[position]);
+            if chosen_resolution
+                .as_ref()
+                .is_some_and(|chosen| chosen != &label)
+            {
+                continue;
+            }
+            match groups.iter_mut().find(|(existing, _)| *existing == label) {
+                Some((_, list)) => list.push(position),
+                None => groups.push((label, vec![position])),
+            }
+        }
+        groups.sort_by_key(|(label, _)| std::cmp::Reverse(resolution_rank(label)));
+
+        if groups.is_empty() {
+            ui.label(
+                egui::RichText::new("No releases match this filter.")
+                    .size(11.0)
+                    .color(theme::TEXT_DIM),
+            );
+            return;
+        }
+
+        for (label, mut positions) in groups {
+            ui.label(
+                egui::RichText::new(&label)
+                    .size(12.0)
+                    .strong()
+                    .color(theme::TEXT_DIM),
+            );
+            // `shown` is already in the chosen order, so ascending index is the
+            // sorted order.
+            positions.sort_by_key(|&position| work.members[position].torrent_id());
+            for position in positions {
+                let member = &work.members[position];
+                let index = member.torrent_id();
+                self.search_grouped_row(ui, &shown[index], &member.entry.release, true, actions);
+            }
+            ui.add_space(4.0);
+        }
+    }
+
+    /// One torrent inside a category: a compact line, like a row of ext.to's
+    /// table, with the quality, swarm and the actions.
+    fn search_grouped_row(
+        &self,
+        ui: &mut egui::Ui,
+        hit: &SearchHit,
+        release: &Release,
+        is_series: bool,
+        actions: &mut SearchActions,
+    ) {
+        egui::Frame::NONE
+            .fill(theme::SURFACE_RAISED)
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .corner_radius(theme::CARD_RADIUS)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let mut line = Vec::new();
+                    if is_series {
+                        if let Some(label) = episode_label(release) {
+                            line.push(label);
+                        }
+                    }
+                    let mut chips = release.attributes.summary();
+                    chips.extend(release.attributes.languages.iter().cloned());
+                    if !chips.is_empty() {
+                        line.push(chips.join(" \u{00b7} "));
+                    }
+
+                    let mut facts = Vec::new();
+                    if let Some(size) = hit.size_bytes {
+                        facts.push(fmt::human_bytes(size));
+                    }
+                    if let Some(seeders) = hit.seeders {
+                        facts.push(format!("{seeders} seeders"));
+                    }
+                    if let Some(leechers) = hit.leechers {
+                        facts.push(format!("{leechers} leechers"));
+                    }
+                    if let Some(published) = hit.published_at {
+                        facts.push(age_label(published));
+                    }
+                    facts.push(hit.source.clone());
+
+                    ui.vertical(|ui| {
+                        if !line.is_empty() {
+                            ui.label(
+                                egui::RichText::new(line.join("   \u{2022}   "))
+                                    .size(11.5)
+                                    .color(theme::TEXT),
+                            );
+                        }
+                        ui.label(
+                            egui::RichText::new(facts.join("   \u{2022}   "))
+                                .size(10.5)
+                                .color(theme::TEXT_DIM),
+                        );
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let pending = self.search_actions.get(&hit.key()).copied();
+                        search_actions_ui(ui, hit, pending, actions);
+                    });
+                });
+            });
+        ui.add_space(4.0);
+    }
+}
+
+/// The add/copy/open a search row can ask for, applied once at the end of the
+/// frame so the borrow of the row is released.
+#[derive(Default)]
+struct SearchActions {
+    add: Option<SearchHit>,
+    play: Option<SearchHit>,
+    copy: Option<String>,
+    open: Option<String>,
+}
+
+/// Which kind of release a series section is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SeriesKind {
+    #[default]
+    Complete,
+    Episodes,
+}
+
+/// Per-series choices in the search list: which season, which kind, and which
+/// resolution is selected. Kept per work so each card remembers its own.
+#[derive(Debug, Clone, Default)]
+struct SeriesView {
+    season: Option<u32>,
+    kind: SeriesKind,
+    resolution: Option<String>,
+}
+
+/// The Play / Add / Open / Copy buttons shared by the flat and grouped rows.
+fn search_actions_ui(
+    ui: &mut egui::Ui,
+    hit: &SearchHit,
+    pending: Option<SearchActionPhase>,
+    actions: &mut SearchActions,
+) {
+    let can_add = hit.is_usable() || hit.detail_url.is_some();
+    if let Some(phase) = pending {
+        search_action_indicator(ui, phase);
+    }
+    if ui
+        .add_enabled(can_add && pending.is_none(), egui::Button::new("Play"))
+        .on_disabled_hover_text("This result has no magnet or .torrent URL")
+        .on_hover_text("Add this result and start streaming its best file")
+        .clicked()
+    {
+        actions.play = Some(hit.clone());
+    }
+    if ui
+        .add_enabled(can_add && pending.is_none(), egui::Button::new("Add"))
+        .on_disabled_hover_text("This result has no magnet or .torrent URL")
+        .on_hover_text("Add this result; the magnet is fetched from its page")
+        .clicked()
+    {
+        actions.add = Some(hit.clone());
+    }
+    if let Some(url) = &hit.detail_url {
+        if ui.button("Open").clicked() {
+            actions.open = Some(url.clone());
+        }
+    }
+    if let Some(magnet) = &hit.magnet {
+        if ui
+            .button("Copy")
+            .on_hover_text("Copy the magnet link")
+            .clicked()
+        {
+            actions.copy = Some(magnet.clone());
+        }
+    }
+}
+
+fn search_action_indicator(ui: &mut egui::Ui, phase: SearchActionPhase) {
+    ui.horizontal(|ui| {
+        ui.spinner();
+        ui.label(
+            egui::RichText::new(phase.label())
+                .size(10.5)
+                .color(theme::ACCENT),
+        );
+    });
+}
+
+/// Draw only the search cards that are actually on screen.
+///
+/// egui lays out every widget in a `ScrollArea` even when it is scrolled out of
+/// view, so a result list of hundreds costs hundreds of layouts — and hundreds
+/// of poster decodes — on every frame. This draws the visible cards and reserves
+/// the last measured height of the rest; each card is measured the first time it
+/// comes into view.
+///
+/// `heights` is kept by the caller (and survives between frames) so that a card
+/// scrolled off screen is still accounted for.
+fn virtual_list(
+    ui: &mut egui::Ui,
+    len: usize,
+    heights: &mut Vec<f32>,
+    mut render: impl FnMut(&mut egui::Ui, usize),
+) {
+    if heights.len() < len {
+        heights.resize(len, SEARCH_CARD_HEIGHT);
+    }
+    egui::ScrollArea::vertical().show_viewport(ui, |ui, viewport| {
+        // The viewport is in content coordinates, with zero at the top; the
+        // content is laid out from `origin` downwards, so the cursor has to be
+        // made relative to it before comparing.
+        let origin = ui.max_rect().top();
+        for (index, slot) in heights.iter_mut().take(len).enumerate() {
+            let height = *slot;
+            let top = ui.cursor().top() - origin;
+            let bottom = top + height;
+            let visible = bottom >= viewport.top() && top <= viewport.bottom();
+            if visible {
+                let before = ui.cursor().top();
+                render(ui, index);
+                let measured = ui.cursor().top() - before;
+                if measured > 0.0 {
+                    *slot = measured;
+                }
+            } else {
+                ui.add_space(height);
+            }
+            ui.add_space(SEARCH_CARD_GAP);
+        }
+    });
+}
+
+/// How relevant a work is to the query, highest first.
+///
+/// The title match dominates, so an exact hit still wins. Below that, a title
+/// whose metadata was fetched beats one that matched nothing, and a title with
+/// many torrents beats a one-release oddity — the two signals that the user most
+/// likely meant this one.
+fn work_score(work: &Work, query: &str) -> i64 {
+    let matched = i64::from(work_relevance(&work.title, query));
+    let has_metadata = i64::from(work.metadata.is_some());
+    let torrents = (work.torrent_count() as i64).min(50);
+    matched * 1000 + has_metadata * 100 + torrents * 4
+}
+
+/// How well a work's title matches the search query, so the closest result
+/// sorts first: exact (3), contains the whole query (2), contains every query
+/// word (1), otherwise 0.
+fn work_relevance(title: &str, query: &str) -> u8 {
+    let title = normalize_words(title);
+    let query = normalize_words(query);
+    if query.is_empty() {
+        return 0;
+    }
+    if title == query {
+        return 3;
+    }
+    if title.contains(&query) {
+        return 2;
+    }
+    let words: HashSet<&str> = title.split_whitespace().collect();
+    if query.split_whitespace().all(|word| words.contains(word)) {
+        return 1;
+    }
+    0
+}
+
+/// Lowercase, punctuation to spaces, single-spaced: `The Lighthouse (2019)`
+/// becomes `the lighthouse 2019`.
+fn normalize_words(text: &str) -> String {
+    text.to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The numeric resolution a label names, 0 when unrecognised.
+fn resolution_rank(label: &str) -> u16 {
+    let value = label.to_ascii_lowercase();
+    if value.contains("2160") || value.contains("4k") {
+        2160
+    } else if value.contains("1440") {
+        1440
+    } else if value.contains("1080") {
+        1080
+    } else if value.contains("720") {
+        720
+    } else if value.contains("576") {
+        576
+    } else if value.contains("480") {
+        480
+    } else {
+        0
+    }
+}
+
+/// The category a film torrent belongs to, as `(sort key, label)`. Higher
+/// resolution sorts first.
+fn resolution_category(resolution: Option<&str>) -> (i64, String) {
+    let rank = resolution_rank(resolution.unwrap_or(""));
+    let name = match rank {
+        2160 => "2160p (4K)",
+        1440 => "1440p",
+        1080 => "1080p",
+        720 => "720p",
+        576 => "576p",
+        480 => "480p",
+        _ => "Quality unknown",
+    };
+    (-i64::from(rank), name.to_string())
+}
+
+/// The resolution label for a series release, or a placeholder.
+fn member_resolution(member: &WorkMember) -> String {
+    member
+        .entry
+        .release
+        .attributes
+        .resolution
+        .clone()
+        .unwrap_or_else(|| "Quality unknown".to_string())
+}
+
+/// Whether a release is a whole-season pack rather than a single episode.
+fn is_complete_season(member: &WorkMember) -> bool {
+    member
+        .entry
+        .release
+        .episodes
+        .iter()
+        .find(|episode| !episode.extra)
+        .and_then(|episode| episode.episode)
+        .is_none()
+}
+
+/// `Season 1`, or `Specials` for the season-zero bucket.
+fn season_label(season: u32) -> String {
+    if season == 0 {
+        "Specials".to_string()
+    } else {
+        format!("Season {season}")
+    }
+}
+
+/// `S01E02`, `Season 1 complete`, or `None` when the name says neither.
+fn episode_label(release: &Release) -> Option<String> {
+    let episode = release.episodes.iter().find(|episode| !episode.extra)?;
+    match (release.season.or(episode.season), episode.episode) {
+        (Some(season), Some(number)) => Some(format!("S{season:02}E{number:02}")),
+        (Some(season), None) => Some(format!("Season {season} complete")),
+        (None, Some(number)) => Some(format!("E{number:02}")),
+        (None, None) => None,
+    }
+}
+
+/// A rating worth showing: providers report 0 for a title nobody has voted on.
+fn display_rating(metadata: &Metadata) -> Option<f32> {
+    let rating = metadata.rating?;
+    (rating > 0.0 && metadata.vote_count.unwrap_or(0) > 0).then_some(rating)
+}
+
+/// `6y` / `3mo` / `5d` for a publication time, so a row reads like ext.to's.
+fn age_label(published_at: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(published_at);
+    let days = (now - published_at).max(0) / 86_400;
+    if days >= 365 {
+        format!("{}y", days / 365)
+    } else if days >= 30 {
+        format!("{}mo", days / 30)
+    } else if days >= 1 {
+        format!("{days}d")
+    } else {
+        "today".to_string()
+    }
+}
+
+/// How search results are ordered for display.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SearchSort {
+    /// Keep the order the backends returned: best swarm first.
+    Relevance,
+    Seeders,
+    Size,
+    Newest,
+}
+
+impl SearchSort {
+    fn label(self) -> &'static str {
+        match self {
+            SearchSort::Relevance => "Best match",
+            SearchSort::Seeders => "Most seeders",
+            SearchSort::Size => "Largest",
+            SearchSort::Newest => "Newest",
+        }
+    }
+
+    /// Order in place. Unknown values sort last, and ties keep backend order
+    /// (`sort_by` is stable).
+    fn apply(self, hits: &mut [SearchHit]) {
+        match self {
+            SearchSort::Relevance => {}
+            SearchSort::Seeders => {
+                hits.sort_by_key(|hit| std::cmp::Reverse(hit.seeders.unwrap_or(0)));
+            }
+            SearchSort::Size => {
+                hits.sort_by_key(|hit| std::cmp::Reverse(hit.size_bytes.unwrap_or(0)));
+            }
+            SearchSort::Newest => {
+                hits.sort_by_key(|hit| std::cmp::Reverse(hit.published_at.unwrap_or(0)));
             }
         }
     }
@@ -2766,10 +4194,17 @@ impl App {
 
 /// One line summarising a search, including sources that failed.
 fn describe_search(results: &reel_catalog::SearchResults) -> Option<String> {
+    describe_search_summary(results.hits.len(), &results.failures)
+}
+
+fn describe_search_summary(hit_count: usize, failures: &[(String, String)]) -> Option<String> {
     let mut parts = Vec::new();
-    parts.push(plural(results.hits.len(), "result"));
-    for (source, message) in &results.failures {
-        parts.push(format!("{source} failed: {}", reel_core::title::truncate(message, 80)));
+    parts.push(plural(hit_count, "result"));
+    for (source, message) in failures {
+        parts.push(format!(
+            "{source} failed: {}",
+            reel_core::title::truncate(message, 80)
+        ));
     }
     Some(parts.join("   \u{2022}   "))
 }
@@ -3043,32 +4478,128 @@ impl App {
 
             ui.label(egui::RichText::new("Search sources").size(16.0).strong());
             ui.checkbox(
-                &mut draft.enable_bundled_sources,
-                "Use the bundled source (Internet Archive)",
+                &mut draft.ext_to_enabled,
+                "ext.to (a general torrent index behind Cloudflare)",
             );
+
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("ext.to")
+                    .size(13.0)
+                    .color(theme::TEXT_DIM),
+            );
+            optional_text(ui, "Cookie (optional)", &mut draft.ext_to_cookie, "cf_clearance=\u{2026}");
+            optional_text(
+                ui,
+                "User agent (optional)",
+                &mut draft.ext_to_user_agent,
+                "the browser the cookie came from",
+            );
+            optional_text(
+                ui,
+                "Base URL (optional)",
+                &mut draft.ext_to_base_url,
+                "https://ext.to",
+            );
+            optional_text(
+                ui,
+                "Solver URL (optional)",
+                &mut draft.ext_to_solver_url,
+                "only used if the built-in solver cannot clear a challenge",
+            );
+
+            ui.add_space(6.0);
             let sources = self.backend.search_sources();
             if sources.is_empty() {
-                row(ui, "Sources", "none");
+                row(ui, "Active sources", "none");
             } else {
-                for source in &sources {
-                    row(
-                        ui,
-                        "Source",
-                        &if source.configured {
+                let names: Vec<String> = sources
+                    .iter()
+                    .map(|source| {
+                        if source.configured {
                             source.name.clone()
                         } else {
-                            format!("{} (disabled)", source.name)
-                        },
-                    );
-                }
+                            format!("{} (needs setup)", source.name)
+                        }
+                    })
+                    .collect();
+                row(ui, "Active sources", &names.join(", "));
             }
             ui.label(
                 egui::RichText::new(
-                    "A search backend is anything implementing the SearchBackend trait; add \
-                     your own in docs/ADDING_A_SOURCE.md.",
+                    "A search backend is anything implementing the SearchBackend trait; \
+                     ext.to is the bundled example.",
                 )
                 .color(theme::TEXT_DIM)
                 .size(12.0),
+            );
+            ui.add_space(14.0);
+
+            ui.label(egui::RichText::new("Torrent engine").size(16.0).strong());
+
+            let mut port = draft.listen_port.unwrap_or(0) as i32;
+            ui.horizontal(|ui| {
+                ui.label("Listen port (0 = automatic)");
+                if ui
+                    .add(egui::DragValue::new(&mut port).range(0..=65535))
+                    .changed()
+                {
+                    draft.listen_port = (port != 0).then_some(port as u16);
+                }
+            });
+
+            let mut peer_limit = draft.peer_limit.unwrap_or(0) as i64;
+            ui.horizontal(|ui| {
+                ui.label("Peer limit per torrent (0 = default)");
+                if ui
+                    .add(egui::DragValue::new(&mut peer_limit).range(0..=10_000))
+                    .changed()
+                {
+                    draft.peer_limit = (peer_limit != 0).then_some(peer_limit as usize);
+                }
+            });
+
+            let mut download = draft.download_limit_kib.unwrap_or(0) as i64;
+            ui.horizontal(|ui| {
+                ui.label("Download limit KiB/s (0 = unlimited)");
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut download)
+                            .range(0..=1_000_000_000)
+                            .speed(64.0),
+                    )
+                    .changed()
+                {
+                    draft.download_limit_kib = (download != 0).then_some(download as u32);
+                }
+            });
+
+            let mut upload = draft.upload_limit_kib.unwrap_or(0) as i64;
+            ui.horizontal(|ui| {
+                ui.label("Upload limit KiB/s (0 = unlimited)");
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut upload)
+                            .range(0..=1_000_000_000)
+                            .speed(64.0),
+                    )
+                    .changed()
+                {
+                    draft.upload_limit_kib = (upload != 0).then_some(upload as u32);
+                }
+            });
+
+            ui.checkbox(&mut draft.dht_enabled, "Use the DHT");
+            ui.checkbox(&mut draft.trackers_enabled, "Announce to trackers");
+            ui.checkbox(&mut draft.enable_upnp, "Open the listen port with UPnP");
+            ui.checkbox(&mut draft.ipv4_only, "IPv4 only");
+            ui.label(
+                egui::RichText::new(
+                    "Port, DHT and tracker changes take effect on the next start; the rate \
+                     limits apply to torrents added after saving.",
+                )
+                .color(theme::TEXT_DIM)
+                .size(11.0),
             );
             ui.add_space(14.0);
 
@@ -3083,17 +4614,20 @@ impl App {
                 .color(theme::TEXT_DIM)
                 .size(12.0),
             );
-        });
 
-        ui.add_space(10.0);
-        if ui
-            .add(egui::Button::new(
-                egui::RichText::new("Save settings").size(14.0),
-            ))
-            .clicked()
-        {
-            persist = true;
-        }
+            // The button lives inside the scroll area so it is always reachable,
+            // however long the settings list grows.
+            ui.add_space(16.0);
+            if ui
+                .add(egui::Button::new(
+                    egui::RichText::new("Save settings").size(14.0),
+                ))
+                .clicked()
+            {
+                persist = true;
+            }
+            ui.add_space(8.0);
+        });
 
         if remove_key {
             draft.tmdb_api_key = None;
@@ -3143,6 +4677,28 @@ fn row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.add_space(2.0);
 }
 
+/// Edit an optional text setting under a small label. Committing blank clears
+/// it, so the settings file only ever holds real values.
+fn optional_text(ui: &mut egui::Ui, label: &str, value: &mut Option<String>, hint: &str) {
+    ui.label(egui::RichText::new(label).size(11.5).color(theme::TEXT_DIM));
+    let mut text = value.clone().unwrap_or_default();
+    let changed = ui
+        .add(
+            egui::TextEdit::singleline(&mut text)
+                .hint_text(hint)
+                .desired_width(f32::INFINITY),
+        )
+        .changed();
+    if changed {
+        *value = if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        };
+    }
+    ui.add_space(4.0);
+}
+
 // ----------------------------------------------------------------- player
 
 impl App {
@@ -3155,8 +4711,12 @@ impl App {
         let info = self.player.current().cloned();
         let state = self.player.state();
         if let Some(info) = info {
-            self.backend
-                .note_playback(info.torrent_id, info.file_id, state.position, state.duration);
+            self.backend.note_playback(
+                info.torrent_id,
+                info.file_id,
+                state.position,
+                state.duration,
+            );
         }
         self.maybe_recover_stalled_stream();
 
@@ -3254,9 +4814,7 @@ impl App {
                                 Some(reel_player::Backend::External) => "external player",
                                 _ => "unknown backend",
                             };
-                            ui.label(
-                                egui::RichText::new(label).size(11.0).color(theme::TEXT_DIM),
-                            );
+                            ui.label(egui::RichText::new(label).size(11.0).color(theme::TEXT_DIM));
                         });
                     });
                 });
@@ -3291,7 +4849,11 @@ impl App {
                             } else {
                                 "The external player has exited."
                             })
-                            .color(if running { theme::OK } else { theme::TEXT_DIM }),
+                            .color(if running {
+                                theme::OK
+                            } else {
+                                theme::TEXT_DIM
+                            }),
                         );
                     });
                 });
@@ -3338,9 +4900,17 @@ impl App {
     /// add always plays. So after a few seconds with no frame, re-add the
     /// stream from scratch once and reopen the player on the new URL.
     fn maybe_recover_stalled_stream(&mut self) {
-        // A paused player, or one that reached the end, is not stalled.
+        // A paused player, one that reached the end, or one waiting for the
+        // demuxer cache to refill is not stalled. A big seek into a large file
+        // is exactly that, and treating it as a wedge is what made playback
+        // appear to restart from scratch. A recent seek also gets time to
+        // buffer before we consider it wedged.
         let state = self.player.state();
-        if state.paused || state.eof {
+        if state.paused || state.eof || state.paused_for_cache {
+            self.player_progress_at = Instant::now();
+            return;
+        }
+        if self.player.seeked_within(Duration::from_secs(20)) {
             self.player_progress_at = Instant::now();
             return;
         }
@@ -3372,16 +4942,16 @@ impl App {
         // core is dropped too; the next play builds a fresh one.
         self.player.reset();
         self.pending_play = Some((info.torrent_id, info.file_id));
-        self.backend.restart_stream(info.torrent_id, &[info.file_id]);
+        self.backend
+            .restart_stream(info.torrent_id, &[info.file_id]);
         self.set_toast("Reconnecting the stream\u{2026}", false);
     }
 
     /// Leave the player, saving where we got to.
     fn leave_player(&mut self) {
-        if let (Some(info_hash), true) = (
-            self.watch_recording_for.clone(),
-            self.player.state().loaded,
-        ) {
+        if let (Some(info_hash), true) =
+            (self.watch_recording_for.clone(), self.player.state().loaded)
+        {
             let state = self.player.state();
             let info = self.player.current().cloned();
             if state.position >= 1.0 {
@@ -3442,7 +5012,12 @@ mod tests {
         let rows = app.row_titles();
         assert_eq!(
             rows,
-            ["Continue watching", "Recently added", "Not started", "Watched"],
+            [
+                "Continue watching",
+                "Recently added",
+                "Not started",
+                "Watched"
+            ],
             "every row should have something in the sample library"
         );
     }
@@ -3471,6 +5046,53 @@ mod tests {
         app.submit_add();
         assert!(app.toast.as_ref().is_some_and(|t| !t.error));
         assert_eq!(app.add_source, "", "the field should be cleared on submit");
+    }
+
+    #[test]
+    fn search_action_shows_immediate_resolving_feedback_and_clears_on_completion() {
+        let mut app = app();
+        let mut hit = SearchHit::new("A page-only result", "ext.to");
+        hit.detail_url = Some("https://example.test/torrent/1".to_string());
+        let key = hit.key();
+
+        app.start_search_action(hit, false);
+
+        assert_eq!(
+            app.search_actions.get(&key),
+            Some(&SearchActionPhase::ResolvingMagnet)
+        );
+        assert!(
+            app.toast
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("Fetching magnet")
+        );
+
+        app.drain_events(&egui::Context::default());
+        assert!(!app.search_actions.contains_key(&key));
+    }
+
+    #[test]
+    fn the_derived_search_view_filters_and_groups() {
+        let mut app = app();
+        app.search_for = Some("the bear".into());
+        let mut first = SearchHit::new("The Bear S02E01 1080p", "ext.to");
+        first.seeders = Some(40);
+        let mut second = SearchHit::new("The Bear S02E02 1080p", "ext.to");
+        second.seeders = Some(4);
+        let mut other = SearchHit::new("Unrelated Film 1999 2160p", "ext.to");
+        other.seeders = Some(80);
+        app.search_hits = vec![first, second, other];
+        app.search_min_seeders = "10".into();
+
+        let signature = app.search_signature();
+        let view = app.build_search_view(signature);
+        assert_eq!(view.shown.len(), 2, "the low-seeder release is filtered out");
+        assert_eq!(view.shown[0].title, "The Bear S02E01 1080p");
+        assert_eq!(view.releases.len(), view.shown.len());
+        assert_eq!(view.metas.len(), view.shown.len());
+        assert_eq!(view.works.len(), 2, "the two remaining titles are different works");
     }
 
     #[test]
@@ -3681,7 +5303,12 @@ mod tests {
             .into_iter()
             .find(|item| item.torrent.id == 1)
             .expect("the matrix");
-        let video = item.torrent.files.iter().find(|f| f.id == 0).expect("video");
+        let video = item
+            .torrent
+            .files
+            .iter()
+            .find(|f| f.id == 0)
+            .expect("video");
         let subs = companion_subtitles(&item.torrent.files, video);
         assert_eq!(subs, vec![2], "The.Matrix.en.srt belongs to the film");
     }
@@ -3766,7 +5393,11 @@ mod tests {
             .lead_torrent_id();
 
         app.open_remove_dialog(work_id, None);
-        assert_eq!(app.remove_selected.len(), 2, "all sources are ticked by default");
+        assert_eq!(
+            app.remove_selected.len(),
+            2,
+            "all sources are ticked by default"
+        );
 
         app.open_remove_dialog(work_id, Some(1));
         assert_eq!(app.remove_selected.len(), 1);
@@ -3775,7 +5406,10 @@ mod tests {
 
     #[test]
     fn episode_codes_are_read_from_names() {
-        assert_eq!(episode_token("Show.S01E02.1080p.mkv").as_deref(), Some("s01e02"));
+        assert_eq!(
+            episode_token("Show.S01E02.1080p.mkv").as_deref(),
+            Some("s01e02")
+        );
         assert_eq!(episode_token("Show.S1E2.srt").as_deref(), Some("s1e2"));
         assert_eq!(episode_token("The.Matrix.1999.mkv"), None);
     }
@@ -3803,7 +5437,10 @@ mod cover_tests {
     #[test]
     fn a_matching_aspect_is_not_cropped() {
         let uv = cover_uv(16.0 / 9.0, 16.0 / 9.0);
-        assert_eq!(uv, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)));
+        assert_eq!(
+            uv,
+            Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
+        );
     }
 
     #[test]
@@ -3839,7 +5476,12 @@ mod cover_tests {
     #[test]
     fn degenerate_aspects_fall_back_to_the_whole_image() {
         let full = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-        for (source, target) in [(0.0, 1.0), (1.0, 0.0), (f32::NAN, 1.0), (1.0, f32::INFINITY)] {
+        for (source, target) in [
+            (0.0, 1.0),
+            (1.0, 0.0),
+            (f32::NAN, 1.0),
+            (1.0, f32::INFINITY),
+        ] {
             assert_eq!(cover_uv(source, target), full);
         }
     }

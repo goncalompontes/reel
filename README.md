@@ -11,10 +11,8 @@ metadata provider so the library shows posters and synopses instead of release
 names.
 
 **Status: engine, streaming, player, catalog, search and desktop app all work
-end to end.** Exactly one search source is bundled — the Internet Archive, which
-serves public-domain and Creative Commons film — and adding your own is a
-documented, tested extension point: see
-[`docs/ADDING_A_SOURCE.md`](docs/ADDING_A_SOURCE.md).
+end to end.** ext.to, a general torrent index, is bundled behind a
+`SearchBackend` trait, so adding another source is a single struct.
 
 ---
 
@@ -43,7 +41,7 @@ documented, tested extension point: see
 | Per-episode resume positions | done |
 | On-disk metadata and artwork cache | done |
 | Search screen + pluggable sources | done |
-| Bundled sources | one: the Internet Archive (public domain / CC film) |
+| Bundled search source | ext.to (Cloudflare cleared by a bundled FlareSolverr) |
 | Settings file as the canonical configuration (not env) | done |
 | Merge copies of a film or show into one title | done |
 | Temporary streaming: sparse scratch storage, freed on stop | done |
@@ -73,6 +71,19 @@ no root and is already on the `PATH` of most desktop Linux setups. It writes:
 | `~/.local/share/applications/reel.desktop` | launcher entry, with an **absolute** `Exec` |
 | `~/.local/share/icons/hicolor/{16..256,scalable}/apps/reel.{png,svg}` | icons |
 | `~/.local/share/licenses/reel/` | licence texts |
+| `~/.local/lib/reel/solver/` | the bundled Cloudflare solver (FlareSolverr) that ext.to uses |
+
+The solver is installed automatically so ext.to works out of the box; reel
+starts it on demand. It drives a real Chrome, so it needs Chrome/Chromium and
+Xvfb on the system — if either is missing the installer offers to install it with
+your package manager (answer the prompt, or pass `--yes` to accept, or
+`--no-deps` to only report). Pass `--without-solver` to skip the solver entirely,
+or `--solver-port N` to change its port.
+
+reel itself builds and runs on Linux, macOS and Windows. The shell installer and
+the bundled solver are Linux-only; on macOS or Windows, build the binaries with
+`cargo` and (for ext.to) point the solver URL in Settings at a FlareSolverr you
+run yourself.
 
 Re-running it is a no-op rather than an error, and there is an undo:
 
@@ -203,10 +214,26 @@ The catalog is verified separately by `crates/reel-catalog`:
   downloads landing in the cache, clean misses, and a cached lookup still
   working with the network gone.
 
-Search sources are covered the same way: `archive_org`'s parsing is unit-tested
-against fixtures with the field-type inconsistencies the real API produces, plus
-an `#[ignore]`d test that searches the live Archive and checks the torrent URL it
-produces actually resolves.
+The ext.to parser is unit-tested against a trimmed copy of a real results page —
+the `<span>`-split titles, the labelled value cells, a row with no magnet link,
+and the Cloudflare challenge page — with its own `#[ignore]`d test that confirms
+the live site is either scraped or reported as a challenge rather than
+mis-parsed.
+
+To get real results from ext.to, set a clearance cookie from a browser that has
+solved the site's challenge once:
+
+```bash
+EXTTO_COOKIE='cf_clearance=...; __cf_bm=...' \
+EXTTO_USER_AGENT='Mozilla/5.0 ... Firefox/128.0' \
+  reel
+```
+
+The cookie is tied to that user agent and to your IP, and it expires, so it has
+to be refreshed from the browser when searches start failing. Until a cookie is
+set, ext.to is listed in Settings as needing setup and skipped by searches;
+once one is set and later goes stale, searches report the challenge instead of
+returning nothing.
 
 There is also an `#[ignore]`d test that talks to the **real** TMDB API:
 
@@ -225,7 +252,7 @@ generated from each title. A key is what turns that into real posters, synopses,
 episode titles and thumbnails.
 
 **What you need: a free TMDB account.** Nothing else. No key is needed for image
-downloads or for the bundled Internet Archive search source.
+downloads.
 
 1. Make an account at `themoviedb.org`.
 2. Settings → API → request a key. Either type works:
@@ -525,15 +552,6 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the reasoning.
   blocks rather than erroring, because that is what a buffering player wants.
   Clients should set their own timeout; a request can outlive the reason it was
   made.
-* **Content and sources.** This is a general-purpose BitTorrent client and HTTP
-  server. Use it for content you own or are licensed to distribute. Exactly one
-  search source is bundled, chosen because it indexes only material anyone may
-  share; anything else you add is your decision and your responsibility.
-* **The bundled source needs a swarm.** Internet Archive torrents carry
-  BEP-19 HTTP web seeds, which librqbit does not implement, so playback depends
-  on the Archive's own seeders. Popular items are well seeded; obscure ones may
-  not be. Web-seed support would fix this properly and is the most valuable
-  engine feature left.
 * **Matching.** Title matching prefers "no match" over a wrong match, so some
   films simply will not be found. That is deliberate: a confidently wrong poster
   is worse than generated artwork. If a title is wrong, the fix belongs in

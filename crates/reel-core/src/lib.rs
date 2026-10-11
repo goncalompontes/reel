@@ -20,6 +20,7 @@ pub mod fmt;
 pub mod library;
 pub mod media;
 pub mod model;
+pub mod paths;
 pub mod streaming;
 pub mod title;
 
@@ -31,3 +32,24 @@ pub use media::{is_media_file, is_video_file, mime_for_name, pick_primary_file};
 pub use model::{
     AddOutcome, AddRequest, FileProbe, FileView, PeerView, StatsView, StreamTarget, TorrentView,
 };
+
+/// Move a file that failed to parse out of the way, so a later save does not
+/// silently overwrite data the user might recover by hand. Returns the backup
+/// path when the move succeeds.
+pub fn quarantine_corrupt(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let backup = path.with_extension("corrupt");
+    match std::fs::rename(path, &backup) {
+        Ok(()) => {
+            tracing::warn!(
+                path = %path.display(),
+                backup = %backup.display(),
+                "kept an unreadable file aside instead of overwriting it"
+            );
+            Some(backup)
+        }
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "could not move an unreadable file aside");
+            None
+        }
+    }
+}

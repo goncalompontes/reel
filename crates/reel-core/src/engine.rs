@@ -200,12 +200,13 @@ impl Engine {
             crate::streaming::sweep_stale_scratch();
         }
 
-        let mut opts = SessionOptions::default();
-
         // Never seed unless the caller deliberately asks to (the CLI's seeding
         // mode). Not a preference for the app: a client that streams content it
         // was not licensed to distribute must not become a distributor.
-        opts.disable_upload = config.disable_upload;
+        let mut opts = SessionOptions {
+            disable_upload: config.disable_upload,
+            ..Default::default()
+        };
 
         if config.disable_dht {
             opts.dht = None;

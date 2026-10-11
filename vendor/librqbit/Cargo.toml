@@ -73,6 +73,12 @@ webui = []
 name = "librqbit"
 path = "src/lib.rs"
 
+# This crate is vendored under the reel repo, but reel's root manifest is a
+# separate workspace that does not list it as a member. Declaring an empty
+# workspace here lets `cargo test` run against the vendored crate directly
+# without pulling it into (or being rejected by) the outer workspace.
+[workspace]
+
 [[example]]
 name = "custom_storage"
 path = "examples/custom_storage.rs"

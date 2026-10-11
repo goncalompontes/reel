@@ -122,7 +122,7 @@ fn a_pack_streams_and_downloads_only_the_chosen_episode() {
     let pack = dir.join("pack");
     std::fs::create_dir_all(&pack).unwrap();
     for n in 1..=3u8 {
-        let bytes: Vec<u8> = (0..96 * 1024).map(|i| ((i as u8).wrapping_add(n * 7)) as u8).collect();
+        let bytes: Vec<u8> = (0..96 * 1024).map(|i| (i as u8).wrapping_add(n * 7)).collect();
         std::fs::write(pack.join(format!("Some.Show.S01E{n:02}.mkv")), bytes).unwrap();
     }
     let torrent_path = dir.join("pack.torrent");
@@ -161,7 +161,14 @@ fn a_pack_streams_and_downloads_only_the_chosen_episode() {
     backend.add(torrent_path.to_str().unwrap(), true);
     wait_until("the pack to appear", || !backend.library().is_empty());
     let id = backend.library().into_iter().next().unwrap().torrent.id;
-    wait_until("the pack to be live", || backend.is_live(id));
+    // It becomes live, then settles paused because nothing has been told to
+    // play. Wait for both rather than racing the transition.
+    wait_until("the pack to be live and paused", || {
+        backend.is_live(id)
+            && backend
+                .item(id)
+                .is_some_and(|item| item.torrent.stats.is_paused())
+    });
 
     let included = |backend: &EngineBackend| -> Vec<usize> {
         backend
@@ -176,10 +183,6 @@ fn a_pack_streams_and_downloads_only_the_chosen_episode() {
     };
 
     // Added as a stream: paused, nothing is being fetched yet.
-    assert!(
-        backend.item(id).expect("the pack").torrent.stats.is_paused(),
-        "a stream pack waits to be told what to play"
-    );
     assert!(!backend.item(id).expect("the pack").downloading);
 
     // Play episode 2: it resumes, and fetches only episode 2.
@@ -452,11 +455,11 @@ fn the_bundled_source_searches_through_the_app_backend() {
 
     assert_eq!(
         backend.search_sources().iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-        ["archive.org"],
-        "the bundled source should be registered"
+        ["ext.to"],
+        "only ext.to should be bundled"
     );
 
-    backend.search("nosferatu");
+    backend.search(&reel_catalog::SearchQuery::new("nosferatu"));
 
     // The search runs on the runtime and reports back through events.
     let mut hits = None;
@@ -608,7 +611,7 @@ fn a_watch_position_follows_the_episode_to_another_release() {
             disable_trackers: true,
             persist_session: false,
             stream_scratch_dir: Some(scratch.clone()),
-            ..EngineConfig::new(&dir.join("downloads"))
+            ..EngineConfig::new(dir.join("downloads"))
         },
         CatalogOptions {
             api_key: None,

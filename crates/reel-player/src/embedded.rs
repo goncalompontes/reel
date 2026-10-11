@@ -25,9 +25,7 @@ use std::time::Duration;
 
 use crate::error::PlayerError;
 use crate::ffi::{self, MpvHandle, MpvLib, MpvRenderContext, mpv_render_param};
-use crate::player::{
-    lock_shared, Command, Notify, PlayerConfig, PlayerState, Shared, Track, VideoFrame,
-};
+use crate::player::{lock_shared, Command, Notify, PlayerConfig, Shared, Track, VideoFrame};
 
 /// How long the worker sleeps when nothing signals it.
 ///
@@ -390,20 +388,21 @@ impl Worker {
             return;
         }
         // Seek once the file has actually loaded; seeking earlier is a no-op.
-        self.pending_start = start_position.or(self.pending_start.take());
+        // Assign rather than inherit: a leftover pending start from a previous
+        // file (the core is reused across plays) must not seek the new one.
+        self.pending_start = start_position;
         self.file_loaded = false;
 
         let mut guard = lock_shared(&self.shared);
-        let volume = guard.state.volume;
         // Drop the previous file's last frame so a reused core does not show it
-        // while the new file loads.
+        // while the new file loads. Update the loaded state in place instead of
+        // replacing it, so player-owned settings (volume, subtitle visibility,
+        // speed) survive a reused core rather than being reset to defaults.
         guard.frame = None;
-        guard.state = PlayerState {
-            loaded: true,
-            url: Some(url.to_string()),
-            volume,
-            ..Default::default()
-        };
+        guard.state.loaded = true;
+        guard.state.url = Some(url.to_string());
+        guard.state.paused = false;
+        guard.state.error = None;
         drop(guard);
 
         self.last_size = None;
@@ -507,6 +506,9 @@ impl Worker {
             tracing::warn!(error = %e, "stop failed");
         }
         self.file_loaded = false;
+        // A stop must not leave a seek offset behind for the next file: the core
+        // is reused, and an inherited offset would jump the new file.
+        self.pending_start = None;
         self.pending_subtitles.clear();
         let mut guard = lock_shared(&self.shared);
         guard.state.loaded = false;
