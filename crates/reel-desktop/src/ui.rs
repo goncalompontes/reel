@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, CornerRadius, Rect, Sense, Vec2};
 use reel_catalog::{
-    ArtworkKind, ArtworkRef, CatalogEntry, CatalogSettings, MediaKind, Metadata, Release, RowKind,
-    SearchHit, Work, WorkEpisode, WorkMember, build_work_rows, build_works, episode_key, movie_key,
+    ArtworkKind, ArtworkRef, CatalogEntry, CatalogSettings, Metadata, Release, RowKind, SearchHit,
+    Work, WorkEpisode, WorkMember, build_work_rows, build_works, episode_key, movie_key,
     separate_works,
 };
 use reel_core::fmt;
@@ -33,13 +33,16 @@ pub enum Screen {
     Discover,
     Activity,
     Settings,
+    /// A title in the library, by its lead torrent id.
     Work(usize),
+    /// A title in the current search results, by work key.
+    Result(String),
 }
 
 impl Screen {
     /// A rail destination, as opposed to a view pushed on top of one.
     fn is_root(&self) -> bool {
-        !matches!(self, Screen::Work(_))
+        !matches!(self, Screen::Work(_) | Screen::Result(_))
     }
 
     /// The fixed name of a rail destination, for breadcrumbs and the rail.
@@ -49,7 +52,7 @@ impl Screen {
             Screen::Discover => "Discover",
             Screen::Activity => "Activity",
             Screen::Settings => "Settings",
-            Screen::Work(_) => "",
+            Screen::Work(_) | Screen::Result(_) => "",
         }
     }
 }
@@ -134,9 +137,8 @@ struct SearchView {
     shown: Vec<SearchHit>,
     /// Parsed release info for each `shown` hit, by position.
     releases: Vec<Release>,
-    /// Metadata matched to each `shown` hit, by position.
-    metas: Vec<Option<Metadata>>,
-    /// One card per film or series, in display order (empty when not grouping).
+    /// One row per film or series, in display order. Discover lists these and
+    /// the Result view renders one of them.
     works: Vec<Work>,
 }
 
@@ -147,7 +149,6 @@ struct SearchSignature {
     query: Option<String>,
     min_seeders: String,
     sort: SearchSort,
-    grouped: bool,
     /// Bumped whenever the hit list changes.
     hits: u64,
     /// Bumped whenever metadata for a hit arrives.
@@ -207,27 +208,18 @@ pub struct App {
     /// episode, quality and languages. Computed once per title so the list does
     /// not re-parse on every frame.
     search_releases: HashMap<String, Release>,
-    /// Whether results are grouped into one card per film/series.
-    search_grouped: bool,
-    /// Work keys the user expanded in the grouped view.
-    search_expanded: HashSet<String>,
-    /// Category keys (work + tier/season) the user collapsed in the grouped view.
-    search_collapsed_categories: HashSet<String>,
-    /// Per-series choices (season, kind, resolution) in the grouped view.
+    /// Per-title choices (season, kind, resolution) in the Result view.
     search_series_views: HashMap<String, SeriesView>,
     /// Search hits currently being added or prepared for playback.
     search_actions: HashMap<String, SearchActionPhase>,
-    /// Whether the first work has been auto-expanded for the current results.
-    search_expand_initialised: bool,
     /// Derived search-page data, rebuilt only when its inputs change.
     search_view: Option<SearchView>,
     /// Bumped whenever the hit list changes, so the view knows to rebuild.
     search_revision: u64,
     /// Bumped whenever metadata for a hit arrives, for the same reason.
     search_metadata_revision: u64,
-    /// Measured heights of flat result cards, so offscreen ones can be skipped.
-    search_card_heights: Vec<f32>,
-    /// Measured heights of grouped work cards, likewise.
+    /// Measured heights of the Discover work rows, so offscreen ones can be
+    /// skipped.
     search_work_heights: Vec<f32>,
     /// The API key being typed on the settings page. Never filled in from
     /// storage: a credential is written, not displayed.
@@ -308,16 +300,11 @@ impl App {
             search_streaming: false,
             search_failures: Vec::new(),
             search_releases: HashMap::new(),
-            search_grouped: true,
-            search_expanded: HashSet::new(),
-            search_collapsed_categories: HashSet::new(),
             search_series_views: HashMap::new(),
             search_actions: HashMap::new(),
-            search_expand_initialised: false,
             search_view: None,
             search_revision: 0,
             search_metadata_revision: 0,
-            search_card_heights: Vec::new(),
             search_work_heights: Vec::new(),
             api_key_input: String::new(),
             settings_draft: None,
@@ -380,6 +367,11 @@ impl App {
     /// "back" returns there rather than to a hardcoded Home.
     pub fn open_work(&mut self, work_id: usize) {
         self.nav.open(Screen::Work(work_id));
+    }
+
+    /// Open a search result's title view, by its work key.
+    pub fn open_result(&mut self, key: impl Into<String>) {
+        self.nav.open(Screen::Result(key.into()));
     }
 
     /// Walk one step back. Returns whether there was anywhere to go.
@@ -782,7 +774,6 @@ impl App {
             query: self.search_for.clone(),
             min_seeders: self.search_min_seeders.clone(),
             sort: self.search_sort,
-            grouped: self.search_grouped,
             hits: self.search_revision,
             metadata: self.search_metadata_revision,
         }
@@ -818,17 +809,12 @@ impl App {
             .map(|hit| self.backend.search_metadata(hit))
             .collect();
 
-        let works = if self.search_grouped {
-            self.build_search_works(&shown, &releases, &metas)
-        } else {
-            Vec::new()
-        };
+        let works = self.build_search_works(&shown, &releases, &metas);
 
         SearchView {
             signature,
             shown,
             releases,
-            metas,
             works,
         }
     }
@@ -990,13 +976,9 @@ impl App {
                         self.search_note = describe_search(&results);
                         self.search_hits = results.hits;
                         self.search_releases.clear();
-                        self.search_expanded.clear();
-                        self.search_collapsed_categories.clear();
                         self.search_series_views.clear();
-                        self.search_expand_initialised = false;
-                        // A new result set means the measured card heights are
+                        // A new result set means the measured row heights are
                         // for the wrong rows.
-                        self.search_card_heights.clear();
                         self.search_work_heights.clear();
                         self.bump_search_revision();
                         // A source that paginates keeps sending more.
@@ -1034,12 +1016,9 @@ impl App {
                         self.search_streaming = false;
                         self.search_hits.clear();
                         self.search_releases.clear();
-                        self.search_expanded.clear();
-                        self.search_collapsed_categories.clear();
                         self.search_series_views.clear();
                         self.search_failed = true;
                         self.search_note = Some(message);
-                        self.search_card_heights.clear();
                         self.search_work_heights.clear();
                         self.bump_search_revision();
                     }
@@ -1279,6 +1258,7 @@ impl eframe::App for App {
             .show(ui, |ui| match self.screen().clone() {
                 Screen::Home => self.library_screen(ui),
                 Screen::Work(_) => self.detail_screen(ui),
+                Screen::Result(key) => self.search_result_screen(ui, &key),
                 Screen::Discover => self.search_screen(ui),
                 Screen::Activity => self.activity_screen(ui),
                 Screen::Settings => self.settings_screen(ui),
@@ -1460,6 +1440,12 @@ impl App {
                 .work(*id)
                 .map(|work| work.heading())
                 .unwrap_or_else(|| "Title".to_string()),
+            Screen::Result(key) => self
+                .search_view
+                .as_ref()
+                .and_then(|view| view.works.iter().find(|work| &work.key == key))
+                .map(|work| work.heading())
+                .unwrap_or_else(|| "Result".to_string()),
             other => other.root_label().to_string(),
         }
     }
@@ -3550,11 +3536,6 @@ impl App {
                         }
                     }
                 });
-            ui.separator();
-            ui.checkbox(&mut self.search_grouped, "Group by title")
-                .on_hover_text(
-                    "One card per film or series, with its torrents grouped by quality or season",
-                );
         });
 
         ui.add_space(6.0);
@@ -3637,179 +3618,253 @@ impl App {
             return;
         }
 
-        let shown = &view.shown;
-        let releases = &view.releases;
-        let metas = &view.metas;
+        // Discover lists one row per title; selecting one pushes the Result
+        // view. Only the rows on screen are laid out, and each row's measured
+        // height is reserved for the ones scrolled past.
+        let mut open: Option<String> = None;
+        let mut heights = std::mem::take(&mut self.search_work_heights);
+        virtual_list(ui, view.works.len(), &mut heights, |ui, index| {
+            self.search_work_row(ui, &view.works[index], &mut open);
+        });
+        self.search_work_heights = heights;
+        self.search_view = Some(view);
+
+        if let Some(key) = open {
+            self.nav.open(Screen::Result(key));
+        }
+    }
+
+    /// One Discover row: a title, its kind, and what it holds. Clicking it
+    /// opens the Result view rather than expanding in place.
+    fn search_work_row(&mut self, ui: &mut egui::Ui, work: &Work, open: &mut Option<String>) {
+        let (rect, response) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 88.0), Sense::click());
+        // Expose the row as one labelled button: its text is painted, so
+        // without this it would be invisible to AccessKit (and to the tests).
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), work.heading())
+        });
+        let painter = ui.painter().clone();
+        painter.rect_filled(
+            rect,
+            theme::CARD_RADIUS,
+            if response.hovered() {
+                theme::SURFACE_RAISED
+            } else {
+                theme::SURFACE
+            },
+        );
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            painter.rect_stroke(
+                rect,
+                theme::CARD_RADIUS,
+                egui::Stroke::new(1.5, theme::ACCENT),
+                egui::StrokeKind::Inside,
+            );
+        }
+
+        // Laid out by hand, exactly like the library card, so the row's own
+        // response is the only interactive widget over it.
+        let pad = 12.0;
+        let poster = Rect::from_min_size(
+            egui::pos2(rect.left() + pad, rect.top() + 10.0),
+            Vec2::new(46.0, 69.0),
+        );
+        Self::paint_art(
+            ui,
+            poster,
+            work.poster(),
+            &work.title,
+            ArtworkKind::Poster,
+            theme::CARD_RADIUS,
+        );
+
+        // Painted rather than added as labels: `ui.put` lays a label out
+        // centred, and a child Ui would sit on top of the row and steal its
+        // hover. The painter gives exact, left-aligned text with nothing
+        // interactive in the way.
+        let text_left = poster.right() + 12.0;
+        painter.text(
+            egui::pos2(text_left, rect.top() + 10.0),
+            egui::Align2::LEFT_TOP,
+            reel_core::title::truncate(&work.heading(), 70),
+            egui::FontId::proportional(15.0),
+            theme::TEXT,
+        );
+
+        let mut facts = Vec::new();
+        if let Some(metadata) = work.metadata.as_ref() {
+            if let Some(rating) = display_rating(metadata) {
+                facts.push(format!("\u{2605} {rating:.1}/10"));
+            }
+            if let Some(runtime) = metadata.runtime_label() {
+                facts.push(runtime);
+            }
+        }
+        facts.push(if work.is_series() { "Series" } else { "Film" }.to_string());
+        if let Some(metadata) = work.metadata.as_ref() {
+            if !metadata.genres.is_empty() {
+                facts.push(metadata.genres.join(", "));
+            }
+        }
+        if let Some(best) = work
+            .members
+            .iter()
+            .max_by_key(|member| member.entry.release.attributes.quality_rank())
+        {
+            let quality = best.attributes().quality_label();
+            if !quality.is_empty() {
+                facts.push(quality);
+            }
+        }
+        facts.push(plural(work.torrent_count(), "release"));
+        painter.text(
+            egui::pos2(text_left, rect.top() + 34.0),
+            egui::Align2::LEFT_TOP,
+            reel_core::title::truncate(&facts.join("   \u{2022}   "), 96),
+            egui::FontId::proportional(11.0),
+            theme::TEXT_DIM,
+        );
+
+        if let Some(overview) = work.metadata.as_ref().and_then(|m| m.overview.as_deref()) {
+            painter.text(
+                egui::pos2(text_left, rect.top() + 54.0),
+                egui::Align2::LEFT_TOP,
+                reel_core::title::truncate(overview, 120),
+                egui::FontId::proportional(11.0),
+                theme::TEXT_DIM,
+            );
+        }
+
+        if response.clicked() {
+            *open = Some(work.key.clone());
+        }
+    }
+
+    /// A search title opened from Discover: its releases, and the actions that
+    /// used to live on the expanding card.
+    fn search_result_screen(&mut self, ui: &mut egui::Ui, key: &str) {
+        // Take the derived view out so the renderers can borrow `self`.
+        let Some(view) = self.search_view.take() else {
+            self.search_result_missing(ui);
+            return;
+        };
+        let work = view
+            .works
+            .iter()
+            .find(|work| work.key.as_str() == key)
+            .cloned();
+        let Some(work) = work else {
+            self.search_view = Some(view);
+            self.search_result_missing(ui);
+            return;
+        };
 
         let mut actions = SearchActions::default();
 
-        if self.search_grouped {
-            self.search_grouped_list(ui, &view.works, shown, releases, &mut actions);
-        } else {
-            // Only the cards actually on screen are laid out; the rest are
-            // skipped, with their last measured height reserved.
-            let mut heights = std::mem::take(&mut self.search_card_heights);
-            virtual_list(ui, shown.len(), &mut heights, |ui, index| {
-                let hit = &shown[index];
-                let release = &releases[index];
-                let metadata = metas[index].as_ref();
-                egui::Frame::NONE
-                    .fill(theme::SURFACE)
-                    .inner_margin(egui::Margin::symmetric(12, 10))
-                    .corner_radius(theme::CARD_RADIUS)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    egui::RichText::new(reel_core::title::truncate(&hit.title, 70))
-                                        .size(14.0)
-                                        .strong(),
-                                );
-
-                                // What it is: film or series, with season and
-                                // episode when the name carries them.
-                                let mut facts = Vec::new();
-                                match release.kind {
-                                    MediaKind::Movie => facts.push("Film".to_string()),
-                                    MediaKind::Series => {
-                                        let episode =
-                                            release.episodes.first().and_then(|e| e.episode);
-                                        facts.push(match (release.season, episode) {
-                                            (Some(season), Some(episode)) => {
-                                                format!("Series S{season:02}E{episode:02}")
-                                            }
-                                            (Some(season), None) => {
-                                                format!("Series S{season:02}")
-                                            }
-                                            _ => "Series".to_string(),
-                                        });
-                                    }
-                                    MediaKind::Unknown => {}
-                                }
-                                if let Some(year) = hit.year.or(release.year) {
-                                    facts.push(year.to_string());
-                                }
-                                facts.push(hit.source.clone());
-                                if let Some(size) = hit.size_bytes {
-                                    facts.push(fmt::human_bytes(size));
-                                }
-                                if let Some(seeders) = hit.seeders {
-                                    facts.push(format!("{seeders} seeders"));
-                                }
-                                if let Some(leechers) = hit.leechers {
-                                    facts.push(format!("{leechers} leechers"));
-                                }
-                                if let Some(popularity) = hit.popularity {
-                                    facts.push(format!("{popularity} downloads"));
-                                }
-                                ui.label(
-                                    egui::RichText::new(facts.join("   \u{2022}   "))
-                                        .size(11.0)
-                                        .color(theme::TEXT_DIM),
-                                );
-
-                                // Quality and languages, when the name
-                                // advertises them.
-                                let mut chips = release.attributes.summary();
-                                chips.extend(release.attributes.languages.iter().cloned());
-                                if !chips.is_empty() {
-                                    ui.label(
-                                        egui::RichText::new(chips.join("  \u{00b7}  "))
-                                            .size(10.5)
-                                            .color(theme::TEXT_DIM),
-                                    );
-                                }
-
-                                // What the metadata provider says about this
-                                // title, once it has answered.
-                                if let Some(metadata) = metadata {
-                                    let mut facts = Vec::new();
-                                    if let Some(rating) = display_rating(metadata) {
-                                        facts.push(format!("\u{2605} {rating:.1}/10"));
-                                    }
-                                    if let Some(votes) = metadata.vote_count {
-                                        facts.push(format!("{votes} votes"));
-                                    }
-                                    if let Some(runtime) = metadata.runtime_label() {
-                                        facts.push(runtime);
-                                    }
-                                    if !metadata.genres.is_empty() {
-                                        facts.push(metadata.genres.join(", "));
-                                    }
-                                    if !facts.is_empty() {
-                                        ui.label(
-                                            egui::RichText::new(facts.join("   \u{2022}   "))
-                                                .size(10.5)
-                                                .color(theme::ACCENT),
-                                        );
-                                    }
-                                    if let Some(overview) = metadata.overview.as_deref() {
-                                        ui.label(
-                                            egui::RichText::new(reel_core::title::truncate(
-                                                overview, 150,
-                                            ))
-                                            .size(10.5)
-                                            .color(theme::TEXT_DIM),
-                                        );
-                                    }
-                                }
-
-                                if let Some(detail) = &hit.detail {
-                                    ui.label(
-                                        egui::RichText::new(reel_core::title::truncate(detail, 90))
-                                            .size(10.5)
-                                            .color(theme::TEXT_DIM),
-                                    );
-                                }
-                            });
-
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    let can_add = hit.is_usable() || hit.detail_url.is_some();
-                                    let pending = self.search_actions.get(&hit.key()).copied();
-                                    if let Some(phase) = pending {
-                                        search_action_indicator(ui, phase);
-                                    }
-                                    let add_clicked = ui
-                                        .add_enabled(
-                                            can_add && pending.is_none(),
-                                            egui::Button::new("Add"),
-                                        )
-                                        .on_disabled_hover_text(
-                                            "This result has no magnet or .torrent URL",
-                                        )
-                                        .on_hover_text(
-                                            "Add this result; the magnet is fetched from its page",
-                                        )
-                                        .clicked();
-                                    if add_clicked {
-                                        actions.add = Some(hit.clone());
-                                    }
-                                    if let Some(url) = &hit.detail_url {
-                                        if ui.button("Open").clicked() {
-                                            actions.open = Some(url.clone());
-                                        }
-                                    }
-                                    if let Some(magnet) = &hit.magnet {
-                                        if ui
-                                            .button("Copy")
-                                            .on_hover_text("Copy the magnet link")
-                                            .clicked()
-                                        {
-                                            actions.copy = Some(magnet.clone());
-                                        }
-                                    }
-                                },
-                            );
-                        });
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                let (poster, _) = ui.allocate_exact_size(Vec2::new(128.0, 192.0), Sense::hover());
+                Self::paint_art(
+                    ui,
+                    poster,
+                    work.poster(),
+                    &work.title,
+                    ArtworkKind::Poster,
+                    theme::CARD_RADIUS,
+                );
+                ui.add_space(16.0);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(work.heading()).size(24.0).strong());
+                        ui.label(
+                            egui::RichText::new(if work.is_series() { "Series" } else { "Film" })
+                                .size(11.0)
+                                .color(theme::ACCENT),
+                        );
                     });
+
+                    let mut facts = Vec::new();
+                    if let Some(metadata) = work.metadata.as_ref() {
+                        if let Some(rating) = display_rating(metadata) {
+                            facts.push(format!("\u{2605} {rating:.1}/10"));
+                        }
+                        if let Some(runtime) = metadata.runtime_label() {
+                            facts.push(runtime);
+                        }
+                        if !metadata.genres.is_empty() {
+                            facts.push(metadata.genres.join("  \u{2022}  "));
+                        }
+                    }
+                    facts.push(plural(work.torrent_count(), "release"));
+                    ui.label(
+                        egui::RichText::new(facts.join("   \u{2022}   "))
+                            .size(12.0)
+                            .color(theme::TEXT_DIM),
+                    );
+
+                    if let Some(overview) =
+                        work.metadata.as_ref().and_then(|m| m.overview.as_deref())
+                    {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(overview).size(12.5).color(theme::TEXT));
+                    }
+
+                    ui.add_space(10.0);
+                    let best = work.members.iter().max_by_key(|member| {
+                        let seeders = view
+                            .shown
+                            .get(member.torrent_id())
+                            .and_then(|hit| hit.seeders)
+                            .unwrap_or(0);
+                        (member.entry.release.attributes.quality_rank(), seeders)
+                    });
+                    if let Some(hit) = best.and_then(|member| view.shown.get(member.torrent_id())) {
+                        let can_play = hit.is_usable() || hit.detail_url.is_some();
+                        let pending = self.search_actions.get(&hit.key()).copied();
+                        if let Some(phase) = pending {
+                            search_action_indicator(ui, phase);
+                        }
+                        if ui
+                            .add_enabled(
+                                can_play && pending.is_none(),
+                                egui::Button::new(
+                                    egui::RichText::new("\u{25b6}  Play best").size(14.0),
+                                ),
+                            )
+                            .on_hover_text("Add and play the best release of this title")
+                            .clicked()
+                        {
+                            actions.play = Some(hit.clone());
+                        }
+                    }
+                });
             });
-            self.search_card_heights = heights;
-        }
+
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(8.0);
+            self.search_work_categories(ui, &work, &view.shown, &view.releases, &mut actions);
+        });
 
         self.search_view = Some(view);
+        self.apply_search_actions(ui, actions);
+    }
 
+    fn search_result_missing(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(24.0);
+        ui.label(
+            egui::RichText::new("This title is no longer in the current results.")
+                .color(theme::TEXT_DIM),
+        );
+        ui.add_space(8.0);
+        if ui.button("Back to results").clicked() {
+            self.back();
+        }
+    }
+
+    fn apply_search_actions(&mut self, ui: &egui::Ui, actions: SearchActions) {
         if let Some(url) = actions.open {
             ui.ctx().open_url(egui::OpenUrl::new_tab(url));
         }
@@ -3825,155 +3880,8 @@ impl App {
         }
     }
 
-    /// Grouped results: one card per film or series, its torrents grouped by
-    /// quality tier (film) or season (series).
-    fn search_grouped_list(
-        &mut self,
-        ui: &mut egui::Ui,
-        works: &[Work],
-        shown: &[SearchHit],
-        releases: &[Release],
-        actions: &mut SearchActions,
-    ) {
-        // Open the first work so results are visible without a click.
-        if !self.search_expand_initialised {
-            if let Some(first) = works.first() {
-                self.search_expanded.insert(first.key.clone());
-            }
-            self.search_expand_initialised = true;
-        }
-
-        // Only the cards on screen are laid out; cards scrolled past are
-        // skipped, with their last measured height reserved.
-        let mut heights = std::mem::take(&mut self.search_work_heights);
-        virtual_list(ui, works.len(), &mut heights, |ui, index| {
-            self.search_work_card(ui, &works[index], shown, releases, actions);
-        });
-        self.search_work_heights = heights;
-    }
-
-    /// One film or series: artwork, details, and — when open — its torrents.
-    fn search_work_card(
-        &mut self,
-        ui: &mut egui::Ui,
-        work: &Work,
-        shown: &[SearchHit],
-        releases: &[Release],
-        actions: &mut SearchActions,
-    ) {
-        let key = work.key.clone();
-        let expanded = self.search_expanded.contains(&key);
-
-        egui::Frame::NONE
-            .fill(theme::SURFACE)
-            .inner_margin(egui::Margin::symmetric(14, 12))
-            .corner_radius(theme::CARD_RADIUS)
-            .show(ui, |ui| {
-                ui.horizontal_top(|ui| {
-                    let (poster, _) =
-                        ui.allocate_exact_size(Vec2::new(74.0, 111.0), Sense::hover());
-                    Self::paint_art(
-                        ui,
-                        poster,
-                        work.poster(),
-                        &work.title,
-                        ArtworkKind::Poster,
-                        theme::CARD_RADIUS,
-                    );
-
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(work.heading()).size(15.0).strong());
-                            ui.label(
-                                egui::RichText::new(if work.is_series() {
-                                    "Series"
-                                } else {
-                                    "Film"
-                                })
-                                .size(10.5)
-                                .color(theme::ACCENT),
-                            );
-                            if let Some(rating) = work.metadata.as_ref().and_then(display_rating) {
-                                ui.label(
-                                    egui::RichText::new(format!("\u{2605} {rating:.1}/10"))
-                                        .size(11.5)
-                                        .color(theme::ACCENT),
-                                );
-                            }
-                        });
-
-                        let mut facts = Vec::new();
-                        if let Some(metadata) = work.metadata.as_ref() {
-                            if let Some(runtime) = metadata.runtime_label() {
-                                facts.push(runtime);
-                            }
-                            if !metadata.genres.is_empty() {
-                                facts.push(metadata.genres.join(", "));
-                            }
-                        }
-                        facts.push(plural(work.torrent_count(), "torrent"));
-                        ui.label(
-                            egui::RichText::new(facts.join("   \u{2022}   "))
-                                .size(11.0)
-                                .color(theme::TEXT_DIM),
-                        );
-
-                        if let Some(overview) =
-                            work.metadata.as_ref().and_then(|m| m.overview.as_deref())
-                        {
-                            ui.label(
-                                egui::RichText::new(reel_core::title::truncate(overview, 160))
-                                    .size(11.0)
-                                    .color(theme::TEXT_DIM),
-                            );
-                        }
-                    });
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                        if ui.button(if expanded { "Hide" } else { "Show" }).clicked() {
-                            if expanded {
-                                self.search_expanded.remove(&key);
-                            } else {
-                                self.search_expanded.insert(key.clone());
-                            }
-                        }
-                        // The best release of this title, for a one-click play.
-                        let best = work.members.iter().max_by_key(|member| {
-                            let seeders = shown
-                                .get(member.torrent_id())
-                                .and_then(|hit| hit.seeders)
-                                .unwrap_or(0);
-                            (member.entry.release.attributes.quality_rank(), seeders)
-                        });
-                        if let Some(hit) = best.and_then(|member| shown.get(member.torrent_id())) {
-                            let can_play = hit.is_usable() || hit.detail_url.is_some();
-                            let pending = self.search_actions.get(&hit.key()).copied();
-                            if let Some(phase) = pending {
-                                search_action_indicator(ui, phase);
-                            }
-                            if ui
-                                .add_enabled(
-                                    can_play && pending.is_none(),
-                                    egui::Button::new("Play"),
-                                )
-                                .on_hover_text("Add and play the best release of this title")
-                                .clicked()
-                            {
-                                actions.play = Some(hit.clone());
-                            }
-                        }
-                    });
-                });
-
-                if expanded {
-                    ui.add_space(8.0);
-                    self.search_work_categories(ui, work, shown, releases, actions);
-                }
-            });
-    }
-
     /// The categories inside a work: resolution tiers for a film, seasons for a
-    /// series. Each is a collapsible section of torrent rows.
+    /// series. Each is a section of torrent rows.
     fn search_work_categories(
         &mut self,
         ui: &mut egui::Ui,
@@ -4004,21 +3912,7 @@ impl App {
         categories.sort_by_key(|(order, _, _)| *order);
 
         for (_, name, mut indices) in categories {
-            let category_key = format!("{}|{name}", work.key);
-            let collapsed = self.search_collapsed_categories.contains(&category_key);
             ui.horizontal(|ui| {
-                if ui
-                    .button(if collapsed { "Show" } else { "Hide" })
-                    .on_hover_text(if collapsed { "Expand" } else { "Collapse" })
-                    .clicked()
-                {
-                    if collapsed {
-                        self.search_collapsed_categories.remove(&category_key);
-                    } else {
-                        self.search_collapsed_categories
-                            .insert(category_key.clone());
-                    }
-                }
                 ui.label(
                     egui::RichText::new(&name)
                         .size(12.0)
@@ -4032,9 +3926,6 @@ impl App {
                 );
             });
 
-            if collapsed {
-                continue;
-            }
             // `shown` is already in the chosen order, and an index is its
             // position in `shown`, so ascending index is the sorted order.
             indices.sort_unstable();
@@ -5488,6 +5379,28 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_result_pushes_it_over_discover() {
+        let mut app = app();
+        app.go_to(Screen::Discover);
+        app.search_for = Some("the bear".into());
+        let mut hit = SearchHit::new("The Bear S02E01 1080p", "ext.to");
+        hit.seeders = Some(40);
+        app.search_hits = vec![hit];
+
+        let signature = app.search_signature();
+        let view = app.build_search_view(signature);
+        let key = view.works[0].key.clone();
+        app.search_view = Some(view);
+
+        app.open_result(key.clone());
+        assert_eq!(app.screen(), &Screen::Result(key.clone()));
+        assert_eq!(app.root(), &Screen::Discover);
+        assert_eq!(app.nav_trail(), &[Screen::Discover, Screen::Result(key)]);
+        assert!(app.back());
+        assert_eq!(app.screen(), &Screen::Discover);
+    }
+
+    #[test]
     fn adding_requires_a_source() {
         let mut app = app();
 
@@ -5547,7 +5460,6 @@ mod tests {
         );
         assert_eq!(view.shown[0].title, "The Bear S02E01 1080p");
         assert_eq!(view.releases.len(), view.shown.len());
-        assert_eq!(view.metas.len(), view.shown.len());
         assert_eq!(
             view.works.len(),
             2,

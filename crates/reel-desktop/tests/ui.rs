@@ -228,6 +228,38 @@ fn snapshot_search() {
     harness.snapshot("search");
 }
 
+/// Opening a Discover row pushes the Result view rather than expanding it.
+#[test]
+fn snapshot_search_result() {
+    let mut harness = harness();
+    harness.run_steps(3);
+    harness.state_mut().go_to(Screen::Discover);
+    harness.state_mut().set_search_query("nosferatu");
+    harness.state_mut().submit_search();
+    harness.run_steps(4);
+
+    // The row itself is a painted hit area, not an accessibility node, so drive
+    // it with the pointer at the title's coordinates rather than `node.click()`.
+    let pos = harness
+        .get_all_by_label_contains("Nosferatu")
+        .next()
+        .expect("a result row")
+        .rect()
+        .center();
+    harness.hover_at(pos);
+    harness.run_steps(1);
+    harness.drag_at(pos);
+    harness.run_steps(1);
+    harness.drop_at(pos);
+    harness.run_steps(3);
+
+    assert!(
+        matches!(harness.state().screen(), Screen::Result(_)),
+        "clicking a row opens the Result view"
+    );
+    harness.snapshot("search-result");
+}
+
 /// The image loader must decode a poster from disk: this is the path a cached
 /// poster takes on its way to a card.
 #[test]
