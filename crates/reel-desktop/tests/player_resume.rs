@@ -88,7 +88,9 @@ fn play(
             )),
             ..Default::default()
         };
-        let mut output = ctx.run_ui(input, |ui| controller.video_ui(ui, ctx));
+        let mut output = ctx.run_ui(input, |ui| {
+            controller.video_ui(ui, ctx);
+        });
         output.textures_delta.clear();
         std::thread::sleep(Duration::from_millis(5));
     }

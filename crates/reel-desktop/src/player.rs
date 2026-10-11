@@ -294,8 +294,7 @@ impl PlayerController {
     /// Whether the user seeked within `within`. The stall watchdog uses this to
     /// give a seek time to buffer before deciding the stream is wedged.
     pub fn seeked_within(&self, within: std::time::Duration) -> bool {
-        self.last_seek
-            .is_some_and(|at| at.elapsed() < within)
+        self.last_seek.is_some_and(|at| at.elapsed() < within)
     }
 
     pub fn set_volume(&mut self, volume: f32) {
@@ -370,14 +369,15 @@ impl PlayerController {
     ///
     /// The video is letterboxed inside the available space and rendered at the
     /// surface's physical pixel size, so it stays sharp on HiDPI displays.
-    pub fn video_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    pub fn video_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> egui::Response {
         let avail = ui.available_size();
-        let (rect, _response) = ui.allocate_exact_size(avail, Sense::hover());
+        // The video area senses clicks so the app can wire click-to-pause.
+        let (rect, response) = ui.allocate_exact_size(avail, Sense::click());
         let painter = ui.painter().clone();
         painter.rect_filled(rect, CornerRadius::ZERO, Color32::BLACK);
 
         let Some(player) = self.player.as_ref() else {
-            return;
+            return response;
         };
 
         let ppp = ctx.pixels_per_point();
@@ -399,11 +399,8 @@ impl PlayerController {
                     texture.set(image, egui::TextureOptions::LINEAR);
                 }
                 _ => {
-                    self.texture = Some(ctx.load_texture(
-                        "reel-video",
-                        image,
-                        egui::TextureOptions::LINEAR,
-                    ));
+                    self.texture =
+                        Some(ctx.load_texture("reel-video", image, egui::TextureOptions::LINEAR));
                 }
             }
             self.last_sequence = snapshot.sequence;
@@ -432,6 +429,8 @@ impl PlayerController {
                 theme::TEXT_DIM,
             );
         }
+
+        response
     }
 
     fn is_embedded_ready(&self) -> bool {
@@ -475,10 +474,18 @@ impl PlayerController {
             if ui.button(play_label).clicked() {
                 self.toggle_pause();
             }
-            if ui.button("\u{23ee}  10s").on_hover_text("Back 10 seconds").clicked() {
+            if ui
+                .button("\u{23ee}  10s")
+                .on_hover_text("Back 10 seconds")
+                .clicked()
+            {
                 self.seek_relative(-10.0);
             }
-            if ui.button("\u{23ed}  30s").on_hover_text("Forward 30 seconds").clicked() {
+            if ui
+                .button("\u{23ed}  30s")
+                .on_hover_text("Forward 30 seconds")
+                .clicked()
+            {
                 self.seek_relative(30.0);
             }
 
@@ -503,11 +510,7 @@ impl PlayerController {
                     } else {
                         "\u{26f6}"
                     };
-                    if ui
-                        .button(icon)
-                        .on_hover_text("Fullscreen (F)")
-                        .clicked()
-                    {
+                    if ui.button(icon).on_hover_text("Fullscreen (F)").clicked() {
                         toggle_fullscreen = true;
                     }
                 }
@@ -636,7 +639,10 @@ impl PlayerController {
             });
 
             ui.menu_button("Aspect", |ui| {
-                if ui.selectable_label(state.aspect_override.is_none(), "Auto").clicked() {
+                if ui
+                    .selectable_label(state.aspect_override.is_none(), "Auto")
+                    .clicked()
+                {
                     set_aspect = Some(None);
                     ui.close();
                 }
@@ -705,11 +711,27 @@ impl PlayerController {
         filled.set_right(track.left() + track.width() * fraction);
         painter.rect_filled(filled, CornerRadius::same(3), theme::ACCENT);
 
-        let knob_x = if duration > 0.0 { filled.right() } else { track.left() };
+        let knob_x = if duration > 0.0 {
+            filled.right()
+        } else {
+            track.left()
+        };
         painter.circle_filled(egui::pos2(knob_x, bar_rect.center().y), 6.0, theme::ACCENT);
 
         if bar_rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default())) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            // Scrub preview: the time under the pointer.
+            if duration > 0.0 {
+                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    let fraction =
+                        ((pos.x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0);
+                    response
+                        .clone()
+                        .on_hover_text_at_pointer(reel_core::fmt::human_duration(
+                            fraction as f64 * duration,
+                        ));
+                }
+            }
         }
 
         if duration <= 0.0 {
@@ -752,10 +774,7 @@ impl PlayerController {
 /// wrong fit shows up as a stretched or cropped picture, which is easy to miss
 /// by eye and hard to prove from a static snapshot.
 pub fn fit_into(available: egui::Rect, aspect: f32) -> egui::Rect {
-    if !aspect.is_finite()
-        || aspect <= 0.0
-        || available.width() <= 0.0
-        || available.height() <= 0.0
+    if !aspect.is_finite() || aspect <= 0.0 || available.width() <= 0.0 || available.height() <= 0.0
     {
         return available;
     }
@@ -785,7 +804,10 @@ mod tests {
         let fitted = fit_into(rect(400.0, 100.0), 16.0 / 9.0);
         assert!((fitted.height() - 100.0).abs() < 0.01);
         assert!((fitted.width() - 177.78).abs() < 0.01);
-        assert!((fitted.center().x - 200.0).abs() < 0.01, "must stay centred");
+        assert!(
+            (fitted.center().x - 200.0).abs() < 0.01,
+            "must stay centred"
+        );
     }
 
     #[test]
