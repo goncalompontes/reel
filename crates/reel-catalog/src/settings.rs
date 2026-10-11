@@ -22,7 +22,7 @@ pub const API_KEY_ENV: &str = "REEL_TMDB_API_KEY";
 const FILE_NAME: &str = "settings.json";
 
 /// Everything the app remembers between runs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CatalogSettings {
     /// TMDB key: a v3 API key or a v4 read access token. Both work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -337,7 +337,10 @@ mod tests {
     #[test]
     fn defaults_are_streaming_first() {
         let settings = CatalogSettings::default();
-        assert!(settings.stream_only, "streaming is the primary way to use the app");
+        assert!(
+            settings.stream_only,
+            "streaming is the primary way to use the app"
+        );
         assert!(settings.subtitles_enabled);
         assert_eq!(settings.default_volume, 100.0);
     }
@@ -358,7 +361,11 @@ mod tests {
             .unwrap()
             .permissions()
             .mode();
-        assert_eq!(mode & 0o777, 0o600, "a credential must not be world readable");
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a credential must not be world readable"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -447,10 +454,8 @@ mod tests {
 
     #[test]
     fn legacy_archive_source_setting_cannot_register_a_backend() {
-        let loaded: CatalogSettings = serde_json::from_str(
-            r#"{"archive_org_enabled":true,"ext_to_enabled":false}"#,
-        )
-        .unwrap();
+        let loaded: CatalogSettings =
+            serde_json::from_str(r#"{"archive_org_enabled":true,"ext_to_enabled":false}"#).unwrap();
         assert!(!loaded.ext_to_enabled);
         assert!(crate::backends::bundled(&loaded).is_empty());
     }

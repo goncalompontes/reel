@@ -130,6 +130,38 @@ fn the_add_modal_opens_and_an_empty_submit_warns() {
     assert_eq!(harness.state().library_len(), 3);
 }
 
+/// Renders the two-pane Settings page so the layout can be reviewed by eye.
+#[test]
+fn snapshot_settings() {
+    let mut harness = harness();
+    harness.run_steps(3);
+    harness.state_mut().go_to(Screen::Settings);
+    harness.run_steps(3);
+    harness.snapshot("settings");
+}
+
+#[test]
+fn settings_autosave_a_toggled_field() {
+    let mut harness = harness();
+    harness.run_steps(3);
+    harness.state_mut().go_to(Screen::Settings);
+    harness.run_steps(3);
+
+    let before = harness.state().settings().merge_works;
+    harness
+        .get_all_by_label_contains("Merge copies")
+        .next()
+        .expect("the merge checkbox")
+        .click();
+    harness.run_steps(3);
+
+    assert_ne!(
+        harness.state().settings().merge_works,
+        before,
+        "changing a setting should write it without a Save button"
+    );
+}
+
 #[test]
 fn settings_reports_the_backend_and_catalog() {
     let mut harness = harness();
@@ -145,23 +177,39 @@ fn settings_reports_the_backend_and_catalog() {
     harness.run_steps(3);
 
     assert_eq!(harness.state().screen(), &Screen::Settings);
-    for label in [
-        "Download folder",
-        "Merge copies",
-        "Metadata API key",
-        "Metadata and artwork",
-        "Search sources",
-        "Streaming and downloads",
-        "Stream on demand",
-        "Playback",
-        "Turn subtitles on",
-        "Stream buffer",
-        "Session cache",
-    ] {
+
+    // General is the pane shown first.
+    for label in ["Download folder", "Merge copies", "Active folder"] {
         assert!(
             harness.query_all_by_label_contains(label).next().is_some(),
-            "settings should show {label:?}"
+            "the General pane should show {label:?}"
         );
+    }
+
+    // Every pane is reachable from the sidebar and shows its own fields.
+    let panes: [(&str, &[&str]); 5] = [
+        ("Metadata", &["Metadata API key", "Cache folder"]),
+        ("Playback", &["Turn subtitles on", "Default volume"]),
+        (
+            "Downloads",
+            &["Stream on demand", "Stream buffer", "Session cache"],
+        ),
+        ("Network", &["Use the DHT", "Announce to trackers"]),
+        ("Search sources", &["Cookie (optional)", "Active sources"]),
+    ];
+    for (pane, labels) in panes {
+        harness
+            .get_all_by_label(pane)
+            .next()
+            .unwrap_or_else(|| panic!("the {pane:?} pane button"))
+            .click();
+        harness.run_steps(2);
+        for label in labels {
+            assert!(
+                harness.query_all_by_label_contains(label).next().is_some(),
+                "the {pane} pane should show {label:?}"
+            );
+        }
     }
 }
 
