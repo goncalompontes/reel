@@ -22,14 +22,16 @@ fn harness() -> Harness<'static, App> {
     // Each Harness has its own egui Context, so the image loaders have to be
     // installed per harness, exactly as `ui.rs` does.
     let installed = std::sync::Once::new();
-    Harness::builder().with_size((1280.0, 820.0)).build_ui_state(
-        move |ui, app: &mut App| {
-            installed.call_once(|| reel_desktop::install(ui.ctx()));
-            let mut frame = eframe::Frame::_new_kittest();
-            eframe::App::ui(app, ui, &mut frame);
-        },
-        App::new(Box::new(FakeBackend::new(sample_library()))),
-    )
+    Harness::builder()
+        .with_size((1280.0, 820.0))
+        .build_ui_state(
+            move |ui, app: &mut App| {
+                installed.call_once(|| reel_desktop::install(ui.ctx()));
+                let mut frame = eframe::Frame::_new_kittest();
+                eframe::App::ui(app, ui, &mut frame);
+            },
+            App::new(Box::new(FakeBackend::new(sample_library()))),
+        )
 }
 
 /// The centre of the first widget whose accessible label contains `label`.
@@ -89,7 +91,7 @@ fn mouse_click_value(harness: &mut Harness<'static, App>, value: &str) {
 fn the_mouse_walks_from_the_library_into_a_detail_page() {
     let mut harness = harness();
     harness.run_steps(3);
-    assert_eq!(harness.state().screen(), &Screen::Library);
+    assert_eq!(harness.state().screen(), &Screen::Home);
 
     // Hovering first must not disturb anything, and then a coordinate click
     // opens the card.
@@ -98,7 +100,7 @@ fn the_mouse_walks_from_the_library_into_a_detail_page() {
 
     assert_eq!(
         harness.state().screen(),
-        &Screen::Detail(3),
+        &Screen::Work(3),
         "a mouse click on the card should open its detail page"
     );
 
@@ -112,8 +114,8 @@ fn the_search_screen_answers_a_mouse_driven_query() {
     let mut harness = harness();
     harness.run_steps(3);
 
-    mouse_click(&mut harness, "Search"); // the nav tab
-    assert_eq!(harness.state().screen(), &Screen::Search);
+    mouse_click(&mut harness, "Discover"); // the rail item
+    assert_eq!(harness.state().screen(), &Screen::Discover);
 
     // The demo backend answers from fixtures. The query is set programmatically
     // because two widgets share the "Search" label (the tab and the button);
@@ -136,7 +138,7 @@ fn the_search_screen_answers_a_mouse_driven_query() {
 fn the_sort_combo_opens_and_selects_with_the_mouse() {
     let mut harness = harness();
     harness.run_steps(3);
-    mouse_click(&mut harness, "Search");
+    mouse_click(&mut harness, "Discover");
 
     // "a" matches both fixtures.
     harness.state_mut().set_search_query("a");

@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use reel_core::{AddOptions, AddSource, Engine, EngineConfig};
+use reel_desktop::App;
 use reel_desktop::backend::{Backend, CatalogOptions, EngineBackend};
-use reel_desktop::{App, Screen};
 
 fn scratch(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("reel-app-resume-{}-{name}", std::process::id()));
@@ -43,7 +43,11 @@ fn wait_for(what: &str, timeout: Duration, mut check: impl FnMut() -> bool) {
 }
 
 /// Run frames until the player has decoded at least `want` of them.
-fn drive_until_frames(harness: &mut Harness<'static, App>, want: u64, timeout: Duration) -> (u64, String) {
+fn drive_until_frames(
+    harness: &mut Harness<'static, App>,
+    want: u64,
+    timeout: Duration,
+) -> (u64, String) {
     let deadline = Instant::now() + timeout;
     while harness.state().frames_uploaded() < want {
         if Instant::now() > deadline {
@@ -77,10 +81,22 @@ fn play_watch_go_back_and_play_again() {
     let video = dir.join("clip.mp4");
     let status = Command::new("ffmpeg")
         .args([
-            "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "lavfi", "-i", "testsrc=duration=30:size=640x360:rate=24",
-            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=30:size=640x360:rate=24",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
         ])
         .arg(&video)
         .status()
@@ -95,7 +111,12 @@ fn play_watch_go_back_and_play_again() {
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let created = runtime
-        .block_on(reel_core::create_torrent_file(&seed_dir, None, Vec::new(), Some(64 * 1024)))
+        .block_on(reel_core::create_torrent_file(
+            &seed_dir,
+            None,
+            Vec::new(),
+            Some(64 * 1024),
+        ))
         .expect("create torrent");
     let torrent_path = dir.join("clip.torrent");
     std::fs::write(&torrent_path, &created.bytes).unwrap();
@@ -114,15 +135,26 @@ fn play_watch_go_back_and_play_again() {
         let outcome = engine
             .add(
                 AddSource::File(created.bytes.clone()),
-                AddOptions { media_only: false, allow_overwrite: true, ..Default::default() },
+                AddOptions {
+                    media_only: false,
+                    allow_overwrite: true,
+                    ..Default::default()
+                },
             )
             .await
             .expect("seed add");
         (engine, outcome.torrent.id)
     });
-    wait_for("the seeder to have the data", Duration::from_secs(60), || {
-        seed_engine.view(seed_id).map(|v| v.finished).unwrap_or(false)
-    });
+    wait_for(
+        "the seeder to have the data",
+        Duration::from_secs(60),
+        || {
+            seed_engine
+                .view(seed_id)
+                .map(|v| v.finished)
+                .unwrap_or(false)
+        },
+    );
     let seed_addr = seed_engine.session().listen_addr().expect("seed addr");
 
     let leech = dir.join("leech");
@@ -166,7 +198,7 @@ fn play_watch_go_back_and_play_again() {
         .first()
         .map(|work| work.lead_torrent_id())
         .expect("a work");
-    harness.state_mut().navigate(Screen::Detail(id));
+    harness.state_mut().open_work(id);
     harness.run_steps(3);
 
     // First play.
@@ -181,7 +213,7 @@ fn play_watch_go_back_and_play_again() {
     // resumes rather than starting over.
     let (frames, why) = drive_until_frames(&mut harness, 90, Duration::from_secs(90));
     assert!(frames >= 90, "first play produced no frames: {why}");
-    assert_eq!(harness.state().screen(), &Screen::Player);
+    assert!(harness.state().is_player());
 
     // Leave, as the Back button does.
     {
@@ -192,7 +224,7 @@ fn play_watch_go_back_and_play_again() {
             .click();
     }
     harness.run_steps(3);
-    assert_ne!(harness.state().screen(), &Screen::Player);
+    assert!(!harness.state().is_player());
 
     // Give the backend a moment to pause and cache the stream.
     std::thread::sleep(Duration::from_millis(500));

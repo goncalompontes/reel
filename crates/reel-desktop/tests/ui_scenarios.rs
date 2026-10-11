@@ -20,13 +20,15 @@ use reel_desktop::{App, Screen};
 
 /// A harness around the real app with the given library.
 fn harness(items: Vec<reel_desktop::LibraryItem>) -> Harness<'static, App> {
-    Harness::builder().with_size((1280.0, 1000.0)).build_ui_state(
-        move |ui, app: &mut App| {
-            let mut frame = eframe::Frame::_new_kittest();
-            eframe::App::ui(app, ui, &mut frame);
-        },
-        App::new(Box::new(FakeBackend::new(items))),
-    )
+    Harness::builder()
+        .with_size((1280.0, 1000.0))
+        .build_ui_state(
+            move |ui, app: &mut App| {
+                let mut frame = eframe::Frame::_new_kittest();
+                eframe::App::ui(app, ui, &mut frame);
+            },
+            App::new(Box::new(FakeBackend::new(items))),
+        )
 }
 
 /// A library with the sample titles plus one paused season pack (torrent 9).
@@ -35,7 +37,7 @@ fn with_paused_pack() -> Harness<'static, App> {
     items.push(sample_paused_season_pack());
     let mut harness = harness(items);
     harness.run_steps(3);
-    harness.state_mut().navigate(Screen::Detail(9));
+    harness.state_mut().open_work(9);
     harness.run_steps(3);
     harness
 }
@@ -60,10 +62,7 @@ fn a_paused_pack_does_not_look_like_it_is_downloading() {
     );
     // Every row still offers Download, which is how you would keep one.
     assert!(
-        harness
-            .get_all_by_label("Download")
-            .next()
-            .is_some(),
+        harness.get_all_by_label("Download").next().is_some(),
         "episodes should be downloadable"
     );
 }
@@ -85,10 +84,7 @@ fn download_toggles_to_stop_download_and_back() {
         "Download should mark the title as kept"
     );
     assert!(
-        harness
-            .get_all_by_label("Stop download")
-            .next()
-            .is_some(),
+        harness.get_all_by_label("Stop download").next().is_some(),
         "once kept, the button reverses"
     );
 
@@ -224,9 +220,7 @@ fn the_remove_dialog_closes_when_you_navigate_away() {
     let mut harness = with_paused_pack();
 
     {
-        harness
-            .get_by_label("\u{1f5d1}  Remove")
-            .click();
+        harness.get_by_label("\u{1f5d1}  Remove").click();
     }
     harness.run_steps(3);
     assert!(
@@ -237,7 +231,7 @@ fn the_remove_dialog_closes_when_you_navigate_away() {
         "Remove should open the source dialog"
     );
 
-    harness.state_mut().navigate(Screen::Settings);
+    harness.state_mut().go_to(Screen::Settings);
     harness.run_steps(3);
     assert!(
         harness

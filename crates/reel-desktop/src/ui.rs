@@ -22,15 +22,97 @@ use crate::backend::{
 use crate::player::{PlaybackInfo, PlaybackStats, PlayerController};
 use crate::theme;
 
-/// Which page is showing.
+/// A location in the content area.
+///
+/// The first entry of the navigation trail is always a *root* — a destination
+/// on the rail. Anything else is a view pushed on top of it: `Work` today, with
+/// collections, seasons and episodes to follow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Screen {
-    Library,
-    Detail(usize),
-    Player,
-    Add,
-    Search,
+    Home,
+    Discover,
+    Activity,
     Settings,
+    Work(usize),
+}
+
+impl Screen {
+    /// A rail destination, as opposed to a view pushed on top of one.
+    fn is_root(&self) -> bool {
+        !matches!(self, Screen::Work(_))
+    }
+
+    /// The fixed name of a rail destination, for breadcrumbs and the rail.
+    fn root_label(&self) -> &'static str {
+        match self {
+            Screen::Home => "Home",
+            Screen::Discover => "Discover",
+            Screen::Activity => "Activity",
+            Screen::Settings => "Settings",
+            Screen::Work(_) => "",
+        }
+    }
+}
+
+/// The navigation trail: a root with views stacked on it.
+///
+/// The content area draws the last entry; breadcrumbs and Back walk the trail,
+/// so a title opened from Discover returns to Discover rather than to Home.
+struct Nav {
+    trail: Vec<Screen>,
+}
+
+impl Nav {
+    fn new(root: Screen) -> Self {
+        debug_assert!(root.is_root(), "a trail must start at a rail destination");
+        Self { trail: vec![root] }
+    }
+
+    /// The screen currently shown.
+    fn screen(&self) -> &Screen {
+        self.trail.last().expect("the trail is never empty")
+    }
+
+    /// The rail destination the trail is rooted at.
+    fn root(&self) -> &Screen {
+        &self.trail[0]
+    }
+
+    fn trail(&self) -> &[Screen] {
+        &self.trail
+    }
+
+    /// Go to a rail destination, replacing the trail.
+    fn go(&mut self, root: Screen) {
+        debug_assert!(root.is_root());
+        self.trail.clear();
+        self.trail.push(root);
+    }
+
+    /// Open a view on top of the current screen.
+    fn open(&mut self, view: Screen) {
+        if self.screen() != &view {
+            self.trail.push(view);
+        }
+    }
+
+    fn can_back(&self) -> bool {
+        self.trail.len() > 1
+    }
+
+    fn back(&mut self) -> bool {
+        if self.can_back() {
+            self.trail.pop();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drop views until the trail is `depth` long, for a breadcrumb click.
+    fn truncate(&mut self, depth: usize) {
+        self.trail.truncate(depth.max(1));
+    }
 }
 
 /// A catalog row, resolved to torrent ids so rendering never rebuilds it.
@@ -74,7 +156,15 @@ struct SearchSignature {
 
 pub struct App {
     backend: Box<dyn Backend>,
-    screen: Screen,
+    /// Where the content area is: a rail destination plus any pushed views.
+    nav: Nav,
+    /// Whether the player overlay is up. It covers the shell and returns to
+    /// whatever the trail already shows when it closes.
+    player_open: bool,
+    /// Whether the global Add modal is up.
+    add_open: bool,
+    /// Set by the ⌘/Ctrl-K shortcut, consumed by the header's search field.
+    focus_search: bool,
     /// Cached library, refreshed periodically while browsing.
     library: Vec<LibraryItem>,
     /// Torrents grouped into films and series. Rebuilt with the library.
@@ -189,7 +279,10 @@ impl App {
     pub fn new(backend: Box<dyn Backend>) -> Self {
         let mut app = Self {
             backend,
-            screen: Screen::Library,
+            nav: Nav::new(Screen::Home),
+            player_open: false,
+            add_open: false,
+            focus_search: false,
             library: Vec::new(),
             works: Vec::new(),
             rows: Vec::new(),
@@ -255,7 +348,49 @@ impl App {
 
     /// The screen currently shown. Exposed for tests.
     pub fn screen(&self) -> &Screen {
-        &self.screen
+        self.nav.screen()
+    }
+
+    /// The rail destination the current trail is rooted at. Exposed for tests.
+    pub fn root(&self) -> &Screen {
+        self.nav.root()
+    }
+
+    /// The navigation trail, deepest last. Exposed for tests.
+    pub fn nav_trail(&self) -> &[Screen] {
+        self.nav.trail()
+    }
+
+    /// Whether the player overlay is showing. Exposed for tests.
+    pub fn is_player(&self) -> bool {
+        self.player_open
+    }
+
+    /// Whether the Add modal is showing. Exposed for tests.
+    pub fn is_add_open(&self) -> bool {
+        self.add_open
+    }
+
+    /// Open the global Add modal. Exposed for tests and the debug tool.
+    pub fn open_add(&mut self) {
+        self.add_open = true;
+    }
+
+    /// Pushed views: `Work` stands on top of the root it was opened from, so
+    /// "back" returns there rather than to a hardcoded Home.
+    pub fn open_work(&mut self, work_id: usize) {
+        self.nav.open(Screen::Work(work_id));
+    }
+
+    /// Walk one step back. Returns whether there was anywhere to go.
+    pub fn back(&mut self) -> bool {
+        self.nav.back()
+    }
+
+    /// Go to a rail destination.
+    pub fn go_to(&mut self, root: Screen) {
+        debug_assert!(root.is_root(), "go_to takes a rail destination");
+        self.nav.go(root);
     }
 
     /// Number of entries in the cached library. Exposed for tests.
@@ -283,8 +418,14 @@ impl App {
         self.rows.iter().map(|row| row.title.clone()).collect()
     }
 
+    /// Go to a location. A rail destination replaces the trail; a view is
+    /// pushed on top of wherever you are. Kept for tests and the debug tool.
     pub fn navigate(&mut self, screen: Screen) {
-        self.screen = screen;
+        if screen.is_root() {
+            self.nav.go(screen);
+        } else {
+            self.nav.open(screen);
+        }
     }
 
     pub fn set_add_source(&mut self, source: impl Into<String>) {
@@ -567,7 +708,7 @@ impl App {
         let ctx = self.pending_ctx.clone().unwrap_or_default();
         match self.player.open(&ctx, &capability, &url, info) {
             Ok(()) => {
-                self.screen = Screen::Player;
+                self.player_open = true;
                 self.toast = None;
             }
             Err(e) => {
@@ -740,7 +881,7 @@ impl App {
     fn maybe_refresh(&mut self) {
         // The player needs fresh engine stats for its overlay, and the library
         // needs new metadata as it arrives, so both refresh on one cadence.
-        if self.screen != Screen::Settings && self.last_refresh.elapsed() >= REFRESH_INTERVAL {
+        if self.screen() != &Screen::Settings && self.last_refresh.elapsed() >= REFRESH_INTERVAL {
             self.refresh();
         }
     }
@@ -780,12 +921,12 @@ impl App {
                     // A new torrent may be another version of something already
                     // held, so open the work it joined rather than the torrent.
                     let work_id = self.work_id_for_torrent(id).unwrap_or(id);
-                    self.screen = Screen::Detail(work_id);
+                    self.open_work(work_id);
                 }
                 BackendEvent::Metadata { .. } | BackendEvent::WatchUpdated => {
                     // Only these change the library, and the settings page does
                     // not show it, so it is left alone there.
-                    if self.screen != Screen::Settings {
+                    if self.screen() != &Screen::Settings {
                         self.refresh();
                     }
                 }
@@ -941,8 +1082,8 @@ impl App {
     }
 
     fn selected_work(&self) -> Option<Work> {
-        match self.screen {
-            Screen::Detail(id) => self.work(id),
+        match self.screen() {
+            Screen::Work(id) => self.work(*id),
             _ => None,
         }
     }
@@ -1094,36 +1235,56 @@ impl eframe::App for App {
             ctx.request_repaint_after(REFRESH_INTERVAL);
         }
 
-        // Players get a bare canvas: the video and its controls only.
-        if self.screen == Screen::Player {
+        // The player is an overlay: it covers the shell and returns to whatever
+        // the trail already shows when it closes.
+        if self.player_open {
             self.player_screen(ui, &ctx);
             self.draw_toast(ui, &ctx);
             return;
         }
 
-        egui::Panel::top("top-bar")
+        self.handle_shortcuts(&ctx);
+
+        // The rail collapses to icons on a narrow window.
+        let rail_width = if ui.available_width() < 1040.0 {
+            60.0
+        } else {
+            200.0
+        };
+        egui::Panel::left("rail")
+            .exact_size(rail_width)
+            .resizable(false)
+            .show_separator_line(false)
             .frame(
                 egui::Frame::NONE
                     .fill(theme::SURFACE)
-                    .inner_margin(egui::Margin::symmetric(16, 10)),
+                    .inner_margin(egui::Margin::symmetric(10, 12)),
             )
-            .show(ui, |ui| self.top_bar(ui));
+            .show(ui, |ui| self.rail(ui, rail_width));
+
+        egui::Panel::top("header")
+            .frame(
+                egui::Frame::NONE
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin::symmetric(18, 10)),
+            )
+            .show(ui, |ui| self.header(ui));
 
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
                     .fill(theme::BG)
-                    .inner_margin(egui::Margin::symmetric(20, 14)),
+                    .inner_margin(egui::Margin::symmetric(20, 6)),
             )
-            .show(ui, |ui| match self.screen.clone() {
-                Screen::Library => self.library_screen(ui),
-                Screen::Detail(_) => self.detail_screen(ui),
-                Screen::Add => self.add_screen(ui),
-                Screen::Search => self.search_screen(ui),
+            .show(ui, |ui| match self.screen().clone() {
+                Screen::Home => self.library_screen(ui),
+                Screen::Work(_) => self.detail_screen(ui),
+                Screen::Discover => self.search_screen(ui),
+                Screen::Activity => self.activity_screen(ui),
                 Screen::Settings => self.settings_screen(ui),
-                Screen::Player => unreachable!("handled above"),
             });
 
+        self.draw_add_modal(&ctx);
         self.draw_toast(ui, &ctx);
         self.draw_remove_dialog(ui, &ctx);
     }
@@ -1136,57 +1297,407 @@ impl eframe::App for App {
 // ------------------------------------------------------------------ chrome
 
 impl App {
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+    /// Keyboard shortcuts that belong to the shell rather than a view.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let focus_search = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K));
+        let back = ctx.input(|i| {
+            i.key_pressed(egui::Key::Escape)
+                || (i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft))
+        });
+
+        // The Add modal owns Escape and the backdrop while it is up.
+        if back && !self.add_open {
+            self.back();
+        }
+        if focus_search {
+            if !matches!(self.root(), Screen::Home | Screen::Discover) {
+                self.go_to(Screen::Discover);
+            }
+            self.focus_search = true;
+        }
+    }
+
+    /// The left rail: destinations, the Add action, and the transfers summary.
+    fn rail(&mut self, ui: &mut egui::Ui, width: f32) {
+        let compact = width < 100.0;
+        ui.vertical(|ui| {
+            ui.add_space(2.0);
             ui.label(
                 egui::RichText::new("reel")
-                    .size(22.0)
+                    .size(if compact { 17.0 } else { 22.0 })
                     .strong()
                     .color(theme::ACCENT),
             );
+            ui.add_space(12.0);
+
+            self.rail_item(ui, Screen::Home, "Home", compact);
+            self.rail_item(ui, Screen::Discover, "Discover", compact);
+            self.rail_item(ui, Screen::Activity, "Activity", compact);
+
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                ui.add_space(2.0);
+                self.rail_transfers(ui, compact);
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+                self.rail_item(ui, Screen::Settings, "Settings", compact);
+                ui.add_space(8.0);
+                let add = if compact {
+                    "+".to_string()
+                } else {
+                    "+   Add".to_string()
+                };
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 30.0],
+                        egui::Button::new(egui::RichText::new(add).size(13.5)),
+                    )
+                    .clicked()
+                {
+                    self.add_open = true;
+                }
+            });
+        });
+    }
+
+    fn rail_item(&mut self, ui: &mut egui::Ui, target: Screen, label: &str, compact: bool) {
+        let selected = self.root() == &target;
+        // No icon set yet (that is the design-system phase); a letter stands in
+        // on the collapsed rail rather than an unsupported glyph.
+        let text = if compact {
+            label.chars().next().unwrap_or(' ').to_string()
+        } else {
+            label.to_string()
+        };
+        let response = ui.add_sized(
+            [ui.available_width(), 30.0],
+            egui::Button::new(egui::RichText::new(text).size(13.5)).selected(selected),
+        );
+        if response.clicked() {
+            self.nav.go(target);
+        }
+    }
+
+    fn rail_transfers(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let (down, peers, active) =
+            self.library
+                .iter()
+                .fold((0u64, 0u32, 0usize), |(down, peers, active), item| {
+                    (
+                        down + item.torrent.stats.download_bps,
+                        peers + item.torrent.stats.peers.live,
+                        active
+                            + usize::from(item.downloading || item.torrent.stats.download_bps > 0),
+                    )
+                });
+        if compact {
+            if active > 0 {
+                ui.label(
+                    egui::RichText::new(format!("{active}"))
+                        .size(12.0)
+                        .color(theme::OK),
+                );
+            }
+            return;
+        }
+        if down > 0 {
+            ui.label(
+                egui::RichText::new(format!("{} \u{2b07}", fmt::human_rate(down)))
+                    .size(11.5)
+                    .color(theme::OK),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new(format!("{active} active"))
+                    .size(11.0)
+                    .color(theme::TEXT_DIM),
+            );
+        }
+        ui.label(
+            egui::RichText::new(format!("{peers} peers"))
+                .size(11.0)
+                .color(theme::TEXT_DIM),
+        );
+    }
+
+    /// The header: Back, breadcrumbs, and the contextual search field.
+    fn header(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(self.nav.can_back(), egui::Button::new("\u{2039}  Back"))
+                .clicked()
+            {
+                self.nav.back();
+            }
             ui.add_space(6.0);
 
-            let tab = |ui: &mut egui::Ui, current: &Screen, target: Screen, label: &str| {
-                if ui.selectable_label(current == &target, label).clicked() {
-                    Some(target)
-                } else {
-                    None
+            let trail: Vec<Screen> = self.nav.trail().to_vec();
+            let last = trail.len().saturating_sub(1);
+            for (index, crumb) in trail.iter().enumerate() {
+                if index > 0 {
+                    ui.label(egui::RichText::new("/").color(theme::TEXT_DIM));
                 }
-            };
-
-            let mut next = None;
-            next = next.or(tab(ui, &self.screen, Screen::Library, "  Library  "));
-            next = next.or(tab(ui, &self.screen, Screen::Search, "  Search  "));
-            next = next.or(tab(ui, &self.screen, Screen::Add, "  Add  "));
-            next = next.or(tab(ui, &self.screen, Screen::Settings, "  Settings  "));
-            if let Some(target) = next {
-                self.screen = target;
+                let label = self.crumb_label(crumb);
+                if index == last {
+                    ui.label(egui::RichText::new(label).size(15.0).strong());
+                } else if ui
+                    .link(egui::RichText::new(label).color(theme::TEXT_DIM))
+                    .clicked()
+                {
+                    self.nav.truncate(index + 1);
+                }
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.screen == Screen::Library {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.filter)
-                            .hint_text("filter library\u{2026}")
-                            .desired_width(200.0),
-                    );
-                }
-
-                let (down, peers): (u64, u32) = self.library.iter().fold((0, 0), |(d, p), item| {
-                    (
-                        d + item.torrent.stats.download_bps,
-                        p + item.torrent.stats.peers.live,
-                    )
-                });
-                if down > 0 {
-                    ui.label(
-                        egui::RichText::new(format!("{} \u{2b07}", fmt::human_rate(down)))
-                            .color(theme::TEXT_DIM),
-                    );
-                }
-                ui.label(egui::RichText::new(format!("{peers} peers")).color(theme::TEXT_DIM));
+                self.header_search(ui);
             });
         });
+    }
+
+    fn crumb_label(&self, screen: &Screen) -> String {
+        match screen {
+            Screen::Work(id) => self
+                .work(*id)
+                .map(|work| work.heading())
+                .unwrap_or_else(|| "Title".to_string()),
+            other => other.root_label().to_string(),
+        }
+    }
+
+    fn header_search(&mut self, ui: &mut egui::Ui) {
+        let root = self.root().clone();
+        match root {
+            Screen::Home => {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.filter)
+                        .id(egui::Id::new("global-search"))
+                        .hint_text("filter library\u{2026}")
+                        .desired_width(240.0),
+                );
+                if self.focus_search {
+                    response.request_focus();
+                    self.focus_search = false;
+                }
+            }
+            // Discover owns its own search field; the header stays quiet there.
+            Screen::Discover => {}
+            _ => {
+                if ui
+                    .button("\u{2318}K  Search")
+                    .on_hover_text("Search the sources")
+                    .clicked()
+                {
+                    self.go_to(Screen::Discover);
+                    self.focus_search = true;
+                }
+            }
+        }
+    }
+
+    /// The global Add modal, opened from the rail or an empty state.
+    fn draw_add_modal(&mut self, ctx: &egui::Context) {
+        if !self.add_open {
+            return;
+        }
+        let mut close = false;
+        let mut submit = false;
+
+        let modal = egui::Modal::new(egui::Id::new("add-modal")).show(ctx, |ui| {
+            ui.set_width(520.0);
+            ui.label(egui::RichText::new("Add a torrent").size(18.0).strong());
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "Paste a magnet link, an http(s) .torrent URL, or a 40-character info hash.",
+                )
+                .color(theme::TEXT_DIM)
+                .size(12.0),
+            );
+            ui.add_space(10.0);
+            let field = ui.add(
+                egui::TextEdit::multiline(&mut self.add_source)
+                    .hint_text("magnet:?xt=urn:btih:\u{2026}")
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(3),
+            );
+            ui.add_space(6.0);
+            ui.checkbox(
+                &mut self.add_media_only,
+                "Only download playable files (skips samples and extras)",
+            );
+
+            let status = self.backend.catalog_status();
+            if !status.configured {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        status
+                            .note
+                            .unwrap_or_else(|| "Metadata is unavailable.".to_string()),
+                    )
+                    .color(theme::WARN)
+                    .size(12.0),
+                );
+            }
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button(egui::RichText::new("Add torrent").size(15.0))
+                    .clicked()
+                {
+                    submit = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+
+            // Ctrl/Cmd+Enter submits from the field.
+            if field.has_focus()
+                && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter))
+            {
+                submit = true;
+            }
+        });
+
+        if modal.backdrop_response.clicked() {
+            close = true;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            close = true;
+        }
+
+        if submit {
+            let had_source = !self.add_source.trim().is_empty();
+            self.submit_add();
+            if had_source {
+                close = true;
+            }
+        }
+        if close {
+            self.add_open = false;
+            self.add_source.clear();
+        }
+    }
+
+    /// Transfers that are moving or kept, so the rail's Activity item has a home.
+    fn activity_screen(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(16.0);
+        ui.label(egui::RichText::new("Activity").size(22.0).strong());
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new("Transfers that are running, buffering or kept on disk.")
+                .color(theme::TEXT_DIM)
+                .size(11.5),
+        );
+        ui.add_space(12.0);
+
+        let active: Vec<LibraryItem> = self
+            .library
+            .iter()
+            .filter(|item| {
+                item.downloading || item.torrent.stats.download_bps > 0 || !item.torrent.finished
+            })
+            .cloned()
+            .collect();
+
+        if active.is_empty() {
+            ui.add_space(30.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new("Nothing is transferring")
+                        .size(18.0)
+                        .strong(),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Playing a title streams it; downloading a copy keeps it on disk.",
+                    )
+                    .color(theme::TEXT_DIM),
+                );
+            });
+            return;
+        }
+
+        let mut open: Option<usize> = None;
+        let mut pause: Option<(usize, bool)> = None;
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for item in &active {
+                let work_id = self
+                    .work_id_for_torrent(item.torrent.id)
+                    .unwrap_or(item.torrent.id);
+                egui::Frame::NONE
+                    .fill(theme::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .corner_radius(theme::CARD_RADIUS)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new(reel_core::title::truncate(
+                                        &item.heading(),
+                                        60,
+                                    ))
+                                    .size(13.5)
+                                    .strong(),
+                                );
+                                let mut facts = vec![item.torrent.stats.state.clone()];
+                                if item.downloading {
+                                    facts.push("kept".to_string());
+                                }
+                                facts.push(format!("{:.0}%", item.torrent.stats.percent));
+                                if item.torrent.stats.download_bps > 0 {
+                                    facts.push(fmt::human_rate(item.torrent.stats.download_bps));
+                                }
+                                facts.push(format!("{} peers", item.torrent.stats.peers.live));
+                                if let Some(eta) = item.torrent.stats.eta_seconds {
+                                    facts.push(fmt::human_eta(Some(eta)));
+                                }
+                                ui.label(
+                                    egui::RichText::new(facts.join("   \u{2022}   "))
+                                        .size(11.0)
+                                        .color(theme::TEXT_DIM),
+                                );
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("Open").clicked() {
+                                        open = Some(work_id);
+                                    }
+                                    let paused = item.torrent.stats.is_paused();
+                                    if ui
+                                        .add_enabled(
+                                            !item.torrent.finished,
+                                            egui::Button::new(if paused {
+                                                "Resume"
+                                            } else {
+                                                "Pause"
+                                            })
+                                            .small(),
+                                        )
+                                        .clicked()
+                                    {
+                                        pause = Some((item.torrent.id, !paused));
+                                    }
+                                },
+                            );
+                        });
+                    });
+                ui.add_space(6.0);
+            }
+        });
+
+        if let Some(id) = open {
+            self.open_work(id);
+        }
+        if let Some((id, paused)) = pause {
+            self.backend.set_paused(id, paused);
+            self.invalidate();
+        }
     }
 
     fn draw_toast(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1259,7 +1770,7 @@ impl App {
             return;
         };
         // Navigating away dismisses the dialog; it belongs to one detail page.
-        if self.screen != Screen::Detail(work_id) {
+        if !matches!(self.screen(), Screen::Work(id) if *id == work_id) {
             self.show_remove = None;
             return;
         }
@@ -1379,7 +1890,7 @@ impl App {
             self.refresh();
             // The work may have shrunk or vanished entirely.
             if self.work(work_id).is_none() {
-                self.screen = Screen::Library;
+                self.nav.go(Screen::Home);
             }
             close = true;
         }
@@ -1689,7 +2200,7 @@ impl App {
         if let Some(id) = play {
             self.play_with_ctx(id);
         } else if let Some(id) = open {
-            self.screen = Screen::Detail(id);
+            self.open_work(id);
         }
     }
 
@@ -1724,7 +2235,7 @@ impl App {
         if let Some(id) = play {
             self.play_with_ctx(id);
         } else if let Some(id) = open {
-            self.screen = Screen::Detail(id);
+            self.open_work(id);
         }
     }
 
@@ -1746,7 +2257,7 @@ impl App {
             );
             ui.add_space(20.0);
             if ui.button("  Add a torrent  ").clicked() {
-                self.screen = Screen::Add;
+                self.add_open = true;
             }
         });
     }
@@ -1863,7 +2374,7 @@ impl App {
         if play {
             self.play_with_ctx(id);
         } else if hero_response.clicked() {
-            self.screen = Screen::Detail(id);
+            self.open_work(id);
         }
     }
 
@@ -1883,8 +2394,8 @@ impl App {
     fn detail_screen(&mut self, ui: &mut egui::Ui) {
         let Some(work) = self.selected_work() else {
             ui.label("That title is no longer in the library.");
-            if ui.button("Back to library").clicked() {
-                self.screen = Screen::Library;
+            if ui.button("Back").clicked() {
+                self.back();
             }
             return;
         };
@@ -1895,8 +2406,8 @@ impl App {
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("\u{2b05}  Library").clicked() {
-                    action = Some(DetailAction::Navigate(Screen::Library));
+                if ui.button("\u{2b05}  Back").clicked() {
+                    action = Some(DetailAction::Back);
                 }
                 let copies = work.torrent_count();
                 ui.label(
@@ -2111,7 +2622,9 @@ impl App {
         });
 
         match action {
-            Some(DetailAction::Navigate(screen)) => self.screen = screen,
+            Some(DetailAction::Back) => {
+                self.back();
+            }
             Some(DetailAction::OpenRemove) => self.open_remove_dialog(work_id, None),
             Some(DetailAction::RemoveSource(torrent_id)) => {
                 self.open_remove_dialog(work_id, Some(torrent_id))
@@ -2667,7 +3180,7 @@ impl App {
 }
 
 enum DetailAction {
-    Navigate(Screen),
+    Back,
     OpenRemove,
     RemoveSource(usize),
     SetPaused(usize, bool),
@@ -2950,83 +3463,6 @@ fn stat(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.add_space(8.0);
 }
 
-// --------------------------------------------------------------------- add
-
-impl App {
-    fn add_screen(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(16.0);
-        ui.label(egui::RichText::new("Add a torrent").size(22.0).strong());
-        ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new(
-                "Paste a magnet link, an http(s) .torrent URL, or a 40-character info hash. \
-                 reel fetches the metadata, picks the video, and starts streaming it.",
-            )
-            .color(theme::TEXT_DIM),
-        );
-
-        ui.add_space(14.0);
-        let response = ui.add(
-            egui::TextEdit::multiline(&mut self.add_source)
-                .hint_text("magnet:?xt=urn:btih:\u{2026}")
-                .desired_width(f32::INFINITY)
-                .desired_rows(3),
-        );
-
-        ui.add_space(8.0);
-        ui.checkbox(
-            &mut self.add_media_only,
-            "Only download playable files (skips samples and extras)",
-        );
-
-        ui.add_space(12.0);
-        let submit = ui
-            .add(egui::Button::new(
-                egui::RichText::new("Add torrent").size(15.0),
-            ))
-            .clicked();
-        let enter = response.has_focus()
-            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-
-        if submit || enter {
-            self.submit_add();
-        }
-
-        let status = self.backend.catalog_status();
-        if !status.configured {
-            ui.add_space(10.0);
-            ui.label(
-                egui::RichText::new(
-                    status
-                        .note
-                        .clone()
-                        .unwrap_or_else(|| "Metadata is unavailable.".into()),
-                )
-                .color(theme::WARN)
-                .size(12.0),
-            );
-        }
-
-        if !self.library.is_empty() {
-            ui.add_space(24.0);
-            ui.label(
-                egui::RichText::new("Already in your library")
-                    .size(16.0)
-                    .strong(),
-            );
-            ui.add_space(6.0);
-            for item in self.library.clone() {
-                ui.horizontal(|ui| {
-                    ui.label(reel_core::title::truncate(&item.heading(), 50));
-                    if ui.small_button("Open").clicked() {
-                        self.screen = Screen::Detail(item.torrent.id);
-                    }
-                });
-            }
-        }
-    }
-}
-
 // ------------------------------------------------------------------ search
 
 impl App {
@@ -3048,9 +3484,15 @@ impl App {
         ui.horizontal(|ui| {
             let field = ui.add(
                 egui::TextEdit::singleline(&mut self.search_query)
+                    .id(egui::Id::new("global-search"))
                     .hint_text("title to search for\u{2026}")
                     .desired_width(420.0),
             );
+            // The shell's ⌘/Ctrl-K lands here when Discover is showing.
+            if self.focus_search {
+                field.request_focus();
+                self.focus_search = false;
+            }
             let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let clicked = ui.button("Search").clicked();
             if clicked || enter {
@@ -4721,10 +5163,9 @@ impl App {
         self.maybe_recover_stalled_stream();
 
         let Some(info) = self.player.current().cloned() else {
-            self.screen = self
-                .player_origin
-                .map(Screen::Detail)
-                .unwrap_or(Screen::Library);
+            // Nothing to show: drop back to the shell, which still points
+            // wherever the player was opened from.
+            self.player_open = false;
             return;
         };
 
@@ -4972,10 +5413,8 @@ impl App {
         self.stream_recovered = false;
         self.watch_recording_for = None;
         self.watch_last_recorded = 0.0;
-        self.screen = self
-            .player_origin
-            .map(Screen::Detail)
-            .unwrap_or(Screen::Library);
+        // The trail still points at wherever the player was opened from.
+        self.player_open = false;
         // A stream-only title gives its temporary storage back now; a download
         // is left alone.
         if let Some(origin) = self.player_origin {
@@ -5006,7 +5445,7 @@ mod tests {
     #[test]
     fn starts_on_the_library_with_rows() {
         let app = app();
-        assert_eq!(app.screen(), &Screen::Library);
+        assert_eq!(app.screen(), &Screen::Home);
         assert_eq!(app.library_len(), 3);
 
         let rows = app.row_titles();
@@ -5025,22 +5464,35 @@ mod tests {
     #[test]
     fn navigation_changes_screens() {
         let mut app = app();
-        app.navigate(Screen::Add);
-        assert_eq!(app.screen(), &Screen::Add);
-        app.navigate(Screen::Settings);
+        app.go_to(Screen::Settings);
         assert_eq!(app.screen(), &Screen::Settings);
-        app.navigate(Screen::Detail(1));
-        assert_eq!(app.screen(), &Screen::Detail(1));
+        app.go_to(Screen::Discover);
+        assert_eq!(app.screen(), &Screen::Discover);
+
+        // A pushed view leaves a trail back to the root it came from.
+        app.open_work(1);
+        assert_eq!(app.screen(), &Screen::Work(1));
+        assert_eq!(app.root(), &Screen::Discover);
+        assert!(app.back());
+        assert_eq!(app.screen(), &Screen::Discover);
+        assert!(!app.back(), "the root is the end of the trail");
+    }
+
+    #[test]
+    fn a_work_opened_from_home_returns_home() {
+        let mut app = app();
+        app.open_work(1);
+        assert_eq!(app.nav_trail(), &[Screen::Home, Screen::Work(1)]);
+        assert!(app.back());
+        assert_eq!(app.screen(), &Screen::Home);
     }
 
     #[test]
     fn adding_requires_a_source() {
         let mut app = app();
-        app.navigate(Screen::Add);
 
         app.submit_add();
         assert!(app.toast.as_ref().is_some_and(|t| t.error));
-        assert_eq!(app.screen(), &Screen::Add, "should stay put on failure");
 
         app.set_add_source("magnet:?xt=urn:btih:abc");
         app.submit_add();
@@ -5088,11 +5540,19 @@ mod tests {
 
         let signature = app.search_signature();
         let view = app.build_search_view(signature);
-        assert_eq!(view.shown.len(), 2, "the low-seeder release is filtered out");
+        assert_eq!(
+            view.shown.len(),
+            2,
+            "the low-seeder release is filtered out"
+        );
         assert_eq!(view.shown[0].title, "The Bear S02E01 1080p");
         assert_eq!(view.releases.len(), view.shown.len());
         assert_eq!(view.metas.len(), view.shown.len());
-        assert_eq!(view.works.len(), 2, "the two remaining titles are different works");
+        assert_eq!(
+            view.works.len(),
+            2,
+            "the two remaining titles are different works"
+        );
     }
 
     #[test]

@@ -22,16 +22,18 @@ fn harness_with(app: App) -> Harness<'static, App> {
     // the generated fallback is drawn instead.
     let installed = std::sync::Once::new();
 
-    Harness::builder().with_size((1280.0, 820.0)).build_ui_state(
-        move |ui, app: &mut App| {
-            installed.call_once(|| reel_desktop::install(ui.ctx()));
-            // eframe hands the app a `Frame`; this is the supported way to
-            // fabricate one for tests.
-            let mut frame = eframe::Frame::_new_kittest();
-            eframe::App::ui(app, ui, &mut frame);
-        },
-        app,
-    )
+    Harness::builder()
+        .with_size((1280.0, 820.0))
+        .build_ui_state(
+            move |ui, app: &mut App| {
+                installed.call_once(|| reel_desktop::install(ui.ctx()));
+                // eframe hands the app a `Frame`; this is the supported way to
+                // fabricate one for tests.
+                let mut frame = eframe::Frame::_new_kittest();
+                eframe::App::ui(app, ui, &mut frame);
+            },
+            app,
+        )
 }
 
 fn harness() -> Harness<'static, App> {
@@ -97,30 +99,34 @@ fn clicking_a_card_opens_the_detail_page() {
 
     assert_eq!(
         harness.state().screen(),
-        &Screen::Detail(3),
+        &Screen::Work(3),
         "clicking a card should open that torrent's detail page"
     );
 }
 
 #[test]
-fn navigation_reaches_the_add_screen_and_submits() {
+fn the_add_modal_opens_and_an_empty_submit_warns() {
     let mut harness = harness();
     harness.run_steps(3);
 
     {
-        let tab = harness
+        let add = harness
             .get_all_by_label_contains("Add")
             .next()
-            .expect("the Add tab");
-        tab.click();
+            .expect("the rail's Add button");
+        add.click();
     }
     harness.run_steps(3);
-    assert_eq!(harness.state().screen(), &Screen::Add);
+    assert!(
+        harness.state().is_add_open(),
+        "the rail's Add opens the modal"
+    );
 
-    // An empty submit must warn rather than adding anything.
+    // An empty submit must warn and keep the modal up rather than adding
+    // anything.
     harness.get_by_label("Add torrent").click();
     harness.run_steps(3);
-    assert_eq!(harness.state().screen(), &Screen::Add);
+    assert!(harness.state().is_add_open());
     assert_eq!(harness.state().library_len(), 3);
 }
 
@@ -166,13 +172,13 @@ fn search_finds_results_and_can_add_one() {
 
     {
         let tab = harness
-            .get_all_by_label_contains("Search")
+            .get_all_by_label_contains("Discover")
             .next()
-            .expect("the Search tab");
+            .expect("the Discover rail item");
         tab.click();
     }
     harness.run_steps(3);
-    assert_eq!(harness.state().screen(), &Screen::Search);
+    assert_eq!(harness.state().screen(), &Screen::Discover);
     assert_eq!(harness.state().search_result_count(), 0);
 
     // An empty query must warn rather than searching for nothing.
@@ -198,7 +204,10 @@ fn search_finds_results_and_can_add_one() {
         "the demo backend knows one nosferatu"
     );
     assert!(
-        harness.query_all_by_label_contains("Nosferatu").next().is_some(),
+        harness
+            .query_all_by_label_contains("Nosferatu")
+            .next()
+            .is_some(),
         "the result title should be on screen"
     );
     assert!(
@@ -212,7 +221,7 @@ fn search_finds_results_and_can_add_one() {
 fn snapshot_search() {
     let mut harness = harness();
     harness.run_steps(3);
-    harness.state_mut().navigate(Screen::Search);
+    harness.state_mut().go_to(Screen::Discover);
     harness.state_mut().set_search_query("nosferatu");
     harness.state_mut().submit_search();
     harness.run_steps(4);
@@ -240,7 +249,10 @@ fn poster_files_decode_through_the_image_loader() {
     // Loading may take a poll or two even for a local file.
     let mut decoded = None;
     for _ in 0..100 {
-        match ctx.try_load_image(&uri, hint).expect("the poster should load") {
+        match ctx
+            .try_load_image(&uri, hint)
+            .expect("the poster should load")
+        {
             egui::load::ImagePoll::Ready { image } => {
                 decoded = Some(image.size);
                 break;
@@ -311,7 +323,7 @@ fn snapshot_season_pack() {
 
     // What pressing play on episode 2 does.
     harness.state_mut().select_files(9, &[1]);
-    harness.state_mut().navigate(Screen::Detail(9));
+    harness.state_mut().open_work(9);
     harness.run_steps(3);
 
     harness.snapshot("season-pack");
@@ -344,7 +356,7 @@ fn snapshot_season_pack_with_duplicates() {
             App::new(Box::new(FakeBackend::new(items))),
         );
     harness.run_steps(3);
-    harness.state_mut().navigate(Screen::Detail(11));
+    harness.state_mut().open_work(11);
     harness.run_steps(3);
     harness.snapshot("season-pack-duplicates");
 }
@@ -365,7 +377,7 @@ fn snapshot_two_season_pack() {
             },
             App::new(Box::new(FakeBackend::new(items))),
         );
-    harness.state_mut().navigate(Screen::Detail(10));
+    harness.state_mut().open_work(10);
     harness.run_steps(3);
     harness.snapshot("two-season-pack");
 }
