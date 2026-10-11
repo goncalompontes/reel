@@ -220,7 +220,11 @@ fn the_remove_dialog_closes_when_you_navigate_away() {
     let mut harness = with_paused_pack();
 
     {
-        harness.get_by_label("\u{1f5d1}  Remove").click();
+        harness
+            .get_all_by_label("Remove")
+            .next()
+            .expect("a Remove button")
+            .click();
     }
     harness.run_steps(3);
     assert!(
