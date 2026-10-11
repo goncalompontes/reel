@@ -19,6 +19,7 @@ use reel_core::fmt;
 use crate::backend::{
     Backend, BackendEvent, LibraryItem, MediaDownload, PlayerCapability, SearchActionPhase,
 };
+use crate::components::{empty_state, page_title, row, section_header, stat};
 use crate::player::{PlaybackInfo, PlaybackStats, PlayerController};
 use crate::theme;
 
@@ -1608,7 +1609,7 @@ impl App {
         let mut go_limits = false;
 
         ui.add_space(16.0);
-        ui.label(egui::RichText::new("Activity").size(22.0).strong());
+        page_title(ui, "Activity");
         ui.add_space(2.0);
         ui.label(
             egui::RichText::new("Transfers that are moving, and titles kept on disk.")
@@ -1648,28 +1649,18 @@ impl App {
         });
 
         if active.is_empty() && kept.is_empty() {
-            ui.add_space(30.0);
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    egui::RichText::new("Nothing is transferring")
-                        .size(18.0)
-                        .strong(),
-                );
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(
-                        "Playing a title streams it; downloading a copy keeps it on disk.",
-                    )
-                    .color(theme::TEXT_DIM),
-                );
-            });
+            empty_state(
+                ui,
+                "Nothing is transferring",
+                "Playing a title streams it; downloading a copy keeps it on disk.",
+            );
             return;
         }
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             if !active.is_empty() {
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new("Transferring").size(16.0).strong());
+                section_header(ui, "Transferring");
                 ui.add_space(4.0);
                 for item in &active {
                     let work_id = self
@@ -1748,7 +1739,7 @@ impl App {
 
             if !kept.is_empty() {
                 ui.add_space(10.0);
-                ui.label(egui::RichText::new("Kept on disk").size(16.0).strong());
+                section_header(ui, "Kept on disk");
                 ui.add_space(4.0);
                 for item in &kept {
                     let work_id = self
@@ -2233,15 +2224,14 @@ impl App {
                 .collect();
 
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(format!(
+                section_header(
+                    ui,
+                    format!(
                         "{} match{} for \"{}\"",
                         matches.len(),
                         if matches.len() == 1 { "" } else { "es" },
                         self.filter.trim()
-                    ))
-                    .size(16.0)
-                    .strong(),
+                    ),
                 );
                 ui.add_space(10.0);
                 if matches.is_empty() {
@@ -2266,7 +2256,7 @@ impl App {
                 }
 
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(&row.title).size(16.0).strong());
+                    section_header(ui, row.title.as_str());
                     ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new(plural(works.len(), "title"))
@@ -2699,11 +2689,7 @@ impl App {
         action: &mut Option<DetailAction>,
     ) {
         let versions = work.versions();
-        ui.label(
-            egui::RichText::new(format!("Releases ({})", versions.len()))
-                .size(16.0)
-                .strong(),
-        );
+        section_header(ui, format!("Releases ({})", versions.len()));
         ui.add_space(2.0);
         ui.label(
             egui::RichText::new(
@@ -2867,11 +2853,7 @@ impl App {
     ) {
         let episodes = work.episodes();
         let seasons = work.seasons();
-        ui.label(
-            egui::RichText::new(plural(episodes.len(), "episode"))
-                .size(16.0)
-                .strong(),
-        );
+        section_header(ui, plural(episodes.len(), "episode"));
 
         let duplicates = episodes
             .iter()
@@ -3141,11 +3123,7 @@ impl App {
         ui.add_space(16.0);
         ui.separator();
         ui.add_space(10.0);
-        ui.label(
-            egui::RichText::new(format!("Sources ({})", work.torrent_count()))
-                .size(16.0)
-                .strong(),
-        );
+        section_header(ui, format!("Sources ({})", work.torrent_count()));
         ui.add_space(4.0);
         for member in &work.members {
             let torrent_id = member.torrent_id();
@@ -3496,14 +3474,6 @@ fn download_buttons(
     }
 }
 
-fn stat(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.vertical(|ui| {
-        ui.label(egui::RichText::new(label).size(10.0).color(theme::TEXT_DIM));
-        ui.label(egui::RichText::new(value).size(13.0));
-    });
-    ui.add_space(8.0);
-}
-
 /// Poster, title, facts and overview: the identity block the library Work view
 /// and the search Result view share.
 fn work_identity(ui: &mut egui::Ui, work: &Work) {
@@ -3517,7 +3487,7 @@ fn work_identity(ui: &mut egui::Ui, work: &Work) {
         theme::CARD_RADIUS,
     );
     ui.add_space(10.0);
-    ui.label(egui::RichText::new(work.heading()).size(22.0).strong());
+    page_title(ui, work.heading());
 
     let mut facts = vec![if work.is_series() { "Series" } else { "Film" }.to_string()];
     if let Some(metadata) = work.metadata.as_ref() {
@@ -3561,7 +3531,7 @@ impl App {
         let sources = self.backend.search_sources();
 
         ui.add_space(16.0);
-        ui.label(egui::RichText::new("Search").size(22.0).strong());
+        page_title(ui, "Search");
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(
@@ -3930,10 +3900,10 @@ impl App {
     }
 
     fn search_result_missing(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(24.0);
-        ui.label(
-            egui::RichText::new("This title is no longer in the current results.")
-                .color(theme::TEXT_DIM),
+        empty_state(
+            ui,
+            "This title is no longer in the current results.",
+            "The results may have changed since it was opened.",
         );
         ui.add_space(8.0);
         if ui.button("Back to results").clicked() {
@@ -4639,7 +4609,7 @@ impl App {
         let saved = draft == self.backend.settings();
         ui.add_space(16.0);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Settings").size(22.0).strong());
+            page_title(ui, "Settings");
             ui.add_space(8.0);
             ui.label(
                 egui::RichText::new(if saved { "saved" } else { "saving\u{2026}" })
@@ -4736,7 +4706,7 @@ impl App {
         draft: &mut CatalogSettings,
         caps: &crate::backend::BackendCapabilities,
     ) {
-        ui.label(egui::RichText::new("General").size(16.0).strong());
+        section_header(ui, "General");
         ui.add_space(4.0);
         row(ui, "Active folder", &caps.download_dir);
         ui.horizontal(|ui| {
@@ -4789,11 +4759,7 @@ impl App {
         check_key: &mut Option<String>,
         remove_key: &mut bool,
     ) {
-        ui.label(
-            egui::RichText::new("Metadata and artwork")
-                .size(16.0)
-                .strong(),
-        );
+        section_header(ui, "Metadata and artwork");
         ui.add_space(4.0);
         row(ui, "Provider", &catalog.provider);
         let status = if catalog.configured {
@@ -4879,7 +4845,7 @@ impl App {
         draft: &mut CatalogSettings,
         caps: &crate::backend::BackendCapabilities,
     ) {
-        ui.label(egui::RichText::new("Playback").size(16.0).strong());
+        section_header(ui, "Playback");
         ui.add_space(4.0);
         ui.checkbox(
             &mut draft.subtitles_enabled,
@@ -4936,11 +4902,7 @@ impl App {
     }
 
     fn settings_downloads(&self, ui: &mut egui::Ui, draft: &mut CatalogSettings) {
-        ui.label(
-            egui::RichText::new("Streaming and downloads")
-                .size(16.0)
-                .strong(),
-        );
+        section_header(ui, "Streaming and downloads");
         ui.add_space(4.0);
         ui.checkbox(
             &mut draft.stream_only,
@@ -4996,7 +4958,7 @@ impl App {
     }
 
     fn settings_network(&self, ui: &mut egui::Ui, draft: &mut CatalogSettings) {
-        ui.label(egui::RichText::new("Torrent engine").size(16.0).strong());
+        section_header(ui, "Torrent engine");
         ui.add_space(4.0);
 
         let mut port = draft.listen_port.unwrap_or(0) as i32;
@@ -5067,7 +5029,7 @@ impl App {
     }
 
     fn settings_search(&self, ui: &mut egui::Ui, draft: &mut CatalogSettings) {
-        ui.label(egui::RichText::new("Search sources").size(16.0).strong());
+        section_header(ui, "Search sources");
         ui.add_space(4.0);
         ui.checkbox(
             &mut draft.ext_to_enabled,
@@ -5132,7 +5094,7 @@ impl App {
     }
 
     fn settings_about(&self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("About").size(16.0).strong());
+        section_header(ui, "About");
         ui.add_space(4.0);
         row(ui, "Version", env!("CARGO_PKG_VERSION"));
         ui.label(
@@ -5186,17 +5148,6 @@ impl SettingsSection {
 enum SettingsAction {
     RefreshMetadata,
     ClearCache,
-}
-
-fn row(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.horizontal(|ui| {
-        ui.add_sized(
-            Vec2::new(150.0, 18.0),
-            egui::Label::new(egui::RichText::new(label).color(theme::TEXT_DIM)),
-        );
-        ui.label(egui::RichText::new(value).monospace().size(12.0));
-    });
-    ui.add_space(2.0);
 }
 
 /// Edit an optional text setting under a small label. Committing blank clears

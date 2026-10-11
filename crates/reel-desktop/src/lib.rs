@@ -6,6 +6,7 @@
 //! torrent engine plus its HTTP streaming API run in-process.
 
 pub mod backend;
+pub mod components;
 pub mod player;
 pub mod testing;
 pub mod theme;
