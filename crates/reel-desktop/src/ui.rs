@@ -215,6 +215,10 @@ pub struct App {
     search_actions: HashMap<String, SearchActionPhase>,
     /// Derived search-page data, rebuilt only when its inputs change.
     search_view: Option<SearchView>,
+    /// The search hit anchoring an open Result view. A work's key can change as
+    /// metadata lands (a name group becoming a metadata group), so the Result
+    /// view is found by a member hit that cannot.
+    result_anchor: Option<String>,
     /// Bumped whenever the hit list changes, so the view knows to rebuild.
     search_revision: u64,
     /// Bumped whenever metadata for a hit arrives, for the same reason.
@@ -313,6 +317,7 @@ impl App {
             search_series_views: HashMap::new(),
             search_actions: HashMap::new(),
             search_view: None,
+            result_anchor: None,
             search_revision: 0,
             search_metadata_revision: 0,
             search_work_heights: Vec::new(),
@@ -1461,7 +1466,14 @@ impl App {
             Screen::Result(key) => self
                 .search_view
                 .as_ref()
-                .and_then(|view| view.works.iter().find(|work| &work.key == key))
+                .and_then(|view| {
+                    view.works.iter().find(|work| &work.key == key).or_else(|| {
+                        let anchor = self.result_anchor.as_deref()?;
+                        view.works
+                            .iter()
+                            .find(|work| work_contains_hit(work, &view.shown, anchor))
+                    })
+                })
                 .map(|work| work.heading())
                 .unwrap_or_else(|| "Result".to_string()),
             other => other.root_label().to_string(),
@@ -3481,6 +3493,15 @@ fn download_buttons(
     }
 }
 
+/// Whether any of a work's members is the hit with the given key.
+fn work_contains_hit(work: &Work, shown: &[SearchHit], anchor: &str) -> bool {
+    work.members.iter().any(|member| {
+        shown
+            .get(member.torrent_id())
+            .is_some_and(|hit| hit.key() == anchor)
+    })
+}
+
 /// Poster, title, facts and overview: the identity block the library Work view
 /// and the search Result view share.
 fn work_identity(ui: &mut egui::Ui, work: &Work) {
@@ -3709,9 +3730,20 @@ impl App {
             self.search_work_row(ui, &view.works[index], &mut open);
         });
         self.search_work_heights = heights;
+        // Anchor the Result view on a member hit, which survives the work's
+        // identity changing as metadata lands.
+        let anchor = open.as_deref().and_then(|key| {
+            view.works
+                .iter()
+                .find(|work| work.key == key)
+                .and_then(|work| work.members.first())
+                .and_then(|member| view.shown.get(member.torrent_id()))
+                .map(SearchHit::key)
+        });
         self.search_view = Some(view);
 
         if let Some(key) = open {
+            self.result_anchor = anchor;
             self.nav.open(Screen::Result(key));
         }
     }
@@ -3827,15 +3859,36 @@ impl App {
     /// A search title opened from Discover: its releases, and the actions that
     /// used to live on the expanding card.
     fn search_result_screen(&mut self, ui: &mut egui::Ui, key: &str) {
+        // Discover is not drawn while this view is open, so nothing else would
+        // refresh the derived view as more hits and metadata arrive. Rebuild it
+        // here on the same signature rule.
+        let signature = self.search_signature();
+        let stale = self
+            .search_view
+            .as_ref()
+            .is_none_or(|view| view.signature != signature);
+        if stale {
+            let rebuilt = self.build_search_view(signature);
+            self.search_view = Some(rebuilt);
+        }
+
         // Take the derived view out so the renderers can borrow `self`.
         let Some(view) = self.search_view.take() else {
             self.search_result_missing(ui);
             return;
         };
+        // Find by key, or by the anchoring hit when the work's identity has
+        // changed under it as metadata arrived.
         let work = view
             .works
             .iter()
             .find(|work| work.key.as_str() == key)
+            .or_else(|| {
+                let anchor = self.result_anchor.as_deref()?;
+                view.works
+                    .iter()
+                    .find(|work| work_contains_hit(work, &view.shown, anchor))
+            })
             .cloned();
         let Some(work) = work else {
             self.search_view = Some(view);
@@ -5635,6 +5688,42 @@ mod tests {
         assert_eq!(app.nav_trail(), &[Screen::Discover, Screen::Result(key)]);
         assert!(app.back());
         assert_eq!(app.screen(), &Screen::Discover);
+    }
+
+    #[test]
+    fn an_open_result_picks_up_late_hits() {
+        let mut app = app();
+        app.search_for = Some("the bear".into());
+        let mut first = SearchHit::new("The Bear S02E01 1080p", "ext.to");
+        first.seeders = Some(40);
+        app.search_hits = vec![first];
+
+        let signature = app.search_signature();
+        let view = app.build_search_view(signature);
+        let key = view.works[0].key.clone();
+        let anchor = view.shown[view.works[0].members[0].torrent_id()].key();
+        app.search_view = Some(view);
+        app.result_anchor = Some(anchor.clone());
+
+        // A later page adds another release of the same title while the Result
+        // view is open (Discover is not drawn, so nothing else refreshes it).
+        let mut second = SearchHit::new("The Bear S02E02 1080p", "ext.to");
+        second.seeders = Some(30);
+        app.search_hits.push(second);
+        app.bump_search_revision();
+
+        let signature = app.search_signature();
+        let view = app.build_search_view(signature);
+        assert_eq!(view.works.len(), 1, "both releases group into one title");
+        assert_eq!(view.works[0].members.len(), 2, "the late hit joined it");
+        assert!(
+            view.works.iter().any(|work| work.key == key)
+                || view
+                    .works
+                    .iter()
+                    .any(|work| work_contains_hit(work, &view.shown, &anchor)),
+            "the open result is still found after the rebuild"
+        );
     }
 
     #[test]
