@@ -130,6 +130,16 @@ fn the_add_modal_opens_and_an_empty_submit_warns() {
     assert_eq!(harness.state().library_len(), 3);
 }
 
+/// Renders the Activity view so the transfers layout can be reviewed by eye.
+#[test]
+fn snapshot_activity() {
+    let mut harness = harness();
+    harness.run_steps(3);
+    harness.state_mut().go_to(Screen::Activity);
+    harness.run_steps(3);
+    harness.snapshot("activity");
+}
+
 /// Renders the two-pane Settings page so the layout can be reviewed by eye.
 #[test]
 fn snapshot_settings() {

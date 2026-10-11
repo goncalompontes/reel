@@ -1579,26 +1579,75 @@ impl App {
 
     /// Transfers that are moving or kept, so the rail's Activity item has a home.
     fn activity_screen(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(16.0);
-        ui.label(egui::RichText::new("Activity").size(22.0).strong());
-        ui.add_space(2.0);
-        ui.label(
-            egui::RichText::new("Transfers that are running, buffering or kept on disk.")
-                .color(theme::TEXT_DIM)
-                .size(11.5),
-        );
-        ui.add_space(12.0);
-
+        // "Moving" is what the repaint loop already treats as active; "kept" is
+        // a download that finished. A stream-only title nobody is watching is
+        // neither, and does not belong here.
         let active: Vec<LibraryItem> = self
             .library
             .iter()
             .filter(|item| {
-                item.downloading || item.torrent.stats.download_bps > 0 || !item.torrent.finished
+                item.torrent.stats.download_bps > 0 || (item.downloading && !item.torrent.finished)
             })
             .cloned()
             .collect();
+        let kept: Vec<LibraryItem> = self
+            .library
+            .iter()
+            .filter(|item| item.downloading && item.torrent.finished)
+            .cloned()
+            .collect();
+        let down: u64 = self
+            .library
+            .iter()
+            .map(|item| item.torrent.stats.download_bps)
+            .sum();
 
-        if active.is_empty() {
+        let mut open: Option<usize> = None;
+        let mut pause: Option<(usize, bool)> = None;
+        let mut pause_all: Option<bool> = None;
+        let mut go_limits = false;
+
+        ui.add_space(16.0);
+        ui.label(egui::RichText::new("Activity").size(22.0).strong());
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new("Transfers that are moving, and titles kept on disk.")
+                .color(theme::TEXT_DIM)
+                .size(11.5),
+        );
+        ui.add_space(10.0);
+
+        // Summary on the left, global controls on the right.
+        ui.horizontal(|ui| {
+            let mut facts = Vec::new();
+            if down > 0 {
+                facts.push(format!("{} \u{2b07}", fmt::human_rate(down)));
+            }
+            facts.push(plural(active.len(), "transfer"));
+            facts.push(format!("{} kept", kept.len()));
+            ui.label(
+                egui::RichText::new(facts.join("   \u{2022}   "))
+                    .size(12.0)
+                    .color(theme::TEXT_DIM),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("Limits")
+                    .on_hover_text("Bandwidth limits live in Settings \u{2192} Network")
+                    .clicked()
+                {
+                    go_limits = true;
+                }
+                if ui.small_button("Pause all").clicked() {
+                    pause_all = Some(true);
+                }
+                if ui.small_button("Resume all").clicked() {
+                    pause_all = Some(false);
+                }
+            });
+        });
+
+        if active.is_empty() && kept.is_empty() {
             ui.add_space(30.0);
             ui.vertical_centered(|ui| {
                 ui.label(
@@ -1617,21 +1666,100 @@ impl App {
             return;
         }
 
-        let mut open: Option<usize> = None;
-        let mut pause: Option<(usize, bool)> = None;
-
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for item in &active {
-                let work_id = self
-                    .work_id_for_torrent(item.torrent.id)
-                    .unwrap_or(item.torrent.id);
-                egui::Frame::NONE
-                    .fill(theme::SURFACE)
-                    .inner_margin(egui::Margin::symmetric(12, 10))
-                    .corner_radius(theme::CARD_RADIUS)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
+            if !active.is_empty() {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Transferring").size(16.0).strong());
+                ui.add_space(4.0);
+                for item in &active {
+                    let work_id = self
+                        .work_id_for_torrent(item.torrent.id)
+                        .unwrap_or(item.torrent.id);
+                    let paused = item.torrent.stats.is_paused();
+                    egui::Frame::NONE
+                        .fill(theme::SURFACE)
+                        .inner_margin(egui::Margin::symmetric(12, 10))
+                        .corner_radius(theme::CARD_RADIUS)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(reel_core::title::truncate(
+                                            &item.heading(),
+                                            60,
+                                        ))
+                                        .size(13.5)
+                                        .strong(),
+                                    );
+                                    let mut facts = vec![item.torrent.stats.state.clone()];
+                                    if item.downloading {
+                                        facts.push("keeping".to_string());
+                                    }
+                                    if item.torrent.stats.download_bps > 0 {
+                                        facts
+                                            .push(fmt::human_rate(item.torrent.stats.download_bps));
+                                    }
+                                    facts.push(format!("{} peers", item.torrent.stats.peers.live));
+                                    if let Some(eta) = item.torrent.stats.eta_seconds {
+                                        facts.push(fmt::human_eta(Some(eta)));
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(facts.join("   \u{2022}   "))
+                                            .size(11.0)
+                                            .color(theme::TEXT_DIM),
+                                    );
+                                    ui.add(
+                                        egui::ProgressBar::new(
+                                            (item.torrent.stats.percent as f32 / 100.0)
+                                                .clamp(0.0, 1.0),
+                                        )
+                                        .desired_width(280.0)
+                                        .fill(if paused { theme::WARN } else { theme::ACCENT })
+                                        .text(format!("{:.0}%", item.torrent.stats.percent)),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button("Open").clicked() {
+                                            open = Some(work_id);
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                !item.torrent.finished,
+                                                egui::Button::new(if paused {
+                                                    "Resume"
+                                                } else {
+                                                    "Pause"
+                                                })
+                                                .small(),
+                                            )
+                                            .clicked()
+                                        {
+                                            pause = Some((item.torrent.id, !paused));
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                    ui.add_space(6.0);
+                }
+            }
+
+            if !kept.is_empty() {
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("Kept on disk").size(16.0).strong());
+                ui.add_space(4.0);
+                for item in &kept {
+                    let work_id = self
+                        .work_id_for_torrent(item.torrent.id)
+                        .unwrap_or(item.torrent.id);
+                    egui::Frame::NONE
+                        .fill(theme::SURFACE)
+                        .inner_margin(egui::Margin::symmetric(12, 10))
+                        .corner_radius(theme::CARD_RADIUS)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
                                 ui.label(
                                     egui::RichText::new(reel_core::title::truncate(
                                         &item.heading(),
@@ -1640,53 +1768,41 @@ impl App {
                                     .size(13.5)
                                     .strong(),
                                 );
-                                let mut facts = vec![item.torrent.stats.state.clone()];
-                                if item.downloading {
-                                    facts.push("kept".to_string());
-                                }
-                                facts.push(format!("{:.0}%", item.torrent.stats.percent));
-                                if item.torrent.stats.download_bps > 0 {
-                                    facts.push(fmt::human_rate(item.torrent.stats.download_bps));
-                                }
-                                facts.push(format!("{} peers", item.torrent.stats.peers.live));
-                                if let Some(eta) = item.torrent.stats.eta_seconds {
-                                    facts.push(fmt::human_eta(Some(eta)));
-                                }
-                                ui.label(
-                                    egui::RichText::new(facts.join("   \u{2022}   "))
-                                        .size(11.0)
-                                        .color(theme::TEXT_DIM),
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button("Open").clicked() {
+                                            open = Some(work_id);
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "on disk   \u{2022}   {}",
+                                                fmt::human_bytes(item.torrent.stats.total_bytes)
+                                            ))
+                                            .size(11.0)
+                                            .color(theme::OK),
+                                        );
+                                    },
                                 );
                             });
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.small_button("Open").clicked() {
-                                        open = Some(work_id);
-                                    }
-                                    let paused = item.torrent.stats.is_paused();
-                                    if ui
-                                        .add_enabled(
-                                            !item.torrent.finished,
-                                            egui::Button::new(if paused {
-                                                "Resume"
-                                            } else {
-                                                "Pause"
-                                            })
-                                            .small(),
-                                        )
-                                        .clicked()
-                                    {
-                                        pause = Some((item.torrent.id, !paused));
-                                    }
-                                },
-                            );
                         });
-                    });
-                ui.add_space(6.0);
+                    ui.add_space(6.0);
+                }
             }
         });
 
+        if go_limits {
+            self.settings_section = SettingsSection::Network;
+            self.go_to(Screen::Settings);
+        }
+        if let Some(paused) = pause_all {
+            for item in &active {
+                if item.torrent.stats.is_paused() != paused {
+                    self.backend.set_paused(item.torrent.id, paused);
+                }
+            }
+            self.invalidate();
+        }
         if let Some(id) = open {
             self.open_work(id);
         }
