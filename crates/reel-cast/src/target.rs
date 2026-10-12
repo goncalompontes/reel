@@ -390,37 +390,127 @@ impl DlnaTarget {
     /// POST a SOAP action and return the response body, turning UPnP faults
     /// into errors.
     async fn call(&self, url: &Url, request: &soap::SoapRequest) -> Result<String> {
-        let response = self
-            .client
-            .post(url.clone())
-            .header(reqwest::header::CONTENT_TYPE, "text/xml; charset=\"utf-8\"")
-            .header("SOAPACTION", request.soap_action())
-            .body(request.envelope())
-            .send()
-            .await?;
-        let status = response.status();
-        let body = response.text().await?;
-
-        // A fault is returned as HTTP 500 with a SOAP Fault body.
-        if let Some(fault) = soap::parse_fault(&body) {
-            return Err(CastError::Fault {
-                code: fault.code,
-                description: fault.description,
-            });
-        }
-        if !status.is_success() {
-            return Err(CastError::HttpStatus {
-                status: status.as_u16(),
-                body,
-            });
-        }
-        Ok(body)
+        post_soap(&self.client, url, request).await
     }
 
     /// Send an action to the `AVTransport` service.
     async fn av(&self, request: &soap::SoapRequest) -> Result<String> {
         self.call(&self.control_url, request).await
     }
+}
+
+/// POST a SOAP action and return the response body, turning UPnP faults into
+/// errors.
+async fn post_soap(
+    client: &reqwest::Client,
+    url: &Url,
+    request: &soap::SoapRequest,
+) -> Result<String> {
+    let response = client
+        .post(url.clone())
+        .header(reqwest::header::CONTENT_TYPE, "text/xml; charset=\"utf-8\"")
+        .header("SOAPACTION", request.soap_action())
+        .body(request.envelope())
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    // A fault is returned as HTTP 500 with a SOAP Fault body.
+    if let Some(fault) = soap::parse_fault(&body) {
+        return Err(CastError::Fault {
+            code: fault.code,
+            description: fault.description,
+        });
+    }
+    if !status.is_success() {
+        return Err(CastError::HttpStatus {
+            status: status.as_u16(),
+            body,
+        });
+    }
+    Ok(body)
+}
+
+/// What a renderer says it can play, from `ConnectionManager.GetProtocolInfo`.
+///
+/// `SinkProtocolInfo` is a comma-separated list of the `protocolInfo` strings a
+/// renderer accepts (for example `http-get:*:video/mp4:*` or
+/// `http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_MP_HD_1080i_AAC`), which is how a
+/// controller decides whether to pass a file through or convert it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SinkCapabilities {
+    /// The raw `SinkProtocolInfo` entries.
+    pub entries: Vec<String>,
+}
+
+impl SinkCapabilities {
+    /// Parse the `Sink` field of a `GetProtocolInfo` response.
+    pub fn parse(sink: &str) -> SinkCapabilities {
+        SinkCapabilities {
+            entries: sink
+                .split(',')
+                .map(|entry| entry.trim().to_string())
+                .filter(|entry| !entry.is_empty())
+                .collect(),
+        }
+    }
+
+    /// Whether any entry contains `needle` (case-insensitive).
+    fn mentions(&self, needle: &str) -> bool {
+        let needle = needle.to_ascii_lowercase();
+        self.entries
+            .iter()
+            .any(|entry| entry.to_ascii_lowercase().contains(&needle))
+    }
+
+    /// Whether the renderer advertises H.265/HEVC support.
+    pub fn supports_hevc(&self) -> bool {
+        self.mentions("hevc") || self.mentions("h265") || self.mentions("h.265")
+    }
+
+    /// Whether the renderer advertises AC-3 support.
+    pub fn supports_ac3(&self) -> bool {
+        self.mentions("ac3") || self.mentions("ac-3")
+    }
+
+    /// Whether the renderer advertises E-AC-3 (Dolby Digital Plus) support.
+    pub fn supports_eac3(&self) -> bool {
+        self.mentions("eac3") || self.mentions("ec-3") || self.mentions("e-ac3")
+    }
+
+    /// Whether the renderer accepts a MIME type.
+    pub fn accepts_mime(&self, mime: &str) -> bool {
+        self.entries.iter().any(|entry| {
+            let fields: Vec<&str> = entry.splitn(4, ':').collect();
+            fields.len() >= 3 && (fields[2] == mime || fields[2] == "*")
+        })
+    }
+}
+
+/// Ask the renderer what it can play (`ConnectionManager.GetProtocolInfo`).
+///
+/// Returns `Err` when the device does not expose a ConnectionManager service or
+/// does not answer, in which case the caller should fall back to a conservative
+/// assumption.
+pub async fn sink_capabilities(device: &CastDevice) -> Result<SinkCapabilities> {
+    let service = device
+        .description
+        .service(device::CONNECTION_MANAGER)
+        .ok_or_else(|| CastError::Missing("ConnectionManager service".into()))?;
+    let request = soap::SoapRequest {
+        service_type: device::CONNECTION_MANAGER,
+        action: "GetProtocolInfo",
+        arguments: Vec::new(),
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let body = post_soap(&client, &service.control_url, &request).await?;
+    let root = crate::xml::parse(&body)?;
+    Ok(SinkCapabilities::parse(
+        root.find_text("Sink").unwrap_or_default(),
+    ))
 }
 
 #[async_trait]
@@ -472,5 +562,35 @@ impl CastTarget for DlnaTarget {
             .ok_or_else(|| CastError::Missing("RenderingControl service".into()))?;
         self.call(url, &soap::set_volume(volume)).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    const SINK: &str = "http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_BL_CIF15_AAC_520,\
+        http-get:*:video/x-matroska:*,http-get:*:audio/mp4:DLNA.ORG_PN=AAC_ISO_320,\
+        http-get:*:audio/x-flac:*";
+
+    #[test]
+    fn parses_and_reports_capabilities() {
+        let caps = SinkCapabilities::parse(SINK);
+        assert_eq!(caps.entries.len(), 4);
+        assert!(caps.accepts_mime("video/mp4"));
+        assert!(caps.accepts_mime("video/x-matroska"));
+        assert!(!caps.accepts_mime("video/x-msvideo"));
+        assert!(!caps.supports_hevc());
+        assert!(!caps.supports_eac3());
+    }
+
+    #[test]
+    fn recognises_hevc_and_eac3_when_advertised() {
+        let caps = SinkCapabilities::parse(
+            "http-get:*:video/mp4:DLNA.ORG_PN=HEVC_MP4_MP_HD_1080i_MAIN,\
+             http-get:*:audio/vnd.dlna.adts:DLNA.ORG_PN=EAC3",
+        );
+        assert!(caps.supports_hevc());
+        assert!(caps.supports_eac3());
     }
 }

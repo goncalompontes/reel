@@ -62,6 +62,18 @@ impl MediaPlan {
     }
 }
 
+/// What a specific renderer accepts, from its `ConnectionManager`
+/// `SinkProtocolInfo` (or a conservative guess when that cannot be read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SinkSupport {
+    /// H.265/HEVC video.
+    pub hevc: bool,
+    /// AC-3 audio.
+    pub ac3: bool,
+    /// E-AC-3 (Dolby Digital Plus) audio.
+    pub eac3: bool,
+}
+
 /// Knobs for [`plan`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlanOptions {
@@ -69,10 +81,8 @@ pub struct PlanOptions {
     pub mode: TranscodeMode,
     /// Quality cap applied when re-encoding.
     pub max_height: u32,
-    /// Trust the renderer with H.265/HEVC (any bit depth) and AC3/EAC3 audio,
-    /// remuxing instead of re-encoding. Modern TVs handle these; older ones do
-    /// not, so it is off by default.
-    pub allow_hevc: bool,
+    /// What the target renderer accepts.
+    pub sink: SinkSupport,
 }
 
 impl Default for PlanOptions {
@@ -80,22 +90,27 @@ impl Default for PlanOptions {
         PlanOptions {
             mode: TranscodeMode::Auto,
             max_height: 1080,
-            allow_hevc: false,
+            sink: SinkSupport::default(),
         }
     }
 }
 
 /// Audio codecs a TV will almost certainly decode inside an MP4.
-fn audio_is_copyable(codec: &str, allow_hevc: bool) -> bool {
-    matches!(codec, "aac" | "mp3") || (allow_hevc && matches!(codec, "ac3" | "eac3"))
+fn audio_is_copyable(codec: &str, sink: SinkSupport) -> bool {
+    match codec {
+        "aac" | "mp3" => true,
+        "ac3" => sink.ac3,
+        "eac3" => sink.eac3,
+        _ => false,
+    }
 }
 
 /// Whether the video can be copied into MP4 unchanged.
-fn video_is_copyable(probe: &Probe, allow_hevc: bool) -> bool {
+fn video_is_copyable(probe: &Probe, sink: SinkSupport) -> bool {
     if probe.is_h264_8bit() {
         return true;
     }
-    allow_hevc
+    sink.hevc
         && probe
             .video
             .as_ref()
@@ -105,11 +120,11 @@ fn video_is_copyable(probe: &Probe, allow_hevc: bool) -> bool {
 /// Choose how to deliver `probe` to a renderer.
 pub fn plan(probe: &Probe, options: &PlanOptions) -> MediaPlan {
     // No video stream (audio-only) counts as compatible.
-    let video_ok = probe.video.is_none() || video_is_copyable(probe, options.allow_hevc);
+    let video_ok = probe.video.is_none() || video_is_copyable(probe, options.sink);
     let audio_ok = probe
         .audio
         .as_ref()
-        .is_none_or(|audio| audio_is_copyable(&audio.codec, options.allow_hevc));
+        .is_none_or(|audio| audio_is_copyable(&audio.codec, options.sink));
 
     if probe.is_mp4() && video_ok && audio_ok {
         return MediaPlan::Original;
@@ -117,7 +132,7 @@ pub fn plan(probe: &Probe, options: &PlanOptions) -> MediaPlan {
 
     if options.mode == TranscodeMode::Off {
         return MediaPlan::Unavailable {
-            reason: unsupported(probe, options.allow_hevc),
+            reason: unsupported(probe, options.sink),
         };
     }
 
@@ -128,7 +143,7 @@ pub fn plan(probe: &Probe, options: &PlanOptions) -> MediaPlan {
 
     if options.mode == TranscodeMode::RemuxOnly {
         return MediaPlan::Unavailable {
-            reason: unsupported(probe, options.allow_hevc),
+            reason: unsupported(probe, options.sink),
         };
     }
 
@@ -138,7 +153,7 @@ pub fn plan(probe: &Probe, options: &PlanOptions) -> MediaPlan {
 }
 
 /// Describe the parts that make a file not directly playable.
-fn unsupported(probe: &Probe, allow_hevc: bool) -> String {
+fn unsupported(probe: &Probe, sink: SinkSupport) -> String {
     let mut features = Vec::new();
     if !probe.is_mp4() {
         features.push(format!(
@@ -147,7 +162,7 @@ fn unsupported(probe: &Probe, allow_hevc: bool) -> String {
         ));
     }
     if let Some(video) = &probe.video {
-        if !video_is_copyable(probe, allow_hevc) {
+        if !video_is_copyable(probe, sink) {
             features.push(match video.bit_depth {
                 Some(depth) if depth > 8 => format!("{}-bit {} video", depth, video.codec),
                 _ => format!("{} video", video.codec),
@@ -155,7 +170,7 @@ fn unsupported(probe: &Probe, allow_hevc: bool) -> String {
         }
     }
     if let Some(audio) = &probe.audio {
-        if !audio_is_copyable(&audio.codec, allow_hevc) {
+        if !audio_is_copyable(&audio.codec, sink) {
             features.push(format!("{} audio", audio.codec));
         }
     }
@@ -321,9 +336,13 @@ mod tests {
         // The conservative default re-encodes it.
         assert!(matches!(plan(&file, &auto()), MediaPlan::Transcode { .. }));
 
-        // Trusting the TV with HEVC and E-AC3 makes it a container remux.
+        // A renderer that accepts HEVC and E-AC3 makes it a container remux.
         let options = PlanOptions {
-            allow_hevc: true,
+            sink: SinkSupport {
+                hevc: true,
+                eac3: true,
+                ..Default::default()
+            },
             ..auto()
         };
         assert_eq!(plan(&file, &options), MediaPlan::Remux);

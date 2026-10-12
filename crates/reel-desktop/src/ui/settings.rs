@@ -531,12 +531,13 @@ impl App {
         ui.add_space(6.0);
         ui.checkbox(
             &mut draft.allow_hevc_passthrough,
-            "Trust the TV with H.265 (HEVC) and AC3/EAC3",
+            "Force H.265 (HEVC) and AC3/EAC3 passthrough",
         )
         .on_hover_text(
-            "Remux 4K HDR/HEVC and surround audio instead of re-encoding, so it \
-             starts immediately. Enable if your TV supports them (most modern 4K \
-             TVs do); otherwise leave it off.",
+            "reel asks the TV what it accepts (ConnectionManager) and converts only \
+             what it must. Tick this to ignore that answer and always remux HEVC and \
+             AC3/EAC3 — useful for a TV that under-reports, or one with no \
+             ConnectionManager. Leave it off if a cast fails to play.",
         );
 
         optional_text(

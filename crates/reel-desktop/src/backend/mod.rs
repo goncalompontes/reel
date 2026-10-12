@@ -265,6 +265,8 @@ pub(crate) struct CastConfig {
     ffmpeg: Option<String>,
     mode: ConversionMode,
     max_height: u32,
+    /// Forced passthrough; a change applies in place, like the mode and cap.
+    passthrough: bool,
 }
 
 impl CastConfig {
@@ -275,6 +277,7 @@ impl CastConfig {
             ffmpeg: settings.ffmpeg_path.clone(),
             mode: settings.conversion_mode,
             max_height: settings.conversion_max_height,
+            passthrough: settings.allow_hevc_passthrough,
         }
     }
 

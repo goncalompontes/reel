@@ -24,7 +24,7 @@ async fn main() {
             println!("Probing {address} for DLNA renderers...");
             match reel_cast::probe_address(&address).await {
                 Ok(devices) if devices.is_empty() => println!("  no MediaRenderer found"),
-                Ok(devices) => report(&devices),
+                Ok(devices) => report(&devices).await,
                 Err(error) => eprintln!("  probe failed: {error}"),
             }
         }
@@ -34,14 +34,14 @@ async fn main() {
                 Ok(devices) if devices.is_empty() => {
                     println!("  nothing found; try `find_tv <ip>` for a host scan")
                 }
-                Ok(devices) => report(&devices),
+                Ok(devices) => report(&devices).await,
                 Err(error) => eprintln!("  discovery failed: {error}"),
             }
         }
     }
 }
 
-fn report(devices: &[reel_cast::CastDevice]) {
+async fn report(devices: &[reel_cast::CastDevice]) {
     for device in devices {
         println!(
             "  {}  [{}]  {}",
@@ -49,5 +49,17 @@ fn report(devices: &[reel_cast::CastDevice]) {
             device.model().unwrap_or("unknown model"),
             device.location
         );
+        match reel_cast::sink_capabilities(device).await {
+            Ok(caps) => println!(
+                "      capabilities: {} entries  hevc={} ac3={} eac3={} mp4={} mkv={}",
+                caps.entries.len(),
+                caps.supports_hevc(),
+                caps.supports_ac3(),
+                caps.supports_eac3(),
+                caps.accepts_mime("video/mp4"),
+                caps.accepts_mime("video/x-matroska"),
+            ),
+            Err(error) => println!("      capabilities: unavailable ({error})"),
+        }
     }
 }

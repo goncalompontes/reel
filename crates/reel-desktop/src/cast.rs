@@ -21,7 +21,9 @@ use reel_cast::{CastDevice, DlnaTarget, didl, discover_all, probe_address};
 use reel_catalog::{CatalogSettings, ConversionMode};
 use reel_core::Engine;
 use reel_http::{MediaState, build_media_router};
-use reel_media::{CacheKey, ConversionCache, MediaPlan, PlanOptions, Tools, TranscodeMode, plan};
+use reel_media::{
+    CacheKey, ConversionCache, MediaPlan, PlanOptions, SinkSupport, Tools, TranscodeMode, plan,
+};
 
 /// How long an SSDP search waits for replies.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
@@ -115,6 +117,8 @@ pub struct CastService {
     cache: ConversionCache,
     /// Conversion policy, swappable while running.
     options: Mutex<PlanOptions>,
+    /// Force H.265/AC3 passthrough, ignoring the renderer's advertised support.
+    passthrough: Mutex<bool>,
     loopback_base: String,
     runtime: tokio::runtime::Handle,
     inner: Arc<Mutex<Inner>>,
@@ -178,10 +182,7 @@ impl CastService {
                 let info_hash = engine.view(id).ok()?.info_hash;
                 let key = CacheKey::for_plan(info_hash, file_id as u64, length, &MediaPlan::Remux);
                 let source = format!("{loopback}/stream/{id}/{file_id}");
-                let tag = remux_tag
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
+                let tag = remux_tag.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let mut command = tokio::process::Command::new(&ffmpeg);
                 command.args(reel_media::convert::remux_stream_args(
                     &source,
@@ -218,6 +219,7 @@ impl CastService {
             tools,
             cache,
             options: Mutex::new(plan_options(settings)),
+            passthrough: Mutex::new(settings.allow_hevc_passthrough),
             loopback_base,
             runtime,
             inner: Arc::new(Mutex::new(Inner::default())),
@@ -230,6 +232,11 @@ impl CastService {
     /// Replace the conversion policy used for the next cast.
     pub fn set_options(&self, options: PlanOptions) {
         *self.options.lock().unwrap_or_else(|e| e.into_inner()) = options;
+    }
+
+    /// Force H.265/AC-3 passthrough, ignoring the renderer's advertised support.
+    pub fn set_passthrough(&self, on: bool) {
+        *self.passthrough.lock().unwrap_or_else(|e| e.into_inner()) = on;
     }
 
     /// Stop the LAN media server and end any cast in progress.
@@ -395,6 +402,7 @@ impl CastService {
         let session_slot = self.session.clone();
         let inner = self.inner.clone();
         let remux_tag = self.remux_tag.clone();
+        let force_passthrough = *self.passthrough.lock().unwrap_or_else(|e| e.into_inner());
 
         self.runtime.spawn(async move {
             let result = prepare_and_start(
@@ -410,6 +418,7 @@ impl CastService {
                 file_id,
                 &title,
                 &remux_tag,
+                force_passthrough,
             )
             .await;
 
@@ -543,9 +552,44 @@ async fn prepare_and_start(
     file_id: usize,
     title: &str,
     remux_tag: &Arc<Mutex<Option<String>>>,
+    force_passthrough: bool,
 ) -> anyhow::Result<CastSession> {
     let source_url = format!("{loopback_base}/stream/{id}/{file_id}");
     let probe = tools.probe(&source_url).await?;
+
+    // Decide what the renderer accepts. A forced passthrough overrides its own
+    // answer (some televisions under-report); otherwise use the reported
+    // capabilities, and stay conservative when it does not answer.
+    let mut options = options;
+    if force_passthrough {
+        options.sink = SinkSupport {
+            hevc: true,
+            ac3: true,
+            eac3: true,
+        };
+        tracing::debug!("passthrough forced; ignoring the renderer's capabilities");
+    } else {
+        match reel_cast::sink_capabilities(device).await {
+            Ok(capabilities) => {
+                options.sink = SinkSupport {
+                    hevc: capabilities.supports_hevc(),
+                    ac3: capabilities.supports_ac3(),
+                    eac3: capabilities.supports_eac3(),
+                };
+                tracing::info!(
+                    entries = capabilities.entries.len(),
+                    hevc = options.sink.hevc,
+                    ac3 = options.sink.ac3,
+                    eac3 = options.sink.eac3,
+                    "renderer capabilities"
+                );
+            }
+            Err(error) => {
+                tracing::debug!(%error, "could not read the renderer's capabilities")
+            }
+        }
+    }
+
     let plan = plan(&probe, &options);
 
     // HEVC in MP4 must carry the `hvc1` sample-entry tag, or televisions report
@@ -615,11 +659,14 @@ pub fn transcode_mode(mode: ConversionMode) -> TranscodeMode {
 }
 
 /// Build the planner options from settings.
+///
+/// The renderer's own capabilities (or the forced passthrough) are applied at
+/// cast time, so `sink` starts conservative here.
 pub fn plan_options(settings: &CatalogSettings) -> PlanOptions {
     PlanOptions {
         mode: transcode_mode(settings.conversion_mode),
         max_height: settings.conversion_max_height,
-        allow_hevc: settings.allow_hevc_passthrough,
+        sink: SinkSupport::default(),
     }
 }
 
@@ -702,7 +749,8 @@ mod tests {
         let options = plan_options(&settings);
         assert_eq!(options.mode, TranscodeMode::RemuxOnly);
         assert_eq!(options.max_height, 720);
-        assert!(options.allow_hevc);
+        // Capabilities are applied per cast, not baked in here.
+        assert_eq!(options.sink, SinkSupport::default());
     }
 
     #[test]

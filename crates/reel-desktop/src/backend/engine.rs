@@ -365,6 +365,7 @@ impl EngineBackend {
         if previous.as_ref().is_none_or(|old| !old.needs_rebind(&want)) {
             if let Some(cast) = self.cast() {
                 cast.set_options(crate::cast::plan_options(settings));
+                cast.set_passthrough(settings.allow_hevc_passthrough);
             }
             *self.cast_config.lock().unwrap_or_else(|e| e.into_inner()) = Some(want);
             return;

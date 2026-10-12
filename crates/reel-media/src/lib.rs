@@ -22,6 +22,6 @@ pub mod tools;
 
 pub use cache::{CacheKey, ConversionCache};
 pub use error::{MediaError, Result};
-pub use plan::{MediaPlan, PlanOptions, TranscodeMode, plan};
+pub use plan::{MediaPlan, PlanOptions, SinkSupport, TranscodeMode, plan};
 pub use probe::{Audio, Probe, Video};
 pub use tools::Tools;
