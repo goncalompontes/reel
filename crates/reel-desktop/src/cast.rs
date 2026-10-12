@@ -386,6 +386,7 @@ impl CastService {
             let session = match result {
                 Ok(session) => session,
                 Err(error) => {
+                    tracing::warn!(%error, "cast failed");
                     set_status_locked(
                         &inner,
                         CastStatus::Failed {

@@ -36,6 +36,27 @@ impl App {
         self.cast_open = true;
     }
 
+    /// Start casting once a device is chosen.
+    ///
+    /// A title that is not already streaming has no valid stream URL yet, so it
+    /// is started and the cast waits for [`crate::backend::BackendEvent::Ready`]
+    /// — otherwise the backend's probe hits a 404 and the cast fails.
+    pub(crate) fn begin_cast(
+        &mut self,
+        udn: String,
+        torrent_id: usize,
+        file_id: usize,
+        title: String,
+    ) {
+        if self.backend.is_live(torrent_id) {
+            self.backend.start_cast(udn, torrent_id, file_id, title);
+            return;
+        }
+        self.start_streaming(torrent_id, &[file_id]);
+        self.pending_cast = Some((udn, torrent_id, file_id, title));
+        self.set_toast("Preparing to stream\u{2026}", false);
+    }
+
     /// The file the current screen implies should be cast.
     fn cast_target(&self) -> Option<(usize, usize, String)> {
         if let Some(info) = self.player.current() {
@@ -133,7 +154,7 @@ impl App {
 
                 if let Some(udn) = chosen {
                     if let Some((torrent_id, file_id, title)) = self.cast_pending.clone() {
-                        self.backend.start_cast(udn, torrent_id, file_id, title);
+                        self.begin_cast(udn, torrent_id, file_id, title);
                         self.cast_open = false;
                     }
                 }

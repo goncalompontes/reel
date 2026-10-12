@@ -297,6 +297,8 @@ pub struct App {
     cast_pending: Option<(usize, usize, String)>,
     /// The "Add by address" text in the cast picker.
     cast_address: String,
+    /// A cast waiting for its title to start streaming: `(udn, torrent, file, title)`.
+    pending_cast: Option<(String, usize, usize, String)>,
     player: PlayerController,
     /// Last time the mouse or a key moved, for hiding the chrome in fullscreen.
     player_last_activity: Instant,
@@ -398,6 +400,7 @@ impl App {
             cast_open: false,
             cast_pending: None,
             cast_address: String::new(),
+            pending_cast: None,
             player: PlayerController::new(),
             player_last_activity: Instant::now(),
             player_controls_hidden: false,
@@ -1037,6 +1040,16 @@ impl App {
                         if matches {
                             self.pending_play = None;
                             self.open_player(torrent_id, file_id);
+                        }
+                    }
+                    // A cast that was waiting for its title to come up.
+                    if let Some((udn, torrent_id, file_id, title)) = self.pending_cast.clone() {
+                        let matches = self
+                            .item(torrent_id)
+                            .is_some_and(|item| item.entry.info_hash == info_hash);
+                        if matches {
+                            self.pending_cast = None;
+                            self.backend.start_cast(udn, torrent_id, file_id, title);
                         }
                     }
                 }
