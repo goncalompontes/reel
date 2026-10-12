@@ -250,6 +250,12 @@ impl WatchHistory {
     pub fn recent(&self, limit: usize, only_resumable: bool) -> Vec<(String, &WatchProgress)> {
         let mut newest: BTreeMap<&str, &WatchProgress> = BTreeMap::new();
         for (key, progress) in &self.entries {
+            // Choose the newest *eligible* file. Filtering after picking would
+            // let a finished episode hide a sibling that is still in progress,
+            // dropping the whole torrent from "continue watching".
+            if only_resumable && !progress.is_resumable() {
+                continue;
+            }
             let hash = key_of(key);
             let keep = newest
                 .get(hash)
@@ -262,7 +268,6 @@ impl WatchHistory {
 
         let mut items: Vec<(String, &WatchProgress)> = newest
             .into_iter()
-            .filter(|(_, progress)| !only_resumable || progress.is_resumable())
             .map(|(hash, progress)| (hash.to_string(), progress))
             .collect();
         items.sort_by(|a, b| {
@@ -348,6 +353,31 @@ mod tests {
         history.forget_file("show", 0).unwrap();
         assert_eq!(history.get_file("show", 0), None);
         assert!(history.get_file("show", 1).is_some());
+    }
+
+    #[test]
+    fn a_finished_episode_does_not_hide_one_still_in_progress() {
+        // Written by hand so the timestamps are explicit: the finished episode is
+        // the *newer* one, which is exactly the case that used to make the whole
+        // torrent vanish from "continue watching".
+        let path = scratch("finished-newer");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            br#"{"version":1,"entries":{
+                "show#1":{"position":2790.0,"duration":2800.0,"updated_at":200},
+                "show#2":{"position":400.0,"duration":2800.0,"updated_at":100}}}"#,
+        )
+        .unwrap();
+
+        let history = WatchHistory::load(&path);
+        let recent = history.recent(10, true);
+        assert_eq!(recent.len(), 1, "the torrent is still being watched");
+        assert_eq!(
+            recent[0].1.position, 400.0,
+            "and points at the unfinished episode"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
