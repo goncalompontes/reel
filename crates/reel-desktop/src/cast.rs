@@ -566,6 +566,8 @@ async fn prepare_and_start(
             hevc: true,
             ac3: true,
             eac3: true,
+            mp4: true,
+            mkv: true,
         };
         tracing::debug!("passthrough forced; ignoring the renderer's capabilities");
     } else {
@@ -575,12 +577,14 @@ async fn prepare_and_start(
                     hevc: capabilities.supports_hevc(),
                     ac3: capabilities.supports_ac3(),
                     eac3: capabilities.supports_eac3(),
+                    mp4: capabilities.accepts_mime("video/mp4"),
+                    mkv: capabilities.accepts_mime("video/x-matroska"),
                 };
                 tracing::info!(
                     entries = capabilities.entries.len(),
                     hevc = options.sink.hevc,
-                    ac3 = options.sink.ac3,
-                    eac3 = options.sink.eac3,
+                    mp4 = options.sink.mp4,
+                    mkv = options.sink.mkv,
                     "renderer capabilities"
                 );
             }
@@ -601,10 +605,18 @@ async fn prepare_and_start(
         .then(|| "hvc1".to_string());
     *remux_tag.lock().unwrap_or_else(|e| e.into_inner()) = video_tag;
 
+    // The source file's name (for the URL/DIDL MIME) and length, fetched once.
+    let file = engine.probe_file(id, file_id)?;
+    let file_name = file.name.clone();
+    let length = file.length;
+
     let (url, seekable, converted) = match plan {
-        MediaPlan::Original => (original_url(lan_base, token, id, file_id), true, false),
+        MediaPlan::Original => (
+            original_url(lan_base, token, id, file_id, &file_name),
+            true,
+            false,
+        ),
         MediaPlan::Remux => {
-            let length = engine.probe_file(id, file_id)?.length;
             let key = CacheKey::for_plan(
                 engine.view(id)?.info_hash,
                 file_id as u64,
@@ -617,11 +629,14 @@ async fn prepare_and_start(
             } else {
                 // Remux on the fly: the LAN endpoint streams fragmented MP4 and
                 // tees it into the cache, so a later cast can seek the file.
-                (remux_url(lan_base, token, id, file_id), false, true)
+                (
+                    remux_url(lan_base, token, id, file_id, &file_name),
+                    false,
+                    true,
+                )
             }
         }
         MediaPlan::Transcode { max_height } => {
-            let length = engine.probe_file(id, file_id)?.length;
             let key = CacheKey::for_plan(
                 engine.view(id)?.info_hash,
                 file_id as u64,
@@ -671,8 +686,11 @@ pub fn plan_options(settings: &CatalogSettings) -> PlanOptions {
 }
 
 /// The LAN URL for a file served directly from the engine.
-pub fn original_url(lan_base: &str, token: &str, id: usize, file_id: usize) -> String {
-    format!("{lan_base}/media/{token}/original/{id}/{file_id}")
+pub fn original_url(lan_base: &str, token: &str, id: usize, file_id: usize, name: &str) -> String {
+    format!(
+        "{lan_base}/media/{token}/original/{id}/{file_id}/{}",
+        url_name(name, None)
+    )
 }
 
 /// The LAN URL for a converted file.
@@ -681,8 +699,37 @@ pub fn converted_url(lan_base: &str, token: &str, name: &str) -> String {
 }
 
 /// The LAN URL for a live remux of a file.
-pub fn remux_url(lan_base: &str, token: &str, id: usize, file_id: usize) -> String {
-    format!("{lan_base}/media/{token}/remux/{id}/{file_id}")
+pub fn remux_url(lan_base: &str, token: &str, id: usize, file_id: usize, name: &str) -> String {
+    format!(
+        "{lan_base}/media/{token}/remux/{id}/{file_id}/{}",
+        url_name(name, Some("mp4"))
+    )
+}
+
+/// A URL-safe file name for a media path, optionally forcing an extension, so
+/// the DIDL `protocolInfo` MIME (derived from the URL) is right.
+fn url_name(name: &str, force_extension: Option<&str>) -> String {
+    let leaf = name.rsplit('/').next().unwrap_or("media");
+    let mut safe: String = leaf
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe.is_empty() || safe.starts_with('.') {
+        safe = format!("media{safe}");
+    }
+    match force_extension {
+        Some(extension) => {
+            let stem = safe.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(&safe);
+            format!("{stem}.{extension}")
+        }
+        None => safe,
+    }
 }
 
 /// DIDL-Lite metadata for a cast.
@@ -756,8 +803,8 @@ mod tests {
     #[test]
     fn media_urls_carry_the_token() {
         assert_eq!(
-            original_url("http://10.0.0.5:4000", "tok", 3, 1),
-            "http://10.0.0.5:4000/media/tok/original/3/1"
+            original_url("http://10.0.0.5:4000", "tok", 3, 1, "Movie.2024.mkv"),
+            "http://10.0.0.5:4000/media/tok/original/3/1/Movie.2024.mkv"
         );
         assert_eq!(
             converted_url("http://10.0.0.5:4000", "tok", "abc-1-2-remux.mp4"),
@@ -781,8 +828,8 @@ mod tests {
     #[test]
     fn media_urls_include_a_live_remux_route() {
         assert_eq!(
-            remux_url("http://10.0.0.5:4000", "tok", 3, 1),
-            "http://10.0.0.5:4000/media/tok/remux/3/1"
+            remux_url("http://10.0.0.5:4000", "tok", 3, 1, "Episode 1.mkv"),
+            "http://10.0.0.5:4000/media/tok/remux/3/1/Episode_1.mp4"
         );
     }
 

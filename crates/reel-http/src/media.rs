@@ -114,7 +114,15 @@ fn tokens_match(expected: &str, given: &str) -> bool {
 pub fn build_media_router(state: MediaState) -> Router {
     Router::new()
         .route("/media/{token}/original/{id}/{file_id}", get(original))
+        .route(
+            "/media/{token}/original/{id}/{file_id}/{name}",
+            get(original_named),
+        )
         .route("/media/{token}/remux/{id}/{file_id}", get(remux))
+        .route(
+            "/media/{token}/remux/{id}/{file_id}/{name}",
+            get(remux_named),
+        )
         .route("/media/{token}/converted/{name}", get(converted))
         .with_state(state)
 }
@@ -252,6 +260,24 @@ fn spawn_live_body(
     });
 
     Ok(Body::from_stream(ReceiverStream::new(rx)))
+}
+
+/// Like [`original`], with a cosmetic file name so the URL has an extension
+/// (the DIDL `protocolInfo` MIME is derived from it).
+async fn original_named(
+    State(st): State<MediaState>,
+    AxumPath((token, id, file_id, _name)): AxumPath<(String, usize, usize, String)>,
+    headers: HeaderMap,
+) -> Result<Response, HttpError> {
+    original(State(st), AxumPath((token, id, file_id)), headers).await
+}
+
+/// Like [`remux`], with a cosmetic file name.
+async fn remux_named(
+    State(st): State<MediaState>,
+    AxumPath((token, id, file_id, _name)): AxumPath<(String, usize, usize, String)>,
+) -> Result<Response, HttpError> {
+    remux(State(st), AxumPath((token, id, file_id))).await
 }
 
 /// Serve a converted file from the cache directory, honouring `Range`.

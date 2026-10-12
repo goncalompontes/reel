@@ -72,6 +72,10 @@ pub struct SinkSupport {
     pub ac3: bool,
     /// E-AC-3 (Dolby Digital Plus) audio.
     pub eac3: bool,
+    /// The MP4 container (`video/mp4`).
+    pub mp4: bool,
+    /// The Matroska container (`video/x-matroska`).
+    pub mkv: bool,
 }
 
 /// Knobs for [`plan`].
@@ -119,6 +123,15 @@ fn video_is_copyable(probe: &Probe, sink: SinkSupport) -> bool {
 
 /// Choose how to deliver `probe` to a renderer.
 pub fn plan(probe: &Probe, options: &PlanOptions) -> MediaPlan {
+    // The renderer advertises the file's own container: hand it the original
+    // bytes, with no conversion at all. This is how a 4K HEVC MKV plays directly
+    // on a television that lists `video/x-matroska`.
+    let container_ok =
+        (probe.is_mp4() && options.sink.mp4) || (probe.is_matroska() && options.sink.mkv);
+    if container_ok {
+        return MediaPlan::Original;
+    }
+
     // No video stream (audio-only) counts as compatible.
     let video_ok = probe.video.is_none() || video_is_copyable(probe, options.sink);
     let audio_ok = probe
@@ -346,6 +359,28 @@ mod tests {
             ..auto()
         };
         assert_eq!(plan(&file, &options), MediaPlan::Remux);
+    }
+
+    #[test]
+    fn an_advertised_container_is_served_as_original() {
+        let hevc10 = Video {
+            codec: "hevc".to_string(),
+            profile: Some("Main 10".to_string()),
+            width: Some(3840),
+            height: Some(2160),
+            bit_depth: Some(10),
+        };
+        let file = probe("matroska,webm", Some(hevc10), Some(audio("eac3")));
+        assert!(matches!(plan(&file, &auto()), MediaPlan::Transcode { .. }));
+
+        let options = PlanOptions {
+            sink: SinkSupport {
+                mkv: true,
+                ..Default::default()
+            },
+            ..auto()
+        };
+        assert_eq!(plan(&file, &options), MediaPlan::Original);
     }
 
     #[test]
