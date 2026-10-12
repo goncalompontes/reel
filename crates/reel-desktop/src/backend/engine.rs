@@ -1,422 +1,10 @@
-//! The seam between the UI and everything below it.
-//!
-//! The UI only ever talks to [`Backend`], which keeps three useful properties:
-//!
-//! * the whole interface can be driven in tests by [`FakeBackend`], with no
-//!   engine, no network and no HTTP server;
-//! * the engine stays off the UI thread for anything slow, because the async
-//!   methods are spawned onto a runtime and report back through events;
-//! * metadata enrichment happens in the background, so a library of two hundred
-//!   titles does not stall the first frame.
-//!
-//! The real implementation mounts the engine, the streaming HTTP server and the
-//! metadata provider in one process. The player is handed URLs on `127.0.0.1`,
-//! so playback uses the same range-request path the CLI and the integration
-//! tests exercise.
+//! The real backend: engine, catalogue and streaming in one process.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-use reel_catalog::{
-    CatalogCache, CatalogEntry, CatalogSettings, FileInput, LookupQuery, MediaRef, MediaStore,
-    Metadata, MetadataProvider, Release, SearchAggregator, SearchResults, TmdbClient, WatchHistory,
-    WatchProgress, Work, WorkMember, analyse, default_data_dir, episode_key_parts,
-    provider_from_key,
-};
-use reel_core::model::{FileView, StatsView, StreamTarget, TorrentView};
-use reel_core::title::clean_title;
-use reel_core::{
-    AddOptions, AddSource, Engine, EngineConfig, LibraryEntry, LibraryStore, StoredFile,
-};
-
-use crate::cast::CastService;
-
-/// How many metadata lookups may be in flight at once. Providers rate-limit, and
-/// a library can be large.
-const MAX_CONCURRENT_LOOKUPS: usize = 2;
-
-/// How many distinct works from one search to look up. A search may return many
-/// releases for one work; they share one lookup, and a broad query must not
-/// create an unbounded stream of TMDB requests.
-const MAX_SEARCH_LOOKUPS: usize = 16;
-
-/// Search metadata is nonessential UI enrichment; serialize requests so a large
-/// result set does not burst at the provider.
-const MAX_SEARCH_CONCURRENCY: usize = 1;
-/// Minimum spacing between starting search metadata lookups.
-const SEARCH_LOOKUP_DELAY: Duration = Duration::from_millis(400);
-
-/// How many extra pages a search streams in after the first batch. A source
-/// that paginates keeps filling the list until it runs out; this bounds a
-/// source that never stops.
-const MAX_SEARCH_ROUNDS: usize = 20;
-
-/// Minimum gap between writing watch positions to disk.
-const HISTORY_WRITE_INTERVAL: Duration = Duration::from_secs(3);
-
-/// How long the settings page's cache figures are reused before the cache
-/// directory is walked again. The walk is cheap but not free, and the page is
-/// redrawn many times a second; the numbers are trivia, so a little staleness
-/// is invisible and a disk walk per frame is not.
-const CACHE_STATS_TTL: Duration = Duration::from_secs(2);
-
-/// The cache figures the settings page shows, and when they were measured.
-#[derive(Debug, Clone, Copy)]
-struct CacheStats {
-    measured_at: Instant,
-    metadata_files: usize,
-    bytes: u64,
-}
-
-/// How video will be shown.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PlayerCapability {
-    /// libmpv renders frames into the app window.
-    Embedded,
-    /// A separate player process; reel cannot draw on top of it.
-    External { program: String },
-    /// Neither worked.
-    Unavailable { reason: String },
-}
-
-#[derive(Debug, Clone)]
-pub struct BackendCapabilities {
-    pub download_dir: String,
-    pub client_name: String,
-    pub player: PlayerCapability,
-    pub mpv_api: Option<(u64, u64)>,
-    /// Why embedded playback is unavailable, when it is.
-    pub player_note: Option<String>,
-}
-
-/// How metadata enrichment is doing, for the settings page.
-#[derive(Debug, Clone, Default)]
-pub struct CatalogStatus {
-    pub provider: String,
-    pub configured: bool,
-    /// Why there is no provider, when there is not.
-    pub note: Option<String>,
-    pub cached_metadata: usize,
-    pub cache_bytes: u64,
-    pub cache_dir: String,
-    /// How many library entries have metadata.
-    pub enriched: usize,
-    /// How many library entries are still being looked up.
-    pub pending: usize,
-    /// Where the key in use came from, in words.
-    pub key_source: String,
-    /// False when the key comes from the environment and cannot be changed here.
-    pub can_set_key: bool,
-}
-
-/// One configured place to look for torrents.
-#[derive(Debug, Clone)]
-pub struct SourceInfo {
-    pub name: String,
-    pub configured: bool,
-}
-
-/// A torrent together with what the catalogue knows about it.
-#[derive(Debug, Clone)]
-pub struct LibraryItem {
-    /// Engine state: files, progress, peers.
-    pub torrent: TorrentView,
-    /// Catalogue state: metadata, artwork, watch position.
-    pub entry: CatalogEntry,
-    /// The user asked to keep this title on disk. `false` means it is only ever
-    /// streamed.
-    pub downloading: bool,
-    /// Which files the user asked to keep, so a per-episode/season/film row can
-    /// show its own Download/Stop toggle.
-    pub kept_files: Vec<usize>,
-}
-
-impl LibraryItem {
-    /// Heading for the UI, preferring real metadata.
-    pub fn heading(&self) -> String {
-        self.entry.heading()
-    }
-
-    pub fn info_hash(&self) -> &str {
-        &self.entry.info_hash
-    }
-
-    /// Position to resume from, if any.
-    pub fn resume_position(&self) -> Option<f64> {
-        self.entry.resume_position()
-    }
-}
-
-/// Something the backend wants the UI to know about.
-#[derive(Debug, Clone)]
-pub enum BackendEvent {
-    Info(String),
-    Error(String),
-    Added {
-        id: usize,
-        title: String,
-    },
-    /// Metadata arrived for a torrent, so the UI should refresh.
-    Metadata {
-        info_hash: String,
-    },
-    /// Metadata arrived for a search result, so the list should refresh.
-    SearchMetadata,
-    /// Wake the search metadata dispatcher after a miss or a pacing delay.
-    SearchLookupReady,
-    /// A title that had to be brought back into the session is now live and can
-    /// be streamed. Payback may have been requested before that.
-    Ready {
-        info_hash: String,
-    },
-    /// A search result was added to play: its files have resolved, so the UI
-    /// should open the player on this file.
-    PlayReady {
-        torrent_id: usize,
-        file_id: usize,
-    },
-    /// Progress for an add/play initiated from a search result.
-    SearchActionProgress {
-        key: String,
-        phase: SearchActionPhase,
-    },
-    /// A search-result add/play has either completed or failed.
-    SearchActionFinished {
-        key: String,
-    },
-    /// Watch positions changed.
-    WatchUpdated,
-    /// The result of checking an API key.
-    ApiKeyChecked {
-        ok: bool,
-        message: String,
-    },
-    /// Results for a search. Carries the query so a stale answer for an older
-    /// query can be recognised and dropped.
-    SearchResults {
-        query: String,
-        results: SearchResults,
-    },
-    /// More results for a search already shown, streamed in as later pages
-    /// arrive. Carries the query for the same stale-answer reason.
-    SearchHitsAdded {
-        query: String,
-        hits: Vec<reel_catalog::SearchHit>,
-    },
-    /// No more results are coming for a search.
-    SearchStreamEnded {
-        query: String,
-    },
-    /// A search that could not run at all.
-    SearchFailed {
-        query: String,
-        message: String,
-    },
-}
-
-/// User-visible stages while adding or playing a search result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SearchActionPhase {
-    ResolvingMagnet,
-    Adding,
-    PreparingPlayback,
-}
-
-impl SearchActionPhase {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::ResolvingMagnet => "Fetching magnet…",
-            Self::Adding => "Adding…",
-            Self::PreparingPlayback => "Starting playback…",
-        }
-    }
-}
-
-/// One media's download request: the logical media key plus the file(s) that
-/// currently back it. The backend resolves this to a stable
-/// [`reel_catalog::MediaRef`] and persists it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MediaDownload {
-    /// e.g. `meta:tmdb:603#movie` or `meta:tmdb:1396#s01e02`.
-    pub key: String,
-    /// The live torrent holding the file right now.
-    pub torrent_id: usize,
-    /// File ids within that torrent.
-    pub files: Vec<usize>,
-}
-
-pub trait Backend {
-    fn capabilities(&self) -> &BackendCapabilities;
-    fn base_url(&self) -> &str;
-
-    /// The whole library, torrents joined to catalogue metadata.
-    fn library(&self) -> Vec<LibraryItem>;
-    fn item(&self, id: usize) -> Option<LibraryItem>;
-
-    fn add(&self, source: &str, media_only: bool);
-    fn set_paused(&self, id: usize, paused: bool);
-    fn remove(&self, id: usize, delete_files: bool);
-    /// Choose exactly which files of a torrent are fetched.
-    ///
-    /// This is what makes "watch episode 3 of a season pack" fetch only episode
-    /// 3 rather than the whole season. Files left out keep whatever they had and
-    /// stop being requested.
-    fn set_only_files(&self, id: usize, files: &[usize]);
-
-    /// Fetch exactly these files *and* make sure the torrent is running.
-    ///
-    /// This is what pressing Play uses: the copy is temporary, so it is fetched
-    /// with the streaming storage and thrown away when playback stops. A
-    /// multi-file torrent is added paused, so narrowing the selection alone
-    /// would leave the stream request waiting forever; the torrent is unpaused
-    /// too.
-    fn start_files(&self, id: usize, files: &[usize]);
-
-    /// Keep this media, backed by these files. The record is keyed by the
-    /// media (`work.key#s01e02`, `work.key#movie`), not the torrent, and
-    /// replaces any previous copy — so switching the chosen release moves the
-    /// download rather than duplicating it.
-    fn download_media(&self, items: Vec<MediaDownload>);
-
-    /// Stop keeping these files. When a media's last file goes, the media is no
-    /// longer a download; its source deletes the files and goes back to
-    /// streaming.
-    fn stop_media_download(&self, items: Vec<MediaDownload>);
-
-    /// Remember which source the user chose for a media, so the copy chooser
-    /// survives a restart.
-    fn choose_source(&self, key: String, torrent_id: usize, file_id: usize);
-
-    /// The user's chosen source for a media, as `(torrent id, file id)`.
-    fn chosen_source(&self, key: &str) -> Option<(usize, usize)>;
-
-    /// Playback has stopped. A title that is not being downloaded is released
-    /// so its temporary storage goes away; a download is left alone.
-    fn stop_streaming(&self, id: usize);
-
-    /// Re-add a stream from scratch and start these files. Used when a cached
-    /// resume stalls: a fresh add is the path that is known to play.
-    fn restart_stream(&self, id: usize, files: &[usize]);
-
-    /// Whether the title is currently in the session, so it can stream now.
-    /// A title that is not live has to be brought back first, which reports
-    /// [`BackendEvent::Ready`] when it is done.
-    fn is_live(&self, id: usize) -> bool;
-
-    /// Report the player's position so the backend can keep streaming from
-    /// running away: once too much is buffered ahead of playback it pauses the
-    /// fetch, and resumes when playback catches up.
-    fn note_playback(&self, id: usize, file_id: usize, position: f64, duration: Option<f64>);
-
-    /// Remember how far through one file of a torrent playback got.
-    ///
-    /// Per file, not per torrent: a series is one torrent with many episodes,
-    /// and one position for all of them would resume episode one at episode
-    /// two's timestamp.
-    fn record_watch(
-        &self,
-        info_hash: &str,
-        file_id: usize,
-        file_name: Option<String>,
-        title: Option<String>,
-        position: f64,
-        duration: Option<f64>,
-    );
-    fn mark_finished(&self, info_hash: &str, file_id: usize, title: Option<String>);
-    fn forget_watch(&self, info_hash: &str, file_id: usize);
-
-    /// Start a search. Results arrive as [`BackendEvent::SearchResults`].
-    ///
-    /// The whole query — text plus any year/season/episode filters — is passed,
-    /// so backends that understand a filter can use it.
-    fn search(&self, query: &reel_catalog::SearchQuery);
-    /// Add a search result. A hit with no magnet yet (an index site that hides
-    /// it behind the torrent's page) is resolved first, then added.
-    fn add_search_hit(&self, hit: reel_catalog::SearchHit, media_only: bool);
-
-    /// Add a search result and start streaming it: resolve the magnet if
-    /// needed, add the torrent, and open the player on its best file once the
-    /// files resolve. Emits [`BackendEvent::PlayReady`] when it is time.
-    fn play_search_hit(&self, _hit: reel_catalog::SearchHit, _media_only: bool) {}
-
-    /// Start metadata lookups for search results, so the list can show a rating
-    /// and a year next to each. Best-effort and bounded; the results are read
-    /// back with [`Backend::search_metadata`].
-    fn enrich_search(&self, _hits: &[reel_catalog::SearchHit]) {}
-
-    /// Metadata matched to a search result, once [`Backend::enrich_search`] has
-    /// had a chance to run.
-    fn search_metadata(&self, _hit: &reel_catalog::SearchHit) -> Option<Metadata> {
-        None
-    }
-
-    /// How many metadata lookups are still running. The UI keeps repainting
-    /// while any are, so results appear as they arrive without a mouse move.
-    fn pending_lookups(&self) -> usize {
-        0
-    }
-
-    /// The configured search sources, for the settings page.
-    fn search_sources(&self) -> Vec<SourceInfo>;
-
-    fn catalog_status(&self) -> CatalogStatus;
-    /// The persisted settings, the canonical configuration.
-    fn settings(&self) -> CatalogSettings;
-    /// Persist settings and apply what can be applied immediately. A changed
-    /// download directory takes effect on the next start.
-    fn save_settings(&self, settings: CatalogSettings);
-    /// Store a TMDB key and use it immediately. `None` clears it.
-    fn set_api_key(&self, key: Option<String>);
-    /// Check a key against the provider and report back as an event.
-    fn test_api_key(&self, key: String);
-    /// Clear cached metadata and artwork, then enrich again.
-    fn clear_catalog_cache(&self);
-    /// Forget what we know and look everything up again.
-    fn refresh_metadata(&self);
-
-    fn take_events(&self) -> Vec<BackendEvent>;
-
-    /// Why casting is unavailable, or `None` when the LAN media server is
-    /// running and renderers can be cast to.
-    fn cast_unavailable(&self) -> Option<String> {
-        Some("casting is not available".to_string())
-    }
-
-    /// Renderers found on the local network.
-    fn cast_devices(&self) -> Vec<crate::cast::DeviceInfo> {
-        Vec::new()
-    }
-
-    /// Whether a renderer search is in progress.
-    fn cast_discovering(&self) -> bool {
-        false
-    }
-
-    /// The active cast, if any.
-    fn cast_status(&self) -> Option<crate::cast::CastStatus> {
-        None
-    }
-
-    /// Start (or repeat) a renderer search.
-    fn refresh_cast_devices(&self) {}
-
-    /// Cast a torrent file to the renderer with the given UDN.
-    fn start_cast(&self, _udn: String, _torrent_id: usize, _file_id: usize, _title: String) {}
-
-    /// Control the active cast.
-    fn cast_action(&self, _action: crate::cast::CastAction) {}
-
-    /// Delete the files converted for casting.
-    fn clear_cast_cache(&self) {}
-
-    /// Dismiss the cast view and session without going through the renderer.
-    fn dismiss_cast(&self) {}
-}
+use super::*;
 
 // ------------------------------------------------------------ real backend
 
-struct CatalogState {
+pub(crate) struct CatalogState {
     /// Swappable: setting a key in Settings has to take effect without a restart.
     provider: Mutex<Arc<dyn MetadataProvider>>,
     settings: Mutex<CatalogSettings>,
@@ -455,7 +43,7 @@ struct CatalogState {
 }
 
 impl CatalogState {
-    fn provider(&self) -> Arc<dyn MetadataProvider> {
+    pub(crate) fn provider(&self) -> Arc<dyn MetadataProvider> {
         self.provider
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -463,14 +51,14 @@ impl CatalogState {
     }
 
     /// The current search backends. Swapped when the search settings change.
-    fn search(&self) -> Arc<SearchAggregator> {
+    pub(crate) fn search(&self) -> Arc<SearchAggregator> {
         self.search
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 
-    fn search_key(&self, hit: &reel_catalog::SearchHit) -> String {
+    pub(crate) fn search_key(&self, hit: &reel_catalog::SearchHit) -> String {
         let raw_key = format!(
             "{}|{}",
             hit.title,
@@ -489,7 +77,7 @@ impl CatalogState {
     /// Parse a torrent's files into a release, reusing the last result while the
     /// file list is unchanged. This is the hot path behind `library()`, which the
     /// UI polls several times a second.
-    fn cached_release(
+    pub(crate) fn cached_release(
         &self,
         info_hash: &str,
         signature: u64,
@@ -509,7 +97,7 @@ impl CatalogState {
         release
     }
 
-    fn note(&self) -> Option<String> {
+    pub(crate) fn note(&self) -> Option<String> {
         if self.provider().is_configured() {
             None
         } else {
@@ -749,7 +337,7 @@ impl EngineBackend {
         self.cast.as_ref()
     }
 
-    fn push(&self, event: BackendEvent) {
+    pub(crate) fn push(&self, event: BackendEvent) {
         self.events
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -757,7 +345,7 @@ impl EngineBackend {
     }
 
     /// Spawn a fallible engine operation and report the outcome as an event.
-    fn spawn_result<F, E>(&self, what: &'static str, future: F)
+    pub(crate) fn spawn_result<F, E>(&self, what: &'static str, future: F)
     where
         F: std::future::Future<Output = Result<(), E>> + Send + 'static,
         E: std::fmt::Display,
@@ -778,7 +366,7 @@ impl EngineBackend {
     // ------------------------------------------------------------ library
 
     /// The live engine id for each torrent in the session, by info hash.
-    fn live_map(&self) -> HashMap<String, usize> {
+    pub(crate) fn live_map(&self) -> HashMap<String, usize> {
         self.engine
             .list()
             .into_iter()
@@ -786,11 +374,11 @@ impl EngineBackend {
             .collect()
     }
 
-    fn library_path(&self) -> std::path::PathBuf {
+    pub(crate) fn library_path(&self) -> std::path::PathBuf {
         self.catalog.data_dir.join("library.json")
     }
 
-    fn save_library(&self) {
+    pub(crate) fn save_library(&self) {
         let library = self.library.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = library.save(&self.library_path()) {
             tracing::warn!(error = %e, "could not save the library");
@@ -799,7 +387,7 @@ impl EngineBackend {
 
     /// Clear the saved pause on these sources, because the user asked them to
     /// run again (a new download, or a resume).
-    fn clear_paused(&self, hashes: &std::collections::HashSet<String>) {
+    pub(crate) fn clear_paused(&self, hashes: &std::collections::HashSet<String>) {
         let mut store = self.library.lock().unwrap_or_else(|e| e.into_inner());
         let mut changed = false;
         for entry in store.entries.iter_mut() {
@@ -817,7 +405,7 @@ impl EngineBackend {
 
     /// The per-torrent rate caps from settings, in bytes per second. `0`/unset
     /// means unlimited.
-    fn rate_limits(&self) -> (Option<u32>, Option<u32>) {
+    pub(crate) fn rate_limits(&self) -> (Option<u32>, Option<u32>) {
         let settings = self.settings();
         let kib = |value: Option<u32>| {
             value
@@ -830,7 +418,7 @@ impl EngineBackend {
         )
     }
 
-    fn snapshot(&self) -> LibraryStore {
+    pub(crate) fn snapshot(&self) -> LibraryStore {
         self.library
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -838,7 +426,7 @@ impl EngineBackend {
     }
 
     /// Persist the `.torrent` bytes so the title can be re-added offline.
-    fn save_torrent_bytes(&self, info_hash: &str, bytes: &[u8]) {
+    pub(crate) fn save_torrent_bytes(&self, info_hash: &str, bytes: &[u8]) {
         let dir = self.catalog.data_dir.join("torrents");
         if let Err(e) = std::fs::create_dir_all(&dir) {
             tracing::warn!(error = %e, "could not create the torrent cache");
@@ -861,7 +449,7 @@ impl EngineBackend {
     ///
     /// The engine id is preserved across the swap (`preferred_id`), so a stream
     /// URL a player already holds keeps resolving.
-    fn recycle(
+    pub(crate) fn recycle(
         &self,
         entry: LibraryEntry,
         downloading: bool,
@@ -958,7 +546,7 @@ impl EngineBackend {
     }
 
     /// Re-add every title the user asked to keep.
-    fn restore_downloads(&self) {
+    pub(crate) fn restore_downloads(&self) {
         let entries: Vec<LibraryEntry> = self
             .library
             .lock()
@@ -973,7 +561,7 @@ impl EngineBackend {
     }
 
     /// Persist the media-keyed download store.
-    fn save_media(&self) {
+    pub(crate) fn save_media(&self) {
         let media = self.media.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = media.save(&MediaStore::path(&self.catalog.data_dir)) {
             tracing::warn!(error = %e, "could not save the media store");
@@ -982,7 +570,7 @@ impl EngineBackend {
 
     /// The media key a file of a torrent belongs to, or `None` if the torrent
     /// is not in the library.
-    fn media_watch_key(&self, info_hash: &str, file_id: usize) -> Option<String> {
+    pub(crate) fn media_watch_key(&self, info_hash: &str, file_id: usize) -> Option<String> {
         let entry = self.snapshot().by_hash(info_hash)?.clone();
         let release = analyse_entry(&entry);
         let work_key = self.work_key_for(&entry, &release);
@@ -991,7 +579,7 @@ impl EngineBackend {
 
     /// Adopt state written before downloads were media-keyed. Runs once, when
     /// the media store has no downloads yet.
-    fn adopt_legacy_downloads(&self) {
+    pub(crate) fn adopt_legacy_downloads(&self) {
         let entries: Vec<LibraryEntry> = self.snapshot().iter().cloned().collect();
         let mut media = self.media.lock().unwrap_or_else(|e| e.into_inner());
         if media.has_downloads() {
@@ -1025,7 +613,7 @@ impl EngineBackend {
     /// `selected_files` and `downloading` are a cache for the UI and the
     /// engine; the media store is the source of truth. A reference resolves by
     /// path, so a torrent that was re-added or reordered still finds its files.
-    fn rehydrate_downloads(&self) {
+    pub(crate) fn rehydrate_downloads(&self) {
         let media = self.media.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let mut library = self.library.lock().unwrap_or_else(|e| e.into_inner());
         let mut changed = false;
@@ -1049,7 +637,7 @@ impl EngineBackend {
     }
 
     /// The file ids of `entry` wanted by the media store.
-    fn selected_from_store(entry: &LibraryEntry, media: &MediaStore) -> Vec<usize> {
+    pub(crate) fn selected_from_store(entry: &LibraryEntry, media: &MediaStore) -> Vec<usize> {
         let wanted: HashSet<&str> = media
             .refs_for_info_hash(&entry.info_hash)
             .map(|file| file.path.as_str())
@@ -1075,7 +663,7 @@ impl EngineBackend {
     /// download and just gained or lost a file only needs its selection
     /// narrowed — recycling it would drop the peer connections and the buffer
     /// for no reason.
-    fn apply_download_state(&self, modes: &[(String, bool)]) {
+    pub(crate) fn apply_download_state(&self, modes: &[(String, bool)]) {
         for (info_hash, was_downloading) in modes {
             let Some(entry) = self.snapshot().by_hash(info_hash).cloned() else {
                 continue;
@@ -1110,7 +698,7 @@ impl EngineBackend {
     }
 
     /// Remember that a stream was watched, for cache eviction order.
-    fn touch_cache(&self, id: usize) {
+    pub(crate) fn touch_cache(&self, id: usize) {
         self.stream_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1119,7 +707,7 @@ impl EngineBackend {
 
     /// Cached metadata-file count and total bytes, re-measured only when the
     /// memoized value is older than [`CACHE_STATS_TTL`].
-    fn cache_stats(&self) -> (usize, u64) {
+    pub(crate) fn cache_stats(&self) -> (usize, u64) {
         let mut slot = self.cache_stats.lock().unwrap_or_else(|e| e.into_inner());
         let fresh = slot
             .as_ref()
@@ -1138,14 +726,14 @@ impl EngineBackend {
     }
 
     /// Forget the memoized cache figures, so the next status read re-measures.
-    fn invalidate_cache_stats(&self) {
+    pub(crate) fn invalidate_cache_stats(&self) {
         *self.cache_stats.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Release the least recently watched stream buffers once the session cache
     /// is over its limit. Streams with downloads attached are left alone; the
     /// title currently playing is never evicted.
-    fn enforce_stream_cache(&self, keep: Option<usize>) {
+    pub(crate) fn enforce_stream_cache(&self, keep: Option<usize>) {
         let cap_mb = self.settings().stream_cache_mb;
         let cap = cap_mb as u64 * 1024 * 1024;
         let store = self.snapshot();
@@ -1214,7 +802,7 @@ impl EngineBackend {
     }
 
     /// Write back the file list the engine knows, once a magnet has resolved.
-    fn sync_entry(&self, id: usize, view: &TorrentView) {
+    pub(crate) fn sync_entry(&self, id: usize, view: &TorrentView) {
         let mut library = self.library.lock().unwrap_or_else(|e| e.into_inner());
         let Some(entry) = library.entry_mut(id) else {
             return;
@@ -1227,7 +815,7 @@ impl EngineBackend {
     }
 
     /// Look up metadata for every stored title we have not tried yet.
-    fn enrich_library(&self) {
+    pub(crate) fn enrich_library(&self) {
         if !self.catalog.provider().is_configured() {
             return;
         }
@@ -1282,7 +870,7 @@ impl EngineBackend {
         }
     }
 
-    fn spawn_lookup(&self, info_hash: String, release: Release) {
+    pub(crate) fn spawn_lookup(&self, info_hash: String, release: Release) {
         let provider = self.catalog.provider();
         let state = self.catalog.clone();
         let events = self.events.clone();
@@ -1321,7 +909,7 @@ impl EngineBackend {
         });
     }
 
-    fn schedule_search_retry(&self, delay: Duration) {
+    pub(crate) fn schedule_search_retry(&self, delay: Duration) {
         let mut scheduled = self
             .catalog
             .search_retry_scheduled
@@ -1349,7 +937,7 @@ impl EngineBackend {
     }
 
     /// Look up one search result's title in the background and remember it.
-    fn spawn_search_lookup(&self, key: String, hit: reel_catalog::SearchHit) {
+    pub(crate) fn spawn_search_lookup(&self, key: String, hit: reel_catalog::SearchHit) {
         let provider = self.catalog.provider();
         let state = self.catalog.clone();
         let events = self.events.clone();
@@ -1396,7 +984,7 @@ impl EngineBackend {
 
     /// A view for a title that is not currently in the session, built from what
     /// the store remembers so the library can still draw it.
-    fn synth_view(&self, entry: &LibraryEntry) -> TorrentView {
+    pub(crate) fn synth_view(&self, entry: &LibraryEntry) -> TorrentView {
         let files: Vec<FileView> = entry
             .files
             .iter()
@@ -1438,7 +1026,7 @@ impl EngineBackend {
         }
     }
 
-    fn entry_for(&self, entry: &LibraryEntry, live: Option<&TorrentView>) -> LibraryItem {
+    pub(crate) fn entry_for(&self, entry: &LibraryEntry, live: Option<&TorrentView>) -> LibraryItem {
         let release = match live {
             Some(view) => {
                 let signature = file_list_signature(
@@ -1529,7 +1117,7 @@ impl EngineBackend {
     ///
     /// `Work::single` applies the same identity a merged group does, so the
     /// media key computed here matches the one the UI computes from its `Work`.
-    fn work_key_for(&self, entry: &LibraryEntry, release: &Release) -> String {
+    pub(crate) fn work_key_for(&self, entry: &LibraryEntry, release: &Release) -> String {
         let (display_title, year) = if release.title.is_empty() {
             display_title_for_entry(entry)
         } else {
@@ -1556,7 +1144,7 @@ impl EngineBackend {
     }
 
     /// The media key one file belongs to.
-    fn media_key_for_release(work_key: &str, release: &Release, file_id: usize) -> String {
+    pub(crate) fn media_key_for_release(work_key: &str, release: &Release, file_id: usize) -> String {
         match release
             .episodes
             .iter()
@@ -1576,7 +1164,7 @@ impl EngineBackend {
 /// A cheap fingerprint of a torrent's file list, used to decide whether a
 /// cached [`Release`] is still valid. `live` distinguishes the two parse paths
 /// so a torrent cannot pick up the other path's result.
-fn file_list_signature<'a>(
+pub(crate) fn file_list_signature<'a>(
     live: bool,
     files: impl Iterator<Item = (u64, u64, &'a str)>,
 ) -> u64 {
@@ -1608,7 +1196,7 @@ pub(crate) fn analyse_torrent(torrent: &TorrentView) -> Release {
 /// work-level metadata (poster, rating and overview), not episode stills; a
 /// season or episode in the release therefore must not turn one show into many
 /// separate TMDB requests.
-fn search_lookup_query(hit: &reel_catalog::SearchHit) -> LookupQuery {
+pub(crate) fn search_lookup_query(hit: &reel_catalog::SearchHit) -> LookupQuery {
     let release = reel_catalog::release::analyse_name(&hit.title);
     let mut query = LookupQuery::from_release(&release);
     if query.title.trim().is_empty() {
@@ -1627,7 +1215,7 @@ fn search_lookup_query(hit: &reel_catalog::SearchHit) -> LookupQuery {
 /// The metadata key for a search result is its parsed work identity, not the
 /// raw release name. `The.Bear.S03E01.1080p...` and `The.Bear.S03E02.720p...`
 /// should share one lookup.
-fn search_metadata_key(hit: &reel_catalog::SearchHit) -> String {
+pub(crate) fn search_metadata_key(hit: &reel_catalog::SearchHit) -> String {
     let query = search_lookup_query(hit);
     let title = reel_catalog::matching::normalize(&query.title);
     let kind = match query.kind {
@@ -1641,11 +1229,11 @@ fn search_metadata_key(hit: &reel_catalog::SearchHit) -> String {
     )
 }
 
-fn claim_search_lookup_budget(budget: &mut HashSet<String>, key: &str) -> bool {
+pub(crate) fn claim_search_lookup_budget(budget: &mut HashSet<String>, key: &str) -> bool {
     budget.len() < MAX_SEARCH_LOOKUPS && budget.insert(key.to_string())
 }
 
-fn search_lookup_delay_remaining(last_started: Instant, now: Instant) -> Option<Duration> {
+pub(crate) fn search_lookup_delay_remaining(last_started: Instant, now: Instant) -> Option<Duration> {
     let elapsed = now.saturating_duration_since(last_started);
     (elapsed < SEARCH_LOOKUP_DELAY).then(|| SEARCH_LOOKUP_DELAY - elapsed)
 }
@@ -1716,7 +1304,7 @@ impl CatalogOptions {
 
 /// Build the search aggregator from settings. `disable_bundled_sources` is the
 /// test/CLI override that registers nothing.
-fn build_search(settings: &CatalogSettings, disable_bundled_sources: bool) -> SearchAggregator {
+pub(crate) fn build_search(settings: &CatalogSettings, disable_bundled_sources: bool) -> SearchAggregator {
     if disable_bundled_sources {
         return SearchAggregator::new(Vec::new());
     }
@@ -1725,7 +1313,7 @@ fn build_search(settings: &CatalogSettings, disable_bundled_sources: bool) -> Se
 
 /// Whether a settings change affects the search sources, so the aggregator must
 /// be rebuilt.
-fn search_settings_differ(a: &CatalogSettings, b: &CatalogSettings) -> bool {
+pub(crate) fn search_settings_differ(a: &CatalogSettings, b: &CatalogSettings) -> bool {
     a.ext_to_enabled != b.ext_to_enabled
         || a.ext_to_base_url != b.ext_to_base_url
         || a.ext_to_cookie != b.ext_to_cookie
@@ -1735,7 +1323,7 @@ fn search_settings_differ(a: &CatalogSettings, b: &CatalogSettings) -> bool {
 
 /// The handles every add needs, so `add_source` keeps a manageable signature.
 #[derive(Clone)]
-struct AddContext {
+pub(crate) struct AddContext {
     engine: Arc<Engine>,
     events: Arc<Mutex<Vec<BackendEvent>>>,
     library: Arc<Mutex<LibraryStore>>,
@@ -1743,7 +1331,7 @@ struct AddContext {
 }
 
 impl EngineBackend {
-    fn add_context(&self) -> AddContext {
+    pub(crate) fn add_context(&self) -> AddContext {
         AddContext {
             engine: self.engine.clone(),
             events: self.events.clone(),
@@ -1753,7 +1341,7 @@ impl EngineBackend {
     }
 }
 
-fn report_search_action(ctx: &AddContext, key: &str, phase: Option<SearchActionPhase>) {
+pub(crate) fn report_search_action(ctx: &AddContext, key: &str, phase: Option<SearchActionPhase>) {
     let event = match phase {
         Some(phase) => BackendEvent::SearchActionProgress {
             key: key.to_string(),
@@ -3083,543 +2671,3 @@ impl Drop for EngineBackend {
     }
 }
 
-// ------------------------------------------------------------ fake backend
-
-/// An in-memory backend for tests and for `--demo` runs.
-pub struct FakeBackend {
-    items: Mutex<Vec<LibraryItem>>,
-    /// Media key -> the files that back it, mirroring the real store.
-    downloads: Mutex<HashMap<String, Vec<(usize, usize)>>>,
-    /// Media key -> the copy the user chose.
-    chosen: Mutex<HashMap<String, (usize, usize)>>,
-    events: Mutex<Vec<BackendEvent>>,
-    capabilities: BackendCapabilities,
-    base_url: String,
-    catalog_status: CatalogStatus,
-    settings: Mutex<CatalogSettings>,
-}
-
-impl FakeBackend {
-    pub fn new(items: Vec<LibraryItem>) -> Self {
-        Self {
-            items: Mutex::new(items),
-            downloads: Mutex::new(HashMap::new()),
-            chosen: Mutex::new(HashMap::new()),
-            events: Mutex::new(Vec::new()),
-            settings: Mutex::new(CatalogSettings::default()),
-            capabilities: BackendCapabilities {
-                download_dir: "/tmp/reel-demo".to_string(),
-                client_name: "reel-demo".to_string(),
-                // Tests must never try to open a real video device.
-                player: PlayerCapability::Unavailable {
-                    reason: "demo backend".to_string(),
-                },
-                mpv_api: None,
-                player_note: Some("demo backend".to_string()),
-            },
-            base_url: "http://127.0.0.1:0".to_string(),
-            catalog_status: CatalogStatus {
-                provider: "static".to_string(),
-                configured: true,
-                note: None,
-                ..Default::default()
-            },
-        }
-    }
-
-    /// Replace the whole library, as a test would between assertions.
-    pub fn set_items(&self, items: Vec<LibraryItem>) {
-        *self.items.lock().unwrap_or_else(|e| e.into_inner()) = items;
-    }
-}
-
-impl Backend for FakeBackend {
-    fn capabilities(&self) -> &BackendCapabilities {
-        &self.capabilities
-    }
-
-    fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
-    fn library(&self) -> Vec<LibraryItem> {
-        self.items.lock().unwrap_or_else(|e| e.into_inner()).clone()
-    }
-
-    fn item(&self, id: usize) -> Option<LibraryItem> {
-        self.library()
-            .into_iter()
-            .find(|item| item.torrent.id == id)
-    }
-
-    fn add(&self, source: &str, media_only: bool) {
-        self.events
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(BackendEvent::Info(format!(
-                "add {source} (media_only={media_only})"
-            )));
-    }
-
-    fn add_search_hit(&self, hit: reel_catalog::SearchHit, media_only: bool) {
-        let key = hit.key();
-        match hit.magnet.or(hit.torrent_url) {
-            Some(source) => self.add(&source, media_only),
-            None => {
-                self.events
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(BackendEvent::Error(
-                        "This result has nothing to add".to_string(),
-                    ))
-            }
-        }
-        self.events
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(BackendEvent::SearchActionFinished { key });
-    }
-
-    fn play_search_hit(&self, hit: reel_catalog::SearchHit, _media_only: bool) {
-        self.events
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(BackendEvent::SearchActionFinished { key: hit.key() });
-    }
-
-    fn set_paused(&self, id: usize, paused: bool) {
-        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(item) = items.iter_mut().find(|i| i.torrent.id == id) {
-            item.torrent.stats.state = if paused { "paused" } else { "live" }.to_string();
-            item.torrent.state = item.torrent.stats.state.clone();
-        }
-    }
-
-    fn remove(&self, id: usize, _delete_files: bool) {
-        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
-        items.retain(|item| item.torrent.id != id);
-    }
-
-    fn set_only_files(&self, id: usize, files: &[usize]) {
-        if files.is_empty() {
-            return;
-        }
-        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(item) = items.iter_mut().find(|i| i.torrent.id == id) {
-            for file in &mut item.torrent.files {
-                file.included = files.contains(&file.id);
-            }
-        }
-    }
-
-    fn start_files(&self, id: usize, files: &[usize]) {
-        if files.is_empty() {
-            return;
-        }
-        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(item) = items.iter_mut().find(|i| i.torrent.id == id) {
-            for file in &mut item.torrent.files {
-                file.included = files.contains(&file.id);
-            }
-            // The real backend resumes the torrent; mirror that so the UI can
-            // be tested against the paused-on-add behaviour.
-            item.torrent.stats.state = "live".to_string();
-            item.torrent.state = "live".to_string();
-        }
-    }
-
-    fn download_media(&self, items: Vec<MediaDownload>) {
-        let mut downloads = self.downloads.lock().unwrap_or_else(|e| e.into_inner());
-        let mut library = self.items.lock().unwrap_or_else(|e| e.into_inner());
-        let mut dirty: Vec<usize> = Vec::new();
-        for request in items {
-            let mut files = Vec::new();
-            for id in &request.files {
-                files.push((request.torrent_id, *id));
-            }
-            if files.is_empty() {
-                continue;
-            }
-            downloads.insert(request.key.clone(), files);
-            dirty.push(request.torrent_id);
-        }
-        dirty.sort_unstable();
-        dirty.dedup();
-        for id in dirty {
-            let wanted: HashSet<usize> = downloads
-                .values()
-                .filter(|files| files.iter().any(|(torrent, _)| *torrent == id))
-                .flat_map(|files| files.iter())
-                .filter(|(torrent, _)| *torrent == id)
-                .map(|(_, file)| *file)
-                .collect();
-            if let Some(item) = library.iter_mut().find(|i| i.torrent.id == id) {
-                item.kept_files = wanted.iter().copied().collect();
-                item.kept_files.sort_unstable();
-                item.downloading = !item.kept_files.is_empty();
-                item.torrent.stats.state = "live".to_string();
-                item.torrent.state = "live".to_string();
-                for file in &mut item.torrent.files {
-                    file.included = item.kept_files.contains(&file.id);
-                }
-            }
-        }
-    }
-
-    fn stop_media_download(&self, items: Vec<MediaDownload>) {
-        let mut downloads = self.downloads.lock().unwrap_or_else(|e| e.into_inner());
-        let mut affected: HashSet<usize> = HashSet::new();
-        for item in &items {
-            affected.insert(item.torrent_id);
-            if let Some(files) = downloads.get_mut(&item.key) {
-                files.retain(|(torrent, file)| {
-                    !(*torrent == item.torrent_id && item.files.contains(file))
-                });
-                if files.is_empty() {
-                    downloads.remove(&item.key);
-                }
-            }
-        }
-        let mut library = self.items.lock().unwrap_or_else(|e| e.into_inner());
-        for id in affected {
-            let wanted: HashSet<usize> = downloads
-                .values()
-                .flat_map(|files| files.iter())
-                .filter(|(torrent, _)| *torrent == id)
-                .map(|(_, file)| *file)
-                .collect();
-            if let Some(item) = library.iter_mut().find(|i| i.torrent.id == id) {
-                item.kept_files = wanted.iter().copied().collect();
-                item.kept_files.sort_unstable();
-                item.downloading = !item.kept_files.is_empty();
-                if !item.downloading {
-                    item.torrent.stats.state = "paused".to_string();
-                    item.torrent.state = "paused".to_string();
-                }
-                for file in &mut item.torrent.files {
-                    file.included = item.kept_files.contains(&file.id);
-                }
-            }
-        }
-    }
-
-    fn choose_source(&self, key: String, torrent_id: usize, file_id: usize) {
-        self.chosen
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, (torrent_id, file_id));
-    }
-
-    fn chosen_source(&self, key: &str) -> Option<(usize, usize)> {
-        self.chosen
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(key)
-            .copied()
-    }
-
-    fn stop_streaming(&self, id: usize) {
-        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(item) = items.iter_mut().find(|i| i.torrent.id == id) {
-            item.torrent.stats.state = "paused".to_string();
-            item.torrent.state = "paused".to_string();
-        }
-    }
-
-    fn restart_stream(&self, id: usize, files: &[usize]) {
-        self.start_files(id, files);
-    }
-
-    fn is_live(&self, _id: usize) -> bool {
-        // Fixtures are always present; the demo never re-adds torrents.
-        true
-    }
-
-    fn note_playback(&self, _id: usize, _file_id: usize, _position: f64, _duration: Option<f64>) {
-        // The demo has no engine to throttle.
-    }
-
-    fn record_watch(
-        &self,
-        info_hash: &str,
-        file_id: usize,
-        file_name: Option<String>,
-        _title: Option<String>,
-        position: f64,
-        duration: Option<f64>,
-    ) {
-        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(item) = items.iter_mut().find(|i| i.entry.info_hash == info_hash) {
-            let progress = WatchProgress {
-                position,
-                duration,
-                updated_at: now_unix(),
-                file_name,
-                title: None,
-            };
-            item.entry.watch_by_file.insert(file_id, progress.clone());
-            item.entry.watch = Some(progress);
-        }
-    }
-
-    fn mark_finished(&self, info_hash: &str, file_id: usize, _title: Option<String>) {
-        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(item) = items.iter_mut().find(|i| i.entry.info_hash == info_hash) {
-            let duration = item
-                .entry
-                .watch_by_file
-                .get(&file_id)
-                .and_then(|w| w.duration)
-                .or_else(|| item.entry.watch.as_ref().and_then(|w| w.duration))
-                .unwrap_or(100.0);
-            let progress = WatchProgress {
-                position: duration,
-                duration: Some(duration),
-                updated_at: now_unix(),
-                file_name: None,
-                title: None,
-            };
-            item.entry.watch_by_file.insert(file_id, progress.clone());
-            // The torrent-level record is what "continue watching" reads, and
-            // the real backend derives it from the newest per-file entry.
-            item.entry.watch = Some(progress);
-        }
-    }
-
-    fn forget_watch(&self, info_hash: &str, file_id: usize) {
-        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(item) = items.iter_mut().find(|i| i.entry.info_hash == info_hash) {
-            item.entry.watch_by_file.remove(&file_id);
-            item.entry.watch = None;
-        }
-    }
-
-    fn search(&self, query: &reel_catalog::SearchQuery) {
-        // Answer with fixtures, so the UI can be driven without a network.
-        let text = query.text.to_lowercase();
-        let mut results = SearchResults::default();
-        for hit in crate::testing::sample_search_hits() {
-            if hit.title.to_lowercase().contains(&text) || query.text.trim().is_empty() {
-                results.hits.push(hit);
-            }
-        }
-        results
-            .hits
-            .sort_by_key(|hit| std::cmp::Reverse(hit.sort_key()));
-
-        self.events
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(BackendEvent::SearchResults {
-                query: query.describe(),
-                results,
-            });
-        // The demo answers in one batch, so the stream is already over.
-        self.events.lock().unwrap_or_else(|e| e.into_inner()).push(
-            BackendEvent::SearchStreamEnded {
-                query: query.describe(),
-            },
-        );
-    }
-
-    fn search_sources(&self) -> Vec<SourceInfo> {
-        vec![SourceInfo {
-            name: "demo".to_string(),
-            configured: true,
-        }]
-    }
-
-    fn catalog_status(&self) -> CatalogStatus {
-        let mut status = self.catalog_status.clone();
-        let items = self.items.lock().unwrap_or_else(|e| e.into_inner());
-        status.enriched = items.iter().filter(|i| i.entry.metadata.is_some()).count();
-        status
-    }
-
-    fn settings(&self) -> CatalogSettings {
-        self.settings
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    }
-
-    fn save_settings(&self, mut settings: CatalogSettings) {
-        settings.normalise();
-        *self.settings.lock().unwrap_or_else(|e| e.into_inner()) = settings;
-        self.events
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(BackendEvent::Info("settings saved (demo)".to_string()));
-    }
-
-    fn set_api_key(&self, key: Option<String>) {
-        let mut settings = self.settings();
-        settings.tmdb_api_key = key;
-        self.save_settings(settings);
-    }
-
-    fn test_api_key(&self, _key: String) {
-        self.events
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(BackendEvent::ApiKeyChecked {
-                ok: true,
-                message: "The key works (demo).".to_string(),
-            });
-    }
-
-    fn clear_catalog_cache(&self) {
-        self.events
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(BackendEvent::Info("cache cleared (demo)".to_string()));
-    }
-
-    fn refresh_metadata(&self) {
-        self.events
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(BackendEvent::Info("refreshing metadata (demo)".to_string()));
-    }
-
-    fn take_events(&self) -> Vec<BackendEvent> {
-        std::mem::take(&mut *self.events.lock().unwrap_or_else(|e| e.into_inner()))
-    }
-}
-
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::testing::sample_library;
-
-    use super::*;
-
-    fn entry_without_name() -> LibraryEntry {
-        let item = sample_library().into_iter().next().expect("a sample");
-        LibraryEntry {
-            id: 0,
-            info_hash: item.torrent.info_hash.clone(),
-            source: String::new(),
-            name: None,
-            files: Vec::new(),
-            primary_file_id: None,
-            selected_files: Vec::new(),
-            downloading: false,
-            paused: false,
-            added_at: 0,
-        }
-    }
-
-    #[test]
-    fn a_stream_path_names_the_torrent_and_the_file() {
-        let path = stream_path(0, 3, "Show S01E04.mkv");
-        assert_eq!(path, "/stream/0/3/Show%20S01E04.mkv");
-        // Always `stream / <torrent> / <file> / <name>`: a missing file id
-        // makes the router treat the file name as the id and answer 400.
-        assert_eq!(path.trim_start_matches('/').split('/').count(), 4);
-    }
-
-    #[test]
-    fn an_unresolved_magnet_is_not_called_by_its_hash() {
-        let entry = entry_without_name();
-        let (title, year) = display_title_for_entry(&entry);
-        assert_eq!(title, "Resolving magnet\u{2026}");
-        assert_eq!(year, None);
-        assert!(
-            !title.contains(&entry.info_hash),
-            "the info hash should never be shown as a title"
-        );
-    }
-
-    #[test]
-    fn an_empty_name_is_treated_as_no_name() {
-        let mut entry = entry_without_name();
-        entry.name = Some("   ".to_string());
-        assert_eq!(
-            display_title_for_entry(&entry).0,
-            "Resolving magnet\u{2026}"
-        );
-    }
-
-    #[test]
-    fn a_real_name_is_cleaned_as_usual() {
-        let mut entry = entry_without_name();
-        entry.name = Some("The.Matrix.1999.1080p.BluRay.x264-GROUP".to_string());
-        let (title, year) = display_title_for_entry(&entry);
-        assert_eq!(title, "The Matrix");
-        assert_eq!(year, Some(1999));
-    }
-
-    #[test]
-    fn search_metadata_deduplicates_release_variants_of_a_series() {
-        let mut first =
-            reel_catalog::SearchHit::new("The.Bear.S03E01.1080p.WEB-DL.H264-GROUP", "ext.to");
-        first.year = Some(2022);
-        let mut second =
-            reel_catalog::SearchHit::new("The.Bear.S03E02.720p.WEBRip.x265-OTHER", "ext.to");
-        second.year = Some(2022);
-
-        assert_eq!(search_metadata_key(&first), search_metadata_key(&second));
-
-        let query = search_lookup_query(&first);
-        assert_eq!(query.title, "The Bear");
-        assert_eq!(query.year, Some(2022));
-        assert_eq!(query.kind, reel_catalog::MediaKind::Series);
-        assert!(query.seasons.is_empty());
-        assert!(query.episodes.is_empty());
-        assert!(query.air_dates.is_empty());
-    }
-
-    #[test]
-    fn search_metadata_keeps_distinct_work_identities_separate() {
-        let bear = reel_catalog::SearchHit::new("The.Bear.S03E01.1080p", "ext.to");
-        let different_year = reel_catalog::SearchHit {
-            year: Some(2022),
-            ..bear.clone()
-        };
-        let movie = reel_catalog::SearchHit::new("The.Bear.2022.1080p.BluRay", "ext.to");
-
-        assert_ne!(
-            search_metadata_key(&bear),
-            search_metadata_key(&different_year)
-        );
-        assert_ne!(search_metadata_key(&bear), search_metadata_key(&movie));
-    }
-
-    #[test]
-    fn search_metadata_lookup_budget_is_unique_and_bounded() {
-        let mut budget = HashSet::new();
-        for index in 0..MAX_SEARCH_LOOKUPS {
-            assert!(claim_search_lookup_budget(
-                &mut budget,
-                &format!("work-{index}")
-            ));
-        }
-        assert_eq!(budget.len(), MAX_SEARCH_LOOKUPS);
-        assert!(!claim_search_lookup_budget(&mut budget, "one-more-work"));
-        assert!(!claim_search_lookup_budget(&mut budget, "work-0"));
-    }
-
-    #[test]
-    fn search_metadata_lookups_are_spaced_by_the_configured_delay() {
-        let start = Instant::now();
-        assert_eq!(
-            search_lookup_delay_remaining(start, start),
-            Some(SEARCH_LOOKUP_DELAY)
-        );
-        assert_eq!(
-            search_lookup_delay_remaining(start, start + Duration::from_millis(250)),
-            Some(Duration::from_millis(150))
-        );
-        assert_eq!(
-            search_lookup_delay_remaining(start, start + SEARCH_LOOKUP_DELAY),
-            None
-        );
-    }
-}
