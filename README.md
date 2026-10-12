@@ -1,5 +1,8 @@
 # reel
 
+[![CI](https://github.com/goncalompontes/reel/actions/workflows/ci.yml/badge.svg)](https://github.com/goncalompontes/reel/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/goncalompontes/reel?include_prereleases&sort=semver)](https://github.com/goncalompontes/reel/releases)
+
 A native desktop client for streaming torrents, with a Netflix-shaped catalog.
 
 `reel` is a Rust workspace: a torrent engine, an HTTP streaming server, a
