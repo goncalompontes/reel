@@ -43,6 +43,15 @@ pub enum CastError {
         description: String,
     },
 
+    /// The renderer did not reach an expected state in time.
+    #[error("the renderer did not {expected} (it reports {reported})")]
+    Stuck {
+        /// What was expected, e.g. `stop`.
+        expected: &'static str,
+        /// The transport state the renderer actually reported.
+        reported: String,
+    },
+
     /// A discovery search failed.
     #[error("discovery failed: {0}")]
     Discovery(String),

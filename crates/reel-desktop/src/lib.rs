@@ -16,7 +16,7 @@ pub mod ui;
 
 pub use backend::{
     Backend, BackendCapabilities, BackendEvent, CatalogOptions, CatalogStatus, EngineBackend,
-    FakeBackend, LibraryItem, PlayerCapability,
+    FakeBackend, FakeCast, LibraryItem, PlayerCapability,
 };
 pub use player::{PlaybackInfo, PlaybackStats, PlayerController};
 pub use ui::{App, RowLayout, Screen};

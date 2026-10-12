@@ -56,6 +56,11 @@ struct Renderer {
     rel_time: u64,
     duration: u64,
     fail_seek: bool,
+    /// Fault on `Stop` and keep playing, like a wedged renderer.
+    refuse_stop: bool,
+    /// Keep the transport position across `Stop`/`SetAVTransportURI`, like the
+    /// LG that the resume-across-casts bug was reported against.
+    sticky_position: bool,
     actions: Vec<String>,
 }
 
@@ -67,6 +72,8 @@ impl Default for Renderer {
             rel_time: 0,
             duration: 42 * 60 + 31,
             fail_seek: false,
+            refuse_stop: false,
+            sticky_position: false,
             actions: Vec::new(),
         }
     }
@@ -104,6 +111,9 @@ async fn control(State(state): State<Shared>, body: Bytes) -> Response {
     match action.as_str() {
         "SetAVTransportURI" => {
             renderer.uri = element_text(&text, "CurrentURI");
+            if !renderer.sticky_position {
+                renderer.rel_time = 0;
+            }
             renderer.state = "STOPPED".to_string();
             ok(&av_response("SetAVTransportURI", ""))
         }
@@ -116,8 +126,13 @@ async fn control(State(state): State<Shared>, body: Bytes) -> Response {
             ok(&av_response("Pause", ""))
         }
         "Stop" => {
+            if renderer.refuse_stop {
+                return fault(701, "Transition not available");
+            }
             renderer.state = "STOPPED".to_string();
-            renderer.rel_time = 0;
+            if !renderer.sticky_position {
+                renderer.rel_time = 0;
+            }
             ok(&av_response("Stop", ""))
         }
         "Seek" => {
@@ -360,4 +375,175 @@ async fn session_records_a_failure() {
 
     assert!(session.seek(Duration::from_secs(5)).await.is_err());
     assert!(session.state().is_error());
+}
+
+#[tokio::test]
+async fn starting_new_media_stops_a_playing_renderer() {
+    let (addr, renderer) = start().await;
+    let target = connect(addr).await.target().unwrap();
+    let mut session = CastSession::new(Box::new(target), "Episode A");
+    session
+        .start("http://10.0.0.1/media/a.mkv", "<DIDL-Lite/>")
+        .await
+        .unwrap();
+    assert_eq!(renderer.lock().unwrap().state, "PLAYING");
+
+    // Casting straight to the next episode, without pressing Stop first, must
+    // stop the first one before loading the new URI.
+    session
+        .start("http://10.0.0.1/media/b.mkv", "<DIDL-Lite/>")
+        .await
+        .unwrap();
+
+    let renderer = renderer.lock().unwrap();
+    assert_eq!(renderer.uri.as_deref(), Some("http://10.0.0.1/media/b.mkv"));
+    let first_set = renderer
+        .actions
+        .iter()
+        .position(|action| action == "SetAVTransportURI")
+        .unwrap();
+    let second_set = renderer
+        .actions
+        .iter()
+        .rposition(|action| action == "SetAVTransportURI")
+        .unwrap();
+    assert!(
+        renderer.actions[first_set..second_set]
+            .iter()
+            .any(|action| action == "Stop"),
+        "expected a Stop between the two URIs: {:?}",
+        renderer.actions
+    );
+}
+
+#[tokio::test]
+async fn start_seeks_back_when_the_renderer_keeps_its_position() {
+    let (addr, renderer) = start().await;
+    {
+        let mut renderer = renderer.lock().unwrap();
+        renderer.sticky_position = true;
+        renderer.state = "STOPPED".to_string();
+        // Episode A was stopped at 5:00, but the transport kept the position.
+        renderer.rel_time = 300;
+    }
+
+    let target = connect(addr).await.target().unwrap();
+    let mut session = CastSession::new(Box::new(target), "Episode B");
+    session
+        .start("http://10.0.0.1/media/b.mkv", "<DIDL-Lite/>")
+        .await
+        .unwrap();
+
+    assert_eq!(session.position(), Some(Duration::ZERO));
+    assert_eq!(renderer.lock().unwrap().rel_time, 0);
+    assert!(
+        renderer
+            .lock()
+            .unwrap()
+            .actions
+            .iter()
+            .any(|action| action == "Seek"),
+        "expected a seek back to the start"
+    );
+}
+
+#[tokio::test]
+async fn start_at_seeks_to_the_hand_off_position() {
+    let (addr, renderer) = start().await;
+    let target = connect(addr).await.target().unwrap();
+    let mut session = CastSession::new(Box::new(target), "Episode B");
+    session
+        .start_at(
+            "http://10.0.0.1/media/b.mkv",
+            "<DIDL-Lite/>",
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(session.position(), Some(Duration::from_secs(300)));
+    assert_eq!(renderer.lock().unwrap().rel_time, 300);
+    assert!(
+        renderer
+            .lock()
+            .unwrap()
+            .actions
+            .iter()
+            .any(|action| action == "Seek"),
+        "expected a seek to the hand-off position"
+    );
+}
+
+#[tokio::test]
+async fn start_at_overrides_a_sticky_position() {
+    let (addr, renderer) = start().await;
+    {
+        let mut renderer = renderer.lock().unwrap();
+        renderer.sticky_position = true;
+        renderer.state = "STOPPED".to_string();
+        // The renderer kept an old position from a previous cast.
+        renderer.rel_time = 1000;
+    }
+
+    let target = connect(addr).await.target().unwrap();
+    let mut session = CastSession::new(Box::new(target), "Episode B");
+    session
+        .start_at(
+            "http://10.0.0.1/media/b.mkv",
+            "<DIDL-Lite/>",
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(session.position(), Some(Duration::from_secs(300)));
+    assert_eq!(renderer.lock().unwrap().rel_time, 300);
+}
+
+#[tokio::test]
+async fn stopping_clears_the_position() {
+    // The desktop hand-off reads the position *before* stopping for this reason;
+    // pin it so a caller does not silently report 0:00.
+    let (addr, _renderer) = start().await;
+    let target = connect(addr).await.target().unwrap();
+    let mut session = CastSession::new(Box::new(target), "Episode A");
+    session
+        .start("http://10.0.0.1/media/a.mkv", "<DIDL-Lite/>")
+        .await
+        .unwrap();
+    session.seek(Duration::from_secs(300)).await.unwrap();
+    assert_eq!(session.position(), Some(Duration::from_secs(300)));
+
+    session.stop().await.unwrap();
+    assert_eq!(session.position(), None);
+    assert_eq!(session.state(), &SessionState::Stopped);
+}
+
+#[tokio::test]
+async fn a_refused_stop_is_reported() {
+    let (addr, renderer) = start().await;
+    let target = connect(addr).await.target().unwrap();
+    let mut session = CastSession::new(Box::new(target), "Episode A");
+    session
+        .start("http://10.0.0.1/media/a.mkv", "<DIDL-Lite/>")
+        .await
+        .unwrap();
+    assert_eq!(session.state(), &SessionState::Playing);
+
+    // The renderer now refuses to stop while continuing to play.
+    renderer.lock().unwrap().refuse_stop = true;
+    let error = session.stop().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            CastError::Fault {
+                code: Some(701),
+                ..
+            }
+        ),
+        "got {error:?}"
+    );
+    // The session must not pretend the renderer stopped.
+    assert!(session.state().is_error());
+    assert_eq!(renderer.lock().unwrap().state, "PLAYING");
 }

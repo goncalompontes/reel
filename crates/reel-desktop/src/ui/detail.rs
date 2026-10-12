@@ -57,10 +57,15 @@ impl App {
             Some(DetailAction::PlayWorkFromStart) => self.restart_work(work_id),
             Some(DetailAction::Cast) => {
                 if let Some((torrent_id, file_id)) = self.work_target(&work) {
-                    if let Some(info_hash) =
-                        self.item(torrent_id).map(|item| item.entry.info_hash.clone())
-                    {
-                        self.request_cast(torrent_id, info_hash, file_id, work.heading());
+                    if let Some(item) = self.item(torrent_id) {
+                        let target = CastTarget {
+                            torrent_id,
+                            info_hash: item.entry.info_hash.clone(),
+                            file_id,
+                            title: work.heading(),
+                            start_at: resume_start_at(&item, file_id),
+                        };
+                        self.request_cast(target);
                     }
                 }
             }

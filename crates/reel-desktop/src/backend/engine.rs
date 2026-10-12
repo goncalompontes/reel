@@ -287,6 +287,7 @@ impl EngineBackend {
 
         // Casting is opt-in: it opens a LAN-facing media port, so it only runs
         // when the setting is on and ffmpeg is available.
+        let events: Arc<Mutex<Vec<BackendEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let cast_config = CastConfig::from_settings(&catalog_options.settings);
         let (cast, cast_unavailable) = match CastService::new(
             engine.clone(),
@@ -294,6 +295,7 @@ impl EngineBackend {
             data_dir.clone(),
             &catalog_options.settings,
             runtime.handle().clone(),
+            cast_ended_hook(events.clone()),
         ) {
             Ok(service) => {
                 service.refresh_devices();
@@ -309,7 +311,7 @@ impl EngineBackend {
             runtime,
             engine,
             base_url,
-            events: Arc::new(Mutex::new(Vec::new())),
+            events,
             capabilities,
             shutdown: Mutex::new(Some(shutdown_tx)),
             catalog,
@@ -389,6 +391,7 @@ impl EngineBackend {
                 self.catalog.data_dir.clone(),
                 settings,
                 self.runtime.handle().clone(),
+                cast_ended_hook(self.events.clone()),
             ) {
                 Ok(service) => {
                     service.refresh_devices();
@@ -1565,6 +1568,17 @@ async fn play_when_ready(ctx: AddContext, torrent_id: usize, info_hash: String) 
     }
 }
 
+/// The hook a [`CastService`] calls when a cast ends, pushing the event the UI
+/// uses to hand playback back to this machine.
+fn cast_ended_hook(events: Arc<Mutex<Vec<BackendEvent>>>) -> crate::cast::EndedHook {
+    Arc::new(move |position, duration| {
+        events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(BackendEvent::CastEnded { position, duration });
+    })
+}
+
 impl Backend for EngineBackend {
     fn capabilities(&self) -> &BackendCapabilities {
         &self.capabilities
@@ -1607,9 +1621,16 @@ impl Backend for EngineBackend {
         }
     }
 
-    fn start_cast(&self, udn: String, info_hash: String, file_id: usize, title: String) {
+    fn start_cast(
+        &self,
+        udn: String,
+        info_hash: String,
+        file_id: usize,
+        title: String,
+        start_at: Option<Duration>,
+    ) {
         if let Some(cast) = self.cast() {
-            cast.start_cast(udn, info_hash, file_id, title);
+            cast.start_cast(udn, info_hash, file_id, title, start_at);
         }
     }
 

@@ -211,6 +211,20 @@ impl SearchLayout {
     }
 }
 
+/// A title chosen to cast, plus where the picture should start.
+///
+/// `start_at` is the hand-off position: the local player's position when it is
+/// open on this file, otherwise the saved watch position. It makes a cast
+/// continue from where this machine was, rather than restarting.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CastTarget {
+    torrent_id: usize,
+    info_hash: String,
+    file_id: usize,
+    title: String,
+    start_at: Option<f64>,
+}
+
 pub struct App {
     backend: Box<dyn Backend>,
     /// Where the content area is: a rail destination plus any pushed views.
@@ -293,15 +307,16 @@ pub struct App {
     /// Which Settings pane is showing.
     settings_section: SettingsSection,
     /// The cast picker popover, and the file to cast when a device is chosen.
-    /// The target is `(torrent id, info hash, file id, title)`; the info hash
-    /// resolves the live engine id, which changes when a stream is re-added.
     cast_open: bool,
-    cast_pending: Option<(usize, String, usize, String)>,
+    cast_pending: Option<CastTarget>,
     /// The "Add by address" text in the cast picker.
     cast_address: String,
-    /// A cast waiting for its title to start streaming:
-    /// `(udn, torrent id, info hash, file id, title)`.
-    pending_cast: Option<(String, usize, String, usize, String)>,
+    /// A cast waiting for its title to start streaming: the chosen device UDN
+    /// and the title to cast.
+    pending_cast: Option<(String, CastTarget)>,
+    /// The cast actually running, remembered so stopping it can hand playback
+    /// back to this machine. Set when the renderer starts, cleared when it ends.
+    casting: Option<CastTarget>,
     /// Whether the full cast remote is open. The cast keeps running when it is
     /// closed; the header/rail control reopens it.
     cast_view_open: bool,
@@ -318,8 +333,9 @@ pub struct App {
     player_help: bool,
     /// Torrent id the player was started from, to return to.
     player_origin: Option<usize>,
-    /// A play request waiting for its temporary torrent to be brought back.
-    pending_play: Option<(usize, usize)>,
+    /// A play request waiting for its temporary torrent to be brought back,
+    /// with an optional explicit start position overriding the saved one.
+    pending_play: Option<(usize, usize, Option<f64>)>,
     /// Frames and playback position seen last time progress was checked, so a
     /// wedge (frozen picture *and* frozen clock) can be told from a slow stream
     /// (which is still making progress) and from a normal scene that happens to
@@ -407,6 +423,7 @@ impl App {
             cast_pending: None,
             cast_address: String::new(),
             pending_cast: None,
+            casting: None,
             cast_view_open: false,
             player: PlayerController::new(),
             player_last_activity: Instant::now(),
@@ -711,6 +728,17 @@ impl App {
     /// until [`crate::backend::BackendEvent::Ready`], and the URL is read from
     /// the refreshed library at that point.
     pub fn play_file(&mut self, _ctx: &egui::Context, torrent_id: usize, file_id: usize) {
+        self.prepare_play(torrent_id, file_id, None);
+    }
+
+    /// Play a file, resuming at an explicit position instead of the saved watch
+    /// position. Used to hand a cast back to this machine.
+    pub fn play_file_at(&mut self, torrent_id: usize, file_id: usize, position: f64) {
+        self.prepare_play(torrent_id, file_id, Some(position));
+    }
+
+    /// The shared body of [`Self::play_file`] and [`Self::play_file_at`].
+    fn prepare_play(&mut self, torrent_id: usize, file_id: usize, start_at: Option<f64>) {
         let Some(item) = self.item(torrent_id) else {
             self.warn("That torrent is no longer in the library");
             return;
@@ -730,12 +758,12 @@ impl App {
 
         self.stream_recovered = false;
         self.start_streaming(torrent_id, &selection);
-        self.pending_play = Some((torrent_id, file_id));
+        self.pending_play = Some((torrent_id, file_id, start_at));
         self.set_toast("Preparing to stream\u{2026}", false);
     }
 
     /// Open the player for a file that the backend has confirmed is ready.
-    fn open_player(&mut self, torrent_id: usize, file_id: usize) {
+    fn open_player(&mut self, torrent_id: usize, file_id: usize, start_at: Option<f64>) {
         let Some(item) = self.item(torrent_id) else {
             self.warn("That torrent is no longer in the library");
             return;
@@ -747,8 +775,9 @@ impl App {
 
         // Resume the *file* that was actually being watched, not the torrent as
         // a whole: a series is one torrent with many episodes. The torrent-level
-        // record is only a fallback for a single-file title.
-        let start_at = resume_start_at(&item, file_id);
+        // record is only a fallback for a single-file title. An explicit position
+        // (a cast handing back) overrides it.
+        let start_at = start_at.or_else(|| resume_start_at(&item, file_id));
 
         let companions = companion_subtitles(&item.torrent.files, file);
         let subtitles: Vec<(String, String)> = companions
@@ -1040,28 +1069,39 @@ impl App {
                 }
                 BackendEvent::Ready { info_hash } => {
                     self.refresh();
-                    if let Some((torrent_id, file_id)) = self.pending_play {
+                    if let Some((torrent_id, file_id, start_at)) = self.pending_play {
                         let matches = self
                             .item(torrent_id)
                             .is_some_and(|item| item.entry.info_hash == info_hash);
                         if matches {
                             self.pending_play = None;
-                            self.open_player(torrent_id, file_id);
+                            self.open_player(torrent_id, file_id, start_at);
                         }
                     }
                     // A cast that was waiting for its title to come up.
-                    if let Some((udn, torrent_id, info_hash, file_id, title)) =
-                        self.pending_cast.clone()
-                    {
+                    if let Some((udn, target)) = self.pending_cast.clone() {
                         let matches = self
-                            .item(torrent_id)
+                            .item(target.torrent_id)
                             .is_some_and(|item| item.entry.info_hash == info_hash);
                         if matches {
                             self.pending_cast = None;
-                            self.backend
-                                .start_cast(udn, info_hash, file_id, title);
+                            self.hand_over_to_cast(&target);
+                            self.backend.start_cast(
+                                udn,
+                                target.info_hash.clone(),
+                                target.file_id,
+                                target.title.clone(),
+                                target.start_at.map(Duration::from_secs_f64),
+                            );
+                            self.casting = Some(target);
                         }
                     }
+                }
+                BackendEvent::CastEnded {
+                    position,
+                    duration,
+                } => {
+                    self.on_cast_ended(position, duration);
                 }
                 BackendEvent::PlayReady {
                     torrent_id,
@@ -1439,14 +1479,75 @@ mod tests {
     #[test]
     fn requesting_a_cast_remembers_the_target_and_opens_the_picker() {
         let mut app = app();
-        app.request_cast(7, "abc123".to_string(), 3, "Episode 1".to_string());
+        app.request_cast(CastTarget {
+            torrent_id: 7,
+            info_hash: "abc123".to_string(),
+            file_id: 3,
+            title: "Episode 1".to_string(),
+            start_at: None,
+        });
         assert!(app.cast_open, "the device picker should open");
         assert_eq!(
             app.cast_pending,
-            Some((7, "abc123".to_string(), 3, "Episode 1".to_string()))
+            Some(CastTarget {
+                torrent_id: 7,
+                info_hash: "abc123".to_string(),
+                file_id: 3,
+                title: "Episode 1".to_string(),
+                start_at: None,
+            })
         );
         // The fake backend has no casting, so the picker explains why.
         assert!(app.backend.cast_unavailable().is_some());
+    }
+
+    #[test]
+    fn ending_a_cast_hands_playback_back_at_its_position() {
+        let mut app = app();
+        // A cast of Sintel (torrent 3, file 0) is running.
+        app.casting = Some(CastTarget {
+            torrent_id: 3,
+            info_hash: "abc123".to_string(),
+            file_id: 0,
+            title: "Sintel".to_string(),
+            start_at: None,
+        });
+
+        app.on_cast_ended(
+            Some(Duration::from_secs(754)),
+            Some(Duration::from_secs(1800)),
+        );
+
+        assert!(
+            app.casting.is_none(),
+            "the cast should be forgotten once it ends"
+        );
+        assert_eq!(
+            app.pending_play,
+            Some((3, 0, Some(754.0))),
+            "playback should resume here at the cast position"
+        );
+    }
+
+    #[test]
+    fn a_cast_that_finished_does_not_resume_here() {
+        let mut app = app();
+        app.casting = Some(CastTarget {
+            torrent_id: 3,
+            info_hash: "abc123".to_string(),
+            file_id: 0,
+            title: "Sintel".to_string(),
+            start_at: None,
+        });
+
+        // Stopped 5 seconds from the end: nothing worth resuming.
+        app.on_cast_ended(
+            Some(Duration::from_secs(1795)),
+            Some(Duration::from_secs(1800)),
+        );
+
+        assert!(app.casting.is_none());
+        assert_eq!(app.pending_play, None);
     }
 
     #[test]

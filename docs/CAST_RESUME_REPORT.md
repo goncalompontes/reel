@@ -1,7 +1,10 @@
-# Cast: playback resumes across casts (open bug)
+# Cast: playback resumes across casts (fixed)
 
-Status: **open bug, for a future session.** Nothing here is implemented; this is
-a report, not a plan we have started.
+Status: **fixed.** The renderer is now treated as a state machine and every
+transition is verified: `Stop` is confirmed via `GetTransportInfo` before the
+app forgets the cast, new media is only loaded once the transport is stopped,
+and a position the renderer failed to reset is diagnosed and corrected. The
+diagnosis below is kept for context; the section **Fix** describes what changed.
 
 ## Symptom
 
@@ -40,7 +43,7 @@ Appending a unique `?cast=<n>` query to the media URL, an unconditional
 `Seek 0` before `Play`, and a Stop retry. Reverted as a hack: it masks the cause
 and changes behaviour blindly. Fix the state machine instead.
 
-## Hypotheses (ranked)
+## Hypotheses (ranked) — 1 and 3 confirmed, 2 covered defensively
 
 1. **Stop is best-effort.** `CastSession::start`
    (`crates/reel-cast/src/session.rs`) sends `Stop` first but **ignores its
@@ -54,22 +57,33 @@ and changes behaviour blindly. Fix the state machine instead.
    clear_status_locked(...)` **even when the renderer refused the Stop**, so
    "Stop casting" looks done in-app while the TV keeps playing.
 
-## Proposed fix (proper)
+## Fix (implemented)
 
-Treat the renderer as a state machine and **verify transitions**:
+The renderer is now treated as a state machine and transitions are verified,
+which addresses hypotheses 1–3:
 
-- `stop()` → send `Stop`, then poll `GetTransportInfo` until `STOPPED` (bounded,
-  with one retry); only then consider it stopped, and surface a failure.
-- Before `SetAVTransportURI`, ensure the transport is `STOPPED`.
-- After `Set` + `Play`, poll `GetTransportInfo` for `PLAYING` and read
-  `GetPositionInfo`; seek to 0 **only if** `RelTime` is materially non-zero
-  (diagnosed, not blunt).
-- Do **not** clear app state until the renderer confirms the stop.
-- Decide per-cast media identity deliberately: if the renderer keys resume by
-  URL, make the URL unique per cast — but as an explicit, documented decision,
-  not a silent query parameter.
+- `CastSession::stop` (`crates/reel-cast/src/session.rs`) sends `Stop` (with one
+  retry on a fault), then checks `GetTransportInfo` and only reports success —
+  and clears the position — once the transport reads `STOPPED`/`NO_MEDIA_PRESENT`.
+  A refused `Stop` is surfaced as an error instead of being ignored.
+- `CastSession::start` calls `stop_if_needed` first: it only loads the new URI
+  once the transport is confirmed stopped, so a still-playing or wedged renderer
+  cannot resume the old media. If it will not stop, the cast fails loudly.
+- After `Set` + `Play`, `CastSession::correct_start_position` reads
+  `GetPositionInfo` and seeks to 0 **only if** `RelTime` is materially non-zero
+  (> 3 s), so a renderer that failed to reset its single transport position is
+  corrected without seeking a stream that already started at the beginning.
+- `CastService::control` (`crates/reel-desktop/src/cast.rs`) only drops the
+  session and clears the status once `stop()` confirms; on failure it keeps the
+  cast visible with a failure message (and stops the poll loop from overwriting
+  it), so "Stop casting" no longer looks done while the TV keeps playing.
+- No per-cast URL uniqueness was added: the state machine above makes it
+  unnecessary, and the earlier `?cast=<n>` hack stays reverted.
 
-## Reproduce / diagnose next session
+Covered by `crates/reel-cast/tests/control.rs`: `starting_new_media_stops_a_playing_renderer`,
+`start_seeks_back_when_the_renderer_keeps_its_position`, `a_refused_stop_is_reported`.
+
+## Reproduce / diagnose on the real TV
 
 - TV name + capabilities:
   `cargo run -p reel-cast --example find_tv -- <tv-ip>` (prints `hevc/ac3/eac3/
@@ -94,17 +108,23 @@ Treat the renderer as a state machine and **verify transitions**:
 
 ## Files
 
-- `crates/reel-cast/src/session.rs` — `CastSession::start` / `stop` (Stop is
-  best-effort, errors ignored).
+- `crates/reel-cast/src/session.rs` — `CastSession::start` / `stop`, plus
+  `stop_if_needed`, `settle_until` and `settle_position` (the verified state
+  machine; `start_at` added the two-way hand-off).
 - `crates/reel-cast/src/target.rs` — `DlnaTarget` SOAP (`stop`, `play`, `seek`,
   `position_info`, `transport_info`).
-- `crates/reel-desktop/src/cast.rs` — `CastService::start_cast`, `control`,
+- `crates/reel-desktop/src/cast.rs` — `CastService::start_cast`, `control`
+  (only clears the cast once the stop is confirmed),
   `prepare_and_start`.
 - `crates/reel-desktop/src/ui/cast.rs` — the cast bar and remote ("Stop" →
   `cast_action(Stop)`).
+- `crates/reel-cast/tests/control.rs` — the regression tests.
 
 ## Acceptance
 
 - Cast A, stop part-way, cast B → **B starts at 0:00**.
 - "Stop casting" leaves the renderer `STOPPED` (verified via `GetTransportInfo`)
   with nothing playing.
+
+Both are exercised against the fake renderer in `control.rs`; the real-TV check
+below remains for a manual pass.

@@ -339,7 +339,9 @@ impl App {
         // A wedged picture is as likely to be the decoder as the fetch, so the
         // core is dropped too; the next play builds a fresh one.
         self.player.reset();
-        self.pending_play = Some((info.torrent_id, info.file_id));
+        // Reopen where it froze, not from the last saved watch position.
+        let resume = (state.position >= 1.0).then_some(state.position);
+        self.pending_play = Some((info.torrent_id, info.file_id, resume));
         self.backend
             .restart_stream(info.torrent_id, &[info.file_id]);
         self.set_toast("Reconnecting the stream\u{2026}", false);

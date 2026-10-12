@@ -36,7 +36,7 @@ mod engine;
 mod fake;
 
 pub use engine::{CatalogOptions, EngineBackend};
-pub use fake::FakeBackend;
+pub use fake::{FakeBackend, FakeCast};
 // The engine's helpers are used by the tests below.
 #[allow(unused_imports)]
 pub(crate) use engine::*;
@@ -198,6 +198,15 @@ pub enum BackendEvent {
     },
     /// Watch positions changed.
     WatchUpdated,
+    /// The active cast ended — the user stopped it, or the renderer did. The
+    /// UI hands playback back to this machine at `position`, unless it looks
+    /// finished.
+    CastEnded {
+        /// Last known cast position.
+        position: Option<Duration>,
+        /// Media duration, when known.
+        duration: Option<Duration>,
+    },
     /// The result of checking an API key.
     ApiKeyChecked {
         ok: bool,
@@ -451,8 +460,17 @@ pub trait Backend {
     ///
     /// Keyed by info hash, not the library id: a stream-only title is re-added
     /// on demand and its engine id can change, so the id must be resolved when
-    /// the cast actually starts.
-    fn start_cast(&self, _udn: String, _info_hash: String, _file_id: usize, _title: String) {}
+    /// the cast actually starts. When `start_at` is set the renderer is seeked
+    /// there, so a cast hands the picture over from the local player.
+    fn start_cast(
+        &self,
+        _udn: String,
+        _info_hash: String,
+        _file_id: usize,
+        _title: String,
+        _start_at: Option<Duration>,
+    ) {
+    }
 
     /// Control the active cast.
     fn cast_action(&self, _action: crate::cast::CastAction) {}

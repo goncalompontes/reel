@@ -2,14 +2,45 @@
 //!
 //! The session is deliberately protocol-agnostic — it drives a boxed
 //! [`CastTarget`], so the same code will work for a future Google Cast target.
-//! It holds no timers: the caller decides when to [`CastSession::poll`] (the
-//! desktop polls about once a second while casting).
+//! The desktop polls [`CastSession::poll`] about once a second for status; the
+//! only other waiting is the short, bounded settle inside
+//! [`CastSession::start`] and [`CastSession::stop`], which verifies the
+//! renderer actually reached the state it was told to.
 
 use std::time::Duration;
 
 use crate::TransportState;
 use crate::error::{CastError, Result};
 use crate::target::CastTarget;
+
+/// How long to give a renderer to reach an expected transport state.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long between transport-state checks while settling.
+const SETTLE_INTERVAL: Duration = Duration::from_millis(200);
+
+/// A position at or below this right after `Play` counts as "at the start".
+/// Above it, the renderer resumed an old position and is seeked back.
+const NEAR_START: Duration = Duration::from_secs(3);
+
+/// Whether a transport state means "not playing" for our purposes.
+fn is_stopped(state: TransportState) -> bool {
+    matches!(
+        state,
+        TransportState::Stopped | TransportState::NoMediaPresent
+    )
+}
+
+/// Whether a transport state means the renderer is ready to be seeked.
+fn is_playable(state: TransportState) -> bool {
+    matches!(
+        state,
+        TransportState::Playing
+            | TransportState::PausedPlayback
+            | TransportState::FastForward
+            | TransportState::Rewind
+    )
+}
 
 /// What a session is doing right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,13 +137,39 @@ impl CastSession {
 
     /// Hand the renderer a media URL plus its DIDL-Lite metadata and start it.
     pub async fn start(&mut self, media_url: impl Into<String>, metadata: &str) -> Result<()> {
+        self.begin(media_url, metadata, None).await
+    }
+
+    /// Start media and hand playback over at `position`.
+    ///
+    /// Used when a title moves from this machine to the renderer: the renderer
+    /// is started, then seeked to where the local player had got to.
+    pub async fn start_at(
+        &mut self,
+        media_url: impl Into<String>,
+        metadata: &str,
+        position: Duration,
+    ) -> Result<()> {
+        self.begin(media_url, metadata, Some(position)).await
+    }
+
+    /// Start media, optionally at a handed-over position.
+    async fn begin(
+        &mut self,
+        media_url: impl Into<String>,
+        metadata: &str,
+        start_at: Option<Duration>,
+    ) -> Result<()> {
         self.media_url = media_url.into();
+        self.position = None;
+        self.duration = None;
         self.state = SessionState::Connecting;
 
-        // Clear stale transport state first: a renderer left transitioning or in
-        // an error (for example after a declined prompt) refuses `Play` with
-        // "Transition not available" (701). `Stop` is best-effort.
-        let _ = self.target.stop().await;
+        // Clear any previous media and verify the renderer really stopped before
+        // loading the new URI. A renderer still playing — or wedged in
+        // `TRANSITIONING` — can ignore the new URI and resume the previous
+        // episode's position, which is the resume-across-casts bug this guards.
+        self.stop_if_needed().await?;
 
         let result = match self.target.set_uri(&self.media_url, metadata).await {
             Ok(()) => self.target.play().await,
@@ -125,12 +182,17 @@ impl CastSession {
                 code: Some(701), ..
             }) => {
                 let _ = self.target.stop().await;
+                let _ = self.settle_until(is_stopped).await;
                 self.target.play().await
             }
             other => other,
         };
 
-        self.apply(result, SessionState::Playing)
+        let result = self.apply(result, SessionState::Playing);
+        if result.is_ok() {
+            self.settle_position(start_at).await;
+        }
+        result
     }
 
     /// Pause playback.
@@ -145,11 +207,144 @@ impl CastSession {
         self.apply(result, SessionState::Playing)
     }
 
-    /// Stop playback.
+    /// Stop playback, and verify the renderer actually stopped.
+    ///
+    /// The reply alone is not trusted: a renderer can accept `Stop` and keep
+    /// playing, or fault (701) while wedged in `TRANSITIONING`. After the
+    /// request the transport is checked, and success — with the position
+    /// cleared — is only reported once it reads `STOPPED`.
     pub async fn stop(&mut self) -> Result<()> {
-        let result = self.target.stop().await;
+        // A renderer wedged in `TRANSITIONING` often faults on the first `Stop`;
+        // one retry clears it.
+        let request = match self.target.stop().await {
+            Err(first) => {
+                tracing::debug!(%first, "stop faulted; retrying once");
+                self.target.stop().await
+            }
+            ok => ok,
+        };
+
+        // A refused `Stop` (both attempts faulted) will not settle, so decide
+        // with a single check instead of waiting the timeout out.
+        if let Err(error) = request {
+            if self.transport_is_stopped().await {
+                return self.confirm_stopped();
+            }
+            self.state = SessionState::Error(error.to_string());
+            return Err(error);
+        }
+
+        // `Stop` was accepted; it may take a moment for the renderer to settle.
+        match self.settle_until(is_stopped).await {
+            Ok(state) if is_stopped(state) => self.confirm_stopped(),
+            Ok(state) => {
+                let error = CastError::Stuck {
+                    expected: "stop",
+                    reported: state.to_string(),
+                };
+                self.state = SessionState::Error(error.to_string());
+                Err(error)
+            }
+            Err(error) => {
+                self.state = SessionState::Error(error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    /// Record a stop only after the renderer confirmed it.
+    fn confirm_stopped(&mut self) -> Result<()> {
         self.position = None;
-        self.apply(result, SessionState::Stopped)
+        self.state = SessionState::Stopped;
+        Ok(())
+    }
+
+    /// Stop the renderer, unless it already reports stopped.
+    async fn stop_if_needed(&mut self) -> Result<()> {
+        if self.transport_is_stopped().await {
+            return Ok(());
+        }
+        self.stop().await
+    }
+
+    /// Whether the renderer reports a stopped (or media-less) transport.
+    async fn transport_is_stopped(&self) -> bool {
+        matches!(self.transport_state().await, Ok(state) if is_stopped(state))
+    }
+
+    /// The renderer's current transport state.
+    async fn transport_state(&self) -> Result<TransportState> {
+        let info = self.target.transport_info().await?;
+        Ok(TransportState::parse(&info.state))
+    }
+
+    /// Poll the transport until `done` accepts the state, or [`SETTLE_TIMEOUT`]
+    /// passes; returns the last state the renderer reported.
+    async fn settle_until(&self, done: impl Fn(TransportState) -> bool) -> Result<TransportState> {
+        let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
+        loop {
+            let state = self.transport_state().await?;
+            if done(state) || tokio::time::Instant::now() >= deadline {
+                return Ok(state);
+            }
+            tokio::time::sleep(SETTLE_INTERVAL).await;
+        }
+    }
+
+    /// Put the renderer at the wanted position once it is playing.
+    ///
+    /// `wanted` is a hand-off position from the local player. Without one, a
+    /// renderer that kept an old transport position (the LG behaviour) is reset
+    /// to the start. Only a materially non-zero difference is corrected, so a
+    /// stream that already began at the right place is not disturbed.
+    async fn settle_position(&mut self, wanted: Option<Duration>) {
+        let Ok(info) = self.target.position_info().await else {
+            return;
+        };
+        if let Some(rel) = info
+            .rel_time
+            .as_deref()
+            .and_then(crate::soap::parse_rel_time)
+        {
+            self.position = Some(rel);
+        }
+        if let Some(duration) = info
+            .track_duration
+            .as_deref()
+            .and_then(crate::soap::parse_rel_time)
+        {
+            self.duration = Some(duration);
+        }
+
+        let current = self.position.unwrap_or_default();
+        let target = match wanted {
+            // A hand-off position worth seeking to.
+            Some(wanted) if wanted > NEAR_START => wanted,
+            // Handing over from the very start: already there.
+            Some(_) => return,
+            // No hand-off: reset a stale position (the resume-across-casts bug).
+            None if current > NEAR_START => Duration::ZERO,
+            None => return,
+        };
+        if target == current {
+            return;
+        }
+
+        // A renderer still `TRANSITIONING` may refuse the seek; give it a moment.
+        let _ = self.settle_until(is_playable).await;
+        tracing::info!(
+            position = %crate::soap::format_rel_time(target),
+            "seeking the renderer to the hand-off position"
+        );
+        // One retry: a renderer that has only just started can refuse the first.
+        if self.target.seek(target).await.is_ok() || self.target.seek(target).await.is_ok() {
+            self.position = Some(target);
+        } else {
+            tracing::warn!(
+                position = %crate::soap::format_rel_time(target),
+                "the renderer refused to seek to the hand-off position"
+            );
+        }
     }
 
     /// Seek to an absolute offset.

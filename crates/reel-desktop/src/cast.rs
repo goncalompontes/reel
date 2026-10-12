@@ -34,6 +34,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Cap on the conversion cache.
 const CACHE_LIMIT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
+/// Notified with the last position and duration when a cast ends — the user
+/// stopped it, or the renderer did — so the app can hand playback back to this
+/// machine. Kept as a callback so this module stays free of backend types.
+pub type EndedHook = Arc<dyn Fn(Option<Duration>, Option<Duration>) + Send + Sync>;
+
 /// A renderer as the UI needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
@@ -128,6 +133,8 @@ pub struct CastService {
     /// MP4 sample-entry tag for the current live remux (`hvc1` for HEVC), set
     /// when a cast is prepared and read by the live source.
     remux_tag: Arc<Mutex<Option<String>>>,
+    /// Called when a cast ends, so playback can resume locally.
+    on_ended: EndedHook,
 }
 
 impl CastService {
@@ -141,6 +148,7 @@ impl CastService {
         data_dir: PathBuf,
         settings: &CatalogSettings,
         runtime: tokio::runtime::Handle,
+        on_ended: EndedHook,
     ) -> Result<CastService, String> {
         if !settings.allow_lan_streaming {
             return Err("streaming to the local network is turned off".to_string());
@@ -226,6 +234,7 @@ impl CastService {
             session: Arc::new(tokio::sync::Mutex::new(None)),
             shutdown: Mutex::new(Some(shutdown_tx)),
             remux_tag,
+            on_ended,
         })
     }
 
@@ -350,7 +359,17 @@ impl CastService {
     }
 
     /// Cast a torrent file to the device with the given UDN.
-    pub fn start_cast(&self, udn: String, info_hash: String, file_id: usize, title: String) {
+    ///
+    /// `start_at` hands the picture over from the local player: the renderer is
+    /// seeked to that position once it is playing.
+    pub fn start_cast(
+        &self,
+        udn: String,
+        info_hash: String,
+        file_id: usize,
+        title: String,
+        start_at: Option<Duration>,
+    ) {
         let device = self
             .inner
             .lock()
@@ -403,6 +422,7 @@ impl CastService {
         let inner = self.inner.clone();
         let remux_tag = self.remux_tag.clone();
         let force_passthrough = *self.passthrough.lock().unwrap_or_else(|e| e.into_inner());
+        let on_ended = self.on_ended.clone();
 
         self.runtime.spawn(async move {
             let result = prepare_and_start(
@@ -419,6 +439,7 @@ impl CastService {
                 &title,
                 &remux_tag,
                 force_passthrough,
+                start_at,
             )
             .await;
 
@@ -454,15 +475,24 @@ impl CastService {
                 }
                 let mut guard = session_slot.lock().await;
                 let Some(session) = guard.as_mut() else { break };
+                // Remember the last position: a renderer that resets to 0:00 on
+                // stop must not erase where the picture actually was.
+                let before = (session.position(), session.duration());
                 if session.poll().await.is_err() {
                     // `poll` records the error in the session state.
                 }
                 let status = status_of(device.name(), &title, session);
                 let ended = matches!(session.state(), SessionState::Stopped);
                 let failed = matches!(session.state(), SessionState::Error(_));
+                let position = match session.position() {
+                    Some(position) if position.as_secs_f64() > 1.0 => Some(position),
+                    _ => before.0,
+                };
+                let duration = session.duration().or(before.1);
                 drop(guard);
                 if ended {
                     clear_status_locked(&inner);
+                    on_ended(position, duration);
                 } else {
                     set_status_locked(&inner, status);
                 }
@@ -477,6 +507,7 @@ impl CastService {
     pub fn control(&self, action: CastAction) {
         let session = self.session.clone();
         let inner = self.inner.clone();
+        let on_ended = self.on_ended.clone();
         self.runtime.spawn(async move {
             let mut guard = session.lock().await;
             let Some(session) = guard.as_mut() else {
@@ -485,13 +516,34 @@ impl CastService {
             let result = match action {
                 CastAction::Pause => session.pause().await,
                 CastAction::Resume => session.resume().await,
+                CastAction::Seek(position) => session.seek(position).await,
                 CastAction::Stop => {
+                    // Capture where it got to *before* stopping clears it, so
+                    // playback can hand back to this machine.
+                    let position = session.position();
+                    let duration = session.duration();
                     let result = session.stop().await;
-                    *guard = None;
-                    clear_status_locked(&inner);
+                    if result.is_ok() {
+                        // Forget the cast only once the renderer confirmed the
+                        // stop, so "end the cast" is real.
+                        *guard = None;
+                        drop(guard);
+                        clear_status_locked(&inner);
+                        on_ended(position, duration);
+                    } else {
+                        // The renderer refused to stop: keep the cast and its
+                        // session so the failure is honest and can be retried,
+                        // and stop the poll loop from papering the error over.
+                        let message = match session.state() {
+                            SessionState::Error(message) => message.clone(),
+                            _ => "the renderer did not stop".to_string(),
+                        };
+                        drop(guard);
+                        inner.lock().unwrap_or_else(|e| e.into_inner()).generation += 1;
+                        set_status_locked(&inner, CastStatus::Failed { message });
+                    }
                     result
                 }
-                CastAction::Seek(position) => session.seek(position).await,
             };
             if let Err(error) = result {
                 tracing::warn!(%error, "cast control failed");
@@ -568,6 +620,7 @@ async fn prepare_and_start(
     title: &str,
     remux_tag: &Arc<Mutex<Option<String>>>,
     force_passthrough: bool,
+    start_at: Option<Duration>,
 ) -> anyhow::Result<CastSession> {
     let source_url = format!("{loopback_base}/stream/{id}/{file_id}");
     let probe = tools.probe(&source_url).await?;
@@ -675,7 +728,11 @@ async fn prepare_and_start(
     let metadata = metadata(title, &url, seekable, converted);
     let target = DlnaTarget::new(device)?;
     let mut session = CastSession::new(Box::new(target), title);
-    session.start(url, &metadata).await?;
+    match start_at {
+        // Hand the picture over from the local player: start, then seek.
+        Some(position) => session.start_at(url, &metadata, position).await?,
+        None => session.start(url, &metadata).await?,
+    }
     Ok(session)
 }
 

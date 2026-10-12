@@ -12,8 +12,10 @@ use std::path::{Path, PathBuf};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use reel_desktop::backend::FakeBackend;
+use reel_desktop::cast::{CastAction, CastStatus, DeviceInfo};
 use reel_desktop::testing::sample_library;
 use reel_desktop::{App, Screen};
+use reel_cast::session::SessionState;
 
 /// Build a harness around the real app, with the sample library.
 fn harness_with(app: App) -> Harness<'static, App> {
@@ -503,4 +505,91 @@ fn snapshot_narrow_rail() {
     );
     harness.run_steps(3);
     harness.snapshot("narrow");
+}
+
+/// The compact "now casting" bar: the primary casting surface.
+#[test]
+fn snapshot_cast_bar() {
+    let backend = FakeBackend::new(sample_library());
+    let cast = backend.cast_handle();
+    cast.enable();
+    cast.set_status(Some(CastStatus::Active {
+        device: "Living Room TV".to_string(),
+        title: "Sintel".to_string(),
+        state: SessionState::Playing,
+        position: Some(std::time::Duration::from_secs(754)),
+        duration: Some(std::time::Duration::from_secs(888)),
+    }));
+
+    let mut harness = harness_with(App::new(Box::new(backend)));
+    harness.run_steps(3);
+    harness.snapshot("cast-bar");
+}
+
+/// The cast picker, with the hand-off position shown before a device is chosen.
+#[test]
+fn snapshot_cast_picker() {
+    let backend = FakeBackend::new(sample_library());
+    let cast = backend.cast_handle();
+    cast.enable();
+    cast.set_devices(vec![
+        DeviceInfo {
+            name: "Living Room TV".to_string(),
+            model: Some("LG webOS".to_string()),
+            udn: "uuid:living-room".to_string(),
+        },
+        DeviceInfo {
+            name: "Bedroom".to_string(),
+            model: Some("Chromecast".to_string()),
+            udn: "uuid:bedroom".to_string(),
+        },
+    ]);
+
+    let mut harness = harness_with(App::new(Box::new(backend)));
+    harness.run_steps(3);
+
+    // The Matrix has a saved position, so the picker shows "Continues from".
+    harness.state_mut().open_work(1);
+    harness.run_steps(2);
+    {
+        let button = harness
+            .get_all_by_label_contains("Cast to a TV")
+            .next()
+            .expect("the detail page's cast button");
+        button.click();
+    }
+    harness.run_steps(3);
+    harness.snapshot("cast-picker");
+}
+
+/// The cast bar's Stop sends a Stop to the renderer.
+#[test]
+fn the_cast_bar_stop_button_stops_the_renderer() {
+    let backend = FakeBackend::new(sample_library());
+    let cast = backend.cast_handle();
+    cast.enable();
+    cast.set_status(Some(CastStatus::Active {
+        device: "Living Room TV".to_string(),
+        title: "Sintel".to_string(),
+        state: SessionState::Playing,
+        position: Some(std::time::Duration::from_secs(30)),
+        duration: Some(std::time::Duration::from_secs(888)),
+    }));
+
+    let mut harness = harness_with(App::new(Box::new(backend)));
+    harness.run_steps(3);
+    {
+        let stop = harness
+            .get_all_by_label("Stop")
+            .next()
+            .expect("the cast bar's Stop button");
+        stop.click();
+    }
+    harness.run_steps(2);
+
+    assert!(
+        cast.actions().contains(&CastAction::Stop),
+        "expected a Stop action, got {:?}",
+        cast.actions()
+    );
 }

@@ -1,6 +1,57 @@
 //! An in-memory backend for UI tests: no engine, network or HTTP.
 
 use super::*;
+use crate::cast::{CastAction, CastStatus, DeviceInfo};
+
+// --------------------------------------------------------- casting handle
+
+/// Shared casting state for [`FakeBackend`], so a test can drive and observe it
+/// after the backend has been boxed into the [`App`](crate::App).
+#[derive(Clone)]
+pub struct FakeCast {
+    /// Why casting is off; `None` means available.
+    available: Arc<Mutex<Option<String>>>,
+    status: Arc<Mutex<Option<CastStatus>>>,
+    devices: Arc<Mutex<Vec<DeviceInfo>>>,
+    actions: Arc<Mutex<Vec<CastAction>>>,
+}
+
+impl Default for FakeCast {
+    fn default() -> Self {
+        // Off by default, so the demo and every existing test keep seeing the
+        // "casting is not available" path unless they opt in.
+        Self {
+            available: Arc::new(Mutex::new(Some(
+                "casting is not available (demo backend)".to_string(),
+            ))),
+            status: Arc::new(Mutex::new(None)),
+            devices: Arc::new(Mutex::new(Vec::new())),
+            actions: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl FakeCast {
+    /// Make casting available, as the real backend does when it is configured.
+    pub fn enable(&self) {
+        *self.available.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Put a cast on screen, or clear it.
+    pub fn set_status(&self, status: Option<CastStatus>) {
+        *self.status.lock().unwrap_or_else(|e| e.into_inner()) = status;
+    }
+
+    /// Advertise renderers in the picker.
+    pub fn set_devices(&self, devices: Vec<DeviceInfo>) {
+        *self.devices.lock().unwrap_or_else(|e| e.into_inner()) = devices;
+    }
+
+    /// The control actions the UI has sent, in order.
+    pub fn actions(&self) -> Vec<CastAction> {
+        self.actions.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
 
 // ------------------------------------------------------------ fake backend
 
@@ -16,6 +67,7 @@ pub struct FakeBackend {
     base_url: String,
     catalog_status: CatalogStatus,
     settings: Mutex<CatalogSettings>,
+    cast: FakeCast,
 }
 
 impl FakeBackend {
@@ -43,12 +95,19 @@ impl FakeBackend {
                 note: None,
                 ..Default::default()
             },
+            cast: FakeCast::default(),
         }
     }
 
     /// Replace the whole library, as a test would between assertions.
     pub fn set_items(&self, items: Vec<LibraryItem>) {
         *self.items.lock().unwrap_or_else(|e| e.into_inner()) = items;
+    }
+
+    /// A shared handle to the casting state, for tests that need to drive it
+    /// after the backend is boxed into an [`App`](crate::App).
+    pub fn cast_handle(&self) -> FakeCast {
+        self.cast.clone()
     }
 }
 
@@ -403,6 +462,52 @@ impl Backend for FakeBackend {
 
     fn take_events(&self) -> Vec<BackendEvent> {
         std::mem::take(&mut *self.events.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn cast_unavailable(&self) -> Option<String> {
+        self.cast
+            .available
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn cast_devices(&self) -> Vec<DeviceInfo> {
+        self.cast
+            .devices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn cast_status(&self) -> Option<CastStatus> {
+        self.cast
+            .status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn start_cast(
+        &self,
+        _udn: String,
+        _info_hash: String,
+        _file_id: usize,
+        _title: String,
+        _start_at: Option<Duration>,
+    ) {
+    }
+
+    fn cast_action(&self, action: CastAction) {
+        self.cast
+            .actions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(action);
+    }
+
+    fn dismiss_cast(&self) {
+        *self.cast.status.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
