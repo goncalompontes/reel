@@ -141,6 +141,12 @@ pub struct CatalogSettings {
     #[serde(default = "default_conversion_max_height")]
     pub conversion_max_height: u32,
 
+    /// Trust the renderer with H.265/HEVC (any bit depth) and AC3/EAC3 audio,
+    /// remuxing instead of re-encoding. Modern TVs handle these; older ones do
+    /// not.
+    #[serde(default)]
+    pub allow_hevc_passthrough: bool,
+
     /// Path to an `ffmpeg` binary. `None` uses a bundled copy, then `PATH`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ffmpeg_path: Option<String>,
@@ -215,6 +221,7 @@ impl Default for CatalogSettings {
             cast_lan_address: None,
             conversion_mode: ConversionMode::default(),
             conversion_max_height: default_conversion_max_height(),
+            allow_hevc_passthrough: false,
             ffmpeg_path: None,
         }
     }
@@ -401,6 +408,10 @@ mod tests {
         );
         assert_eq!(settings.conversion_mode, ConversionMode::Auto);
         assert_eq!(settings.conversion_max_height, 1080);
+        assert!(
+            !settings.allow_hevc_passthrough,
+            "passthrough must be opted into"
+        );
     }
 
     #[test]

@@ -594,6 +594,7 @@ pub fn plan_options(settings: &CatalogSettings) -> PlanOptions {
     PlanOptions {
         mode: transcode_mode(settings.conversion_mode),
         max_height: settings.conversion_max_height,
+        allow_hevc: settings.allow_hevc_passthrough,
     }
 }
 
@@ -670,11 +671,13 @@ mod tests {
         let settings = CatalogSettings {
             conversion_mode: ConversionMode::Remux,
             conversion_max_height: 720,
+            allow_hevc_passthrough: true,
             ..Default::default()
         };
         let options = plan_options(&settings);
         assert_eq!(options.mode, TranscodeMode::RemuxOnly);
         assert_eq!(options.max_height, 720);
+        assert!(options.allow_hevc);
     }
 
     #[test]

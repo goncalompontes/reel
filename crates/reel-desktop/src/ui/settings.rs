@@ -467,9 +467,21 @@ impl App {
         );
         ui.horizontal(|ui| {
             for (mode, label, hint) in [
-                (ConversionMode::Off, "Off", "Only cast files the TV can already play"),
-                (ConversionMode::Remux, "Rewrap", "Change the container, never re-encode"),
-                (ConversionMode::Auto, "Convert", "Re-encode only when necessary"),
+                (
+                    ConversionMode::Off,
+                    "Off",
+                    "Only cast files the TV can already play",
+                ),
+                (
+                    ConversionMode::Remux,
+                    "Rewrap",
+                    "Change the container, never re-encode",
+                ),
+                (
+                    ConversionMode::Auto,
+                    "Convert",
+                    "Re-encode only when necessary",
+                ),
             ] {
                 if ui
                     .selectable_label(draft.conversion_mode == mode, label)
@@ -496,6 +508,17 @@ impl App {
                 draft.conversion_max_height = height.max(144) as u32;
             }
         });
+
+        ui.add_space(6.0);
+        ui.checkbox(
+            &mut draft.allow_hevc_passthrough,
+            "Trust the TV with H.265 (HEVC) and AC3/EAC3",
+        )
+        .on_hover_text(
+            "Remux 4K HDR/HEVC and surround audio instead of re-encoding, so it \
+             starts immediately. Enable if your TV supports them (most modern 4K \
+             TVs do); otherwise leave it off.",
+        );
 
         optional_text(
             ui,
@@ -642,7 +665,12 @@ pub(crate) enum SettingsAction {
 
 /// Edit an optional text setting under a small label. Committing blank clears
 /// it, so the settings file only ever holds real values.
-pub(crate) fn optional_text(ui: &mut egui::Ui, label: &str, value: &mut Option<String>, hint: &str) {
+pub(crate) fn optional_text(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut Option<String>,
+    hint: &str,
+) {
     ui.label(egui::RichText::new(label).size(11.5).color(theme::TEXT_DIM));
     let mut text = value.clone().unwrap_or_default();
     let changed = ui
@@ -661,4 +689,3 @@ pub(crate) fn optional_text(ui: &mut egui::Ui, label: &str, value: &mut Option<S
     }
     ui.add_space(4.0);
 }
-
