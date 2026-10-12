@@ -376,6 +376,39 @@ pub trait Backend {
     fn refresh_metadata(&self);
 
     fn take_events(&self) -> Vec<BackendEvent>;
+
+    /// Why casting is unavailable, or `None` when the LAN media server is
+    /// running and renderers can be cast to.
+    fn cast_unavailable(&self) -> Option<String> {
+        Some("casting is not available".to_string())
+    }
+
+    /// Renderers found on the local network.
+    fn cast_devices(&self) -> Vec<crate::cast::DeviceInfo> {
+        Vec::new()
+    }
+
+    /// Whether a renderer search is in progress.
+    fn cast_discovering(&self) -> bool {
+        false
+    }
+
+    /// The active cast, if any.
+    fn cast_status(&self) -> Option<crate::cast::CastStatus> {
+        None
+    }
+
+    /// Start (or repeat) a renderer search.
+    fn refresh_cast_devices(&self) {}
+
+    /// Cast a torrent file to the renderer with the given UDN.
+    fn start_cast(&self, _udn: String, _torrent_id: usize, _file_id: usize, _title: String) {}
+
+    /// Control the active cast.
+    fn cast_action(&self, _action: crate::cast::CastAction) {}
+
+    /// Delete the files converted for casting.
+    fn clear_cast_cache(&self) {}
 }
 
 // ------------------------------------------------------------ real backend
@@ -509,6 +542,8 @@ pub struct EngineBackend {
     cache_stats: Mutex<Option<CacheStats>>,
     /// Casting to DLNA renderers, when enabled and available.
     cast: Option<CastService>,
+    /// Why casting is off, when `cast` is `None`.
+    cast_unavailable: Option<String>,
 }
 
 impl EngineBackend {
@@ -658,7 +693,7 @@ impl EngineBackend {
 
         // Casting is opt-in: it opens a LAN-facing media port, so it only runs
         // when the setting is on and ffmpeg is available.
-        let cast = match CastService::new(
+        let (cast, cast_unavailable) = match CastService::new(
             engine.clone(),
             base_url.clone(),
             data_dir.clone(),
@@ -667,11 +702,11 @@ impl EngineBackend {
         ) {
             Ok(service) => {
                 service.refresh_devices();
-                Some(service)
+                (Some(service), None)
             }
             Err(reason) => {
                 tracing::info!(%reason, "casting is not available");
-                None
+                (None, Some(reason))
             }
         };
 
@@ -689,6 +724,7 @@ impl EngineBackend {
             playing: Mutex::new(None),
             cache_stats: Mutex::new(None),
             cast,
+            cast_unavailable,
         };
 
         // The media store owns what is being kept. Adopt any old per-torrent
@@ -1874,6 +1910,51 @@ impl Backend for EngineBackend {
 
     fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    fn cast_unavailable(&self) -> Option<String> {
+        self.cast_unavailable.clone()
+    }
+
+    fn cast_devices(&self) -> Vec<crate::cast::DeviceInfo> {
+        self.cast
+            .as_ref()
+            .map(CastService::devices)
+            .unwrap_or_default()
+    }
+
+    fn cast_discovering(&self) -> bool {
+        self.cast.as_ref().is_some_and(CastService::discovering)
+    }
+
+    fn cast_status(&self) -> Option<crate::cast::CastStatus> {
+        self.cast.as_ref().and_then(CastService::status)
+    }
+
+    fn refresh_cast_devices(&self) {
+        if let Some(cast) = &self.cast {
+            cast.refresh_devices();
+        }
+    }
+
+    fn start_cast(&self, udn: String, torrent_id: usize, file_id: usize, title: String) {
+        if let Some(cast) = &self.cast {
+            cast.start_cast(udn, torrent_id, file_id, title);
+        }
+    }
+
+    fn cast_action(&self, action: crate::cast::CastAction) {
+        if let Some(cast) = &self.cast {
+            cast.control(action);
+        }
+    }
+
+    fn clear_cast_cache(&self) {
+        if let Some(cast) = &self.cast {
+            if let Err(error) = cast.clear_cache() {
+                tracing::warn!(%error, "could not clear the cast cache");
+            }
+        }
     }
 
     fn library(&self) -> Vec<LibraryItem> {
