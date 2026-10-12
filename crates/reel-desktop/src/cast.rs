@@ -158,12 +158,34 @@ impl CastService {
             .port();
         let lan_base = format!("http://{address}:{port}");
 
+        // Live remux: ffmpeg reads the loopback stream and writes a fragmented
+        // MP4, which the LAN endpoint streams and tees into the cache.
+        let live_source: reel_http::LiveSource = {
+            let engine = engine.clone();
+            let ffmpeg = tools.ffmpeg.clone();
+            let cache = cache.clone();
+            let loopback = loopback_base.clone();
+            Arc::new(move |id: usize, file_id: usize| {
+                let length = engine.probe_file(id, file_id).ok()?.length;
+                let info_hash = engine.view(id).ok()?.info_hash;
+                let key = CacheKey::for_plan(info_hash, file_id as u64, length, &MediaPlan::Remux);
+                let source = format!("{loopback}/stream/{id}/{file_id}");
+                let mut command = tokio::process::Command::new(&ffmpeg);
+                command.args(reel_media::convert::remux_stream_args(&source));
+                Some(reel_http::LiveSession {
+                    command,
+                    tee: Some(cache.path_for(&key)),
+                })
+            })
+        };
+
         let media = MediaState::new(
             engine.clone(),
             token.clone(),
             cache.root().to_path_buf(),
             reel_cast::dlna::content_features(true, false),
-        );
+        )
+        .with_live_source(live_source);
         let router = build_media_router(media);
         runtime.spawn(async move {
             let _ = reel_http::serve_router_with_shutdown(listener, router, std::future::pending())
@@ -434,18 +456,35 @@ async fn prepare_and_start(
     let probe = tools.probe(&source_url).await?;
     let plan = plan(&probe, &options);
 
-    let (url, converted) = match plan {
-        MediaPlan::Original => (original_url(lan_base, token, id, file_id), false),
-        MediaPlan::Remux | MediaPlan::Transcode { .. } => {
-            let view = engine.view(id)?;
+    let (url, seekable, converted) = match plan {
+        MediaPlan::Original => (original_url(lan_base, token, id, file_id), true, false),
+        MediaPlan::Remux => {
             let length = engine.probe_file(id, file_id)?.length;
-            let key = CacheKey::for_plan(view.info_hash, file_id as u64, length, &plan);
+            let key = CacheKey::for_plan(
+                engine.view(id)?.info_hash,
+                file_id as u64,
+                length,
+                &MediaPlan::Remux,
+            );
+            if cache.path_for(&key).is_file() {
+                // A previous live remux finished: serve it with range support.
+                (converted_url(lan_base, token, &key.file_name()), true, true)
+            } else {
+                // Remux on the fly: the LAN endpoint streams fragmented MP4 and
+                // tees it into the cache, so a later cast can seek the file.
+                (remux_url(lan_base, token, id, file_id), false, true)
+            }
+        }
+        MediaPlan::Transcode { max_height } => {
+            let length = engine.probe_file(id, file_id)?.length;
+            let key = CacheKey::for_plan(
+                engine.view(id)?.info_hash,
+                file_id as u64,
+                length,
+                &MediaPlan::Transcode { max_height },
+            );
             let output = cache.path_for(&key);
             if !output.is_file() {
-                let max_height = match plan {
-                    MediaPlan::Transcode { max_height } => max_height,
-                    _ => options.max_height,
-                };
                 tools
                     .transcode(&source_url, &probe, max_height, &output)
                     .await?;
@@ -453,12 +492,12 @@ async fn prepare_and_start(
                     tracing::warn!(%error, "could not trim the conversion cache");
                 }
             }
-            (converted_url(lan_base, token, &key.file_name()), true)
+            (converted_url(lan_base, token, &key.file_name()), true, true)
         }
         MediaPlan::Unavailable { reason } => anyhow::bail!("{reason}"),
     };
 
-    let metadata = metadata(title, &url, converted);
+    let metadata = metadata(title, &url, seekable, converted);
     let target = DlnaTarget::new(device)?;
     let mut session = CastSession::new(Box::new(target), title);
     session.start(url, &metadata).await?;
@@ -492,9 +531,14 @@ pub fn converted_url(lan_base: &str, token: &str, name: &str) -> String {
     format!("{lan_base}/media/{token}/converted/{name}")
 }
 
+/// The LAN URL for a live remux of a file.
+pub fn remux_url(lan_base: &str, token: &str, id: usize, file_id: usize) -> String {
+    format!("{lan_base}/media/{token}/remux/{id}/{file_id}")
+}
+
 /// DIDL-Lite metadata for a cast.
-pub fn metadata(title: &str, url: &str, converted: bool) -> String {
-    didl::Item::video(title, url, converted).to_xml()
+pub fn metadata(title: &str, url: &str, seekable: bool, converted: bool) -> String {
+    didl::Item::video(title, url, seekable, converted).to_xml()
 }
 
 /// The address to advertise in cast URLs.
@@ -574,11 +618,20 @@ mod tests {
         let xml = metadata(
             "Episode 1",
             "http://10.0.0.5:4000/media/tok/original/3/1",
+            true,
             false,
         );
         assert!(xml.contains("<dc:title>Episode 1</dc:title>"));
         assert!(xml.contains("protocolInfo=\"http-get:*:"));
         assert!(xml.contains("http://10.0.0.5:4000/media/tok/original/3/1"));
+    }
+
+    #[test]
+    fn media_urls_include_a_live_remux_route() {
+        assert_eq!(
+            remux_url("http://10.0.0.5:4000", "tok", 3, 1),
+            "http://10.0.0.5:4000/media/tok/remux/3/1"
+        );
     }
 
     #[test]

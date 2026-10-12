@@ -19,8 +19,10 @@ use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use bytes::Bytes;
 use reel_core::Engine;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
 
 use crate::error::HttpError;
@@ -32,6 +34,21 @@ const STREAM_CHUNK: usize = 64 * 1024;
 
 /// `transferMode.dlna.org`: streamed (not interactive) media.
 const TRANSFER_MODE: &str = "Streaming";
+
+/// A live remux: a command whose stdout is a fragmented MP4, plus an optional
+/// file to tee the output into so a later request can range-seek it.
+pub struct LiveSession {
+    /// The command to run; its stdout is piped by this crate.
+    pub command: tokio::process::Command,
+    /// Where to write the output as it streams, for later range requests.
+    pub tee: Option<PathBuf>,
+}
+
+/// Supplying a live remux command for a `(torrent id, file id)` pair.
+///
+/// The desktop builds this from `reel-media`; making it a callback is what lets
+/// this crate stream a remux without depending on ffmpeg itself.
+pub type LiveSource = Arc<dyn Fn(usize, usize) -> Option<LiveSession> + Send + Sync>;
 
 /// State for the LAN media router.
 #[derive(Clone)]
@@ -45,6 +62,9 @@ pub struct MediaState {
     /// Value for `contentFeatures.dlna.org` (built by the caller from the
     /// casting layer, e.g. `reel_cast::dlna::content_features`).
     pub content_features: String,
+    /// Optional on-the-fly remux, for instant playback of files that only need
+    /// a container change.
+    pub live_source: Option<LiveSource>,
 }
 
 impl MediaState {
@@ -60,7 +80,14 @@ impl MediaState {
             token: token.into(),
             converted_dir: converted_dir.into(),
             content_features: content_features.into(),
+            live_source: None,
         }
+    }
+
+    /// Provide a live remux source, enabling `/media/{token}/remux/…`.
+    pub fn with_live_source(mut self, source: LiveSource) -> MediaState {
+        self.live_source = Some(source);
+        self
     }
 
     /// Whether a request token matches, in constant time.
@@ -87,6 +114,7 @@ fn tokens_match(expected: &str, given: &str) -> bool {
 pub fn build_media_router(state: MediaState) -> Router {
     Router::new()
         .route("/media/{token}/original/{id}/{file_id}", get(original))
+        .route("/media/{token}/remux/{id}/{file_id}", get(remux))
         .route("/media/{token}/converted/{name}", get(converted))
         .with_state(state)
 }
@@ -123,6 +151,107 @@ async fn original(
         &probe.name,
         body,
     ))
+}
+
+/// Serve a live remux: run the caller's command and stream its stdout.
+///
+/// `Range` is not honoured — the bytes are produced on the fly — so the DIDL
+/// metadata advertises this URL as non-seekable.
+async fn remux(
+    State(st): State<MediaState>,
+    AxumPath((token, id, file_id)): AxumPath<(String, usize, usize)>,
+) -> Result<Response, HttpError> {
+    if !st.authorized(&token) {
+        return Err(HttpError::not_found("no such media"));
+    }
+    let Some(source) = st.live_source.as_ref() else {
+        return Err(HttpError::not_found("no such media"));
+    };
+    let Some(session) = source(id, file_id) else {
+        return Err(HttpError::not_found("no such media"));
+    };
+
+    let body = spawn_live_body(session.command, session.tee)?;
+    // A live stream cannot be seeked, whatever the caller's default features say.
+    let features = st
+        .content_features
+        .replace("DLNA.ORG_OP=01", "DLNA.ORG_OP=00");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "video/mp4")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::ACCEPT_RANGES, "none")
+        .header("contentFeatures.dlna.org", features)
+        .header("transferMode.dlna.org", TRANSFER_MODE)
+        .body(body)
+        .map_err(|error| HttpError::internal(format!("building response: {error}")))
+}
+
+/// Spawn `command`, forward its stdout as the response body, and optionally tee
+/// it to a file.
+///
+/// The child is moved into the streaming task, so it is killed (`kill_on_drop`)
+/// when the response body is dropped — i.e. when the receiver disconnects.
+fn spawn_live_body(
+    mut command: tokio::process::Command,
+    tee: Option<PathBuf>,
+) -> Result<Body, HttpError> {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|error| HttpError::internal(format!("spawning remux: {error}")))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| HttpError::internal("remux produced no stdout"))?;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tokio::spawn(async move {
+        // Keep the child alive for as long as we are reading its stdout.
+        let _child = child;
+        let mut file = match &tee {
+            Some(path) => {
+                if let Some(parent) = path.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                tokio::fs::File::create(path).await.ok()
+            }
+            None => None,
+        };
+        let mut tee_ok = file.is_some();
+        let mut buffer = vec![0u8; STREAM_CHUNK];
+        loop {
+            match stdout.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tee_ok {
+                        if let Some(file) = file.as_mut() {
+                            if file.write_all(&buffer[..n]).await.is_err() {
+                                tee_ok = false;
+                            }
+                        }
+                    }
+                    if tx
+                        .send(Ok(Bytes::copy_from_slice(&buffer[..n])))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(error)).await;
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok(Body::from_stream(ReceiverStream::new(rx)))
 }
 
 /// Serve a converted file from the cache directory, honouring `Range`.
@@ -274,5 +403,28 @@ mod tests {
         assert!(converted_path(dir, "a/b.mp4").is_err());
         assert!(converted_path(dir, "a\\b.mp4").is_err());
         assert!(converted_path(dir, "").is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_live_body_streams_and_tees_to_a_file() {
+        use http_body_util::BodyExt;
+
+        let dir = std::env::temp_dir().join(format!("reel-http-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tee = dir.join("out.mp4");
+
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg("printf 'fragmented-mp4-bytes'");
+        let body = spawn_live_body(command, Some(tee.clone())).unwrap();
+
+        let bytes = body.collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"fragmented-mp4-bytes");
+        // The tee is written before each chunk is yielded, but allow a moment
+        // for the file handle to settle.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(std::fs::read(&tee).unwrap(), b"fragmented-mp4-bytes");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

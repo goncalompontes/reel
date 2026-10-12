@@ -45,7 +45,15 @@ pub struct Item {
 
 impl Item {
     /// A video item with a single `http-get` resource.
-    pub fn video(title: impl Into<String>, url: impl Into<String>, converted: bool) -> Item {
+    ///
+    /// `seekable` advertises whether the URL supports byte-range seeks — a live
+    /// remux does not, so the receiver should not try to seek it.
+    pub fn video(
+        title: impl Into<String>,
+        url: impl Into<String>,
+        seekable: bool,
+        converted: bool,
+    ) -> Item {
         let url = url.into();
         Item {
             id: "0".to_string(),
@@ -53,7 +61,7 @@ impl Item {
             title: title.into(),
             class: CLASS_VIDEO.to_string(),
             resources: vec![Resource {
-                protocol_info: dlna::protocol_info(dlna::mime_for_url(&url), true, converted),
+                protocol_info: dlna::protocol_info(dlna::mime_for_url(&url), seekable, converted),
                 url,
             }],
         }
@@ -114,7 +122,7 @@ mod tests {
 
     #[test]
     fn builds_a_video_item() {
-        let xml = Item::video("Episode 1", "http://10.0.0.1/media/x.mp4", false).to_xml();
+        let xml = Item::video("Episode 1", "http://10.0.0.1/media/x.mp4", true, false).to_xml();
         assert!(xml.starts_with("<DIDL-Lite"));
         assert!(xml.contains("<dc:title>Episode 1</dc:title>"));
         assert!(xml.contains("<upnp:class>object.item.videoItem</upnp:class>"));
@@ -123,8 +131,15 @@ mod tests {
     }
 
     #[test]
+    fn a_non_seekable_resource_advertises_no_seeking() {
+        let xml = Item::video("Live", "http://h/x.mp4", false, true).to_xml();
+        assert!(xml.contains("DLNA.ORG_OP=00"));
+        assert!(xml.contains("DLNA.ORG_CI=1"));
+    }
+
+    #[test]
     fn escapes_the_title() {
-        let xml = Item::video("Tom & Jerry", "http://h/x.mp4", false).to_xml();
+        let xml = Item::video("Tom & Jerry", "http://h/x.mp4", true, false).to_xml();
         assert!(xml.contains("<dc:title>Tom &amp; Jerry</dc:title>"));
     }
 }
