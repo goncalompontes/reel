@@ -1,0 +1,29 @@
+# Pin the toolchain. `reel` uses no nightly-only features (no `#![feature(...)]`
+# anywhere in the tree) and edition 2024 is stable since Rust 1.85; the workspace
+# rust-version is 1.95 (driven by egui/eframe 0.36), so a stable toolchain builds
+# it fine.
+#
+# Why this matters for disk usage:
+#   Recent nightly Cargo enables the experimental `build-dir-new-layout`
+#   unconditionally. That layout stores EVERY build unit under
+#       target/debug/build/<package>/<hash>/out/
+#   where <hash> is derived from the unit *and all of its inputs*. When the
+#   toolchain changes (nightly rebuilds update the compiler hash) or a
+#   dependency/feature/profile changes, Cargo writes a brand-new hash directory
+#   and never reclaims the old one -- automatic cleanup of stale build units is
+#   still future work:
+#       https://github.com/rust-lang/cargo/issues/5026
+#       https://github.com/rust-lang/cargo/issues/15010
+#   With the huge wgpu/eframe debug binaries in this workspace that silently
+#   grew target/ to ~139 GB.
+#
+#   Stable Cargo still uses the legacy content-organised layout (deps/ + a single
+#   build/<pkg>-<hash> per build script), which reuses/overwrites artifacts
+#   instead of piling up per-input copies, and pinning the channel stops the
+#   daily nightly churn that re-hashed every unit.
+#
+# If you must build with nightly, pin an exact dated nightly (e.g.
+# `channel = "nightly-2026-08-31"`) so the compiler hash stops changing, and run
+# `cargo clean` periodically.
+[toolchain]
+channel = "stable"

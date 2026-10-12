@@ -19,6 +19,10 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 
+# Shared dependency helpers: package-manager detection, prompts, tool lookups.
+# shellcheck source=lib/deps.sh
+. "$HERE/lib/deps.sh"
+
 PREFIX="${PREFIX:-$HOME/.local}"
 UNINSTALL=0
 FORCE=0
@@ -144,86 +148,8 @@ resolve_uv() {
 
 # --- system dependencies: Chrome/Chromium and Xvfb -------------------------
 
-# The package manager to use, or empty if none was recognised.
-detect_package_manager() {
-  for manager in pacman apt-get dnf zypper apk; do
-    if command -v "$manager" >/dev/null 2>&1; then
-      printf '%s' "$manager"
-      return
-    fi
-  done
-  printf ''
-}
-
-# The package name for a browser / Xvfb, per package manager.
-browser_package() {
-  case "$1" in
-    pacman|apt-get|dnf|zypper|apk) printf 'chromium' ;;
-    *) printf '' ;;
-  esac
-}
-xvfb_package() {
-  case "$1" in
-    pacman) printf 'xorg-server-xvfb' ;;
-    apt-get) printf 'xvfb' ;;
-    dnf) printf 'xorg-x11-server-Xvfb' ;;
-    zypper) printf 'xorg-x11-server-extra' ;;
-    apk) printf 'xvfb' ;;
-    *) printf '' ;;
-  esac
-}
-
-# Ask a yes/no question on the terminal. No terminal means "no", so a
-# non-interactive install never hangs.
-confirm() {
-  [ "$ASSUME_YES" -eq 1 ] && return 0
-  [ -r /dev/tty ] || return 1
-  printf '%s [y/N] ' "$1" > /dev/tty 2>/dev/null || return 1
-  local reply=""
-  read -r reply < /dev/tty 2>/dev/null || return 1
-  case "$reply" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
-}
-
-# Install packages with the detected manager, via sudo unless already root.
-install_packages() {
-  local sudo=""
-  [ "$(id -u)" -eq 0 ] || sudo="sudo"
-  case "$PKG_MANAGER" in
-    pacman) $sudo pacman -S --needed --noconfirm "$@" ;;
-    apt-get) $sudo apt-get update && $sudo apt-get install -y "$@" ;;
-    dnf) $sudo dnf install -y "$@" ;;
-    zypper) $sudo zypper --non-interactive install "$@" ;;
-    apk) $sudo apk add "$@" ;;
-    *) return 1 ;;
-  esac
-}
-
-# Offer to install a missing dependency: `$1` a human name, `$2` the package,
-# `$3` what breaks without it.
-install_dependency() {
-  local what="$1" package="$2" hint="$3"
-  if [ "$NO_DEPS" -eq 1 ] || [ -z "$PKG_MANAGER" ] || [ -z "$package" ]; then
-    warn "$what is missing: $hint"
-    return
-  fi
-  if confirm "$what is missing. Install '$package' with $PKG_MANAGER?"; then
-    say "  installing $package..."
-    install_packages "$package" || warn "  could not install $package: $hint"
-  else
-    warn "  skipped: $hint"
-  fi
-}
-
-# The browser names the solver might use.
-find_browser() {
-  for candidate in google-chrome google-chrome-stable chromium chromium-browser; do
-    if command -v "$candidate" >/dev/null 2>&1; then
-      printf '%s' "$candidate"
-      return
-    fi
-  done
-  printf ''
-}
+# Package-manager detection, the prompts, `install_packages` and
+# `install_dependency` live in lib/deps.sh, shared with install.sh.
 
 # Make sure the browser and Xvfb are present, offering to install them.
 ensure_dependencies() {
@@ -234,7 +160,7 @@ ensure_dependencies() {
   if [ -n "$browser" ]; then
     say "  browser: $browser"
   else
-    install_dependency "Chrome/Chromium" "$(browser_package "$PKG_MANAGER")" \
+    install_dependency "Chrome/Chromium" "$(pkg_for "$PKG_MANAGER" browser)" \
       "the solver needs a browser to clear Cloudflare, so ext.to will not work"
     browser="$(find_browser)"
     [ -n "$browser" ] && say "  browser: $browser"
@@ -243,7 +169,7 @@ ensure_dependencies() {
   if command -v Xvfb >/dev/null 2>&1; then
     say "  virtual display: Xvfb"
   else
-    install_dependency "Xvfb" "$(xvfb_package "$PKG_MANAGER")" \
+    install_dependency "Xvfb" "$(pkg_for "$PKG_MANAGER" xvfb)" \
       "the solver runs the browser on a virtual display, so ext.to will not work"
     command -v Xvfb >/dev/null 2>&1 && say "  virtual display: Xvfb"
   fi

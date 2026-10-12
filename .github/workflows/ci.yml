@@ -1,0 +1,103 @@
+name: CI
+
+# Build and test reel on every platform the stack supports, plus the real
+# end-to-end suite on Linux. The toolchain comes from rust-toolchain.toml
+# (stable), so the matrix tracks whatever the repo pins.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # The portable core: build the whole workspace and run every unit test on
+  # Linux, macOS and Windows. This is what proves the cross-platform claim.
+  build-test:
+    name: build + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show the toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the workspace
+        run: cargo build --workspace --locked
+
+      - name: Check every target (tests, examples, benches)
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Unit tests
+        run: cargo test --workspace --locked --lib
+
+  # Integration tests that shell out to real tools (ffmpeg/ffprobe) or bind a
+  # localhost socket. Linux only, because that is where they are exercised.
+  integration:
+    name: integration (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runtime tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg mpv
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Integration tests
+        run: cargo test --locked -p reel-cast -p reel-catalog -p reel-media
+
+  # The real proof: generate a video, seed it, stream it out of a second
+  # instance while it downloads, and decode the stream with libmpv.
+  e2e:
+    name: end-to-end (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runtime tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg mpv
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the binaries and examples
+        run: |
+          cargo build --locked --workspace
+          cargo build --locked --workspace --examples
+
+      - name: Run the end-to-end suite
+        run: bash scripts/e2e.sh
+
+  lint:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: rustup component add clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Informational, not a gate: the tree carries pre-existing suggestions
+      # (mostly `collapsible_if` let-chains from the corrected 1.95 MSRV), so
+      # `-D warnings` would fail on day one. Warnings still show up in the log.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked

@@ -85,6 +85,22 @@ the bundled solver are Linux-only; on macOS or Windows, build the binaries with
 `cargo` and (for ext.to) point the solver URL in Settings at a FlareSolverr you
 run yourself.
 
+### Dependencies
+
+reel builds and runs without any optional tool, and says what is missing when it
+is needed. `scripts/install.sh --check` is the doctor: it reports what a machine
+has — `ffmpeg`/`ffprobe` for casting, `mpv`/libmpv for embedded playback,
+Chrome + Xvfb for the ext.to solver — and what each missing one would break. A
+normal install offers to install them with your package manager (`--yes` to
+accept every prompt, `--no-deps` to only report).
+
+```bash
+scripts/install.sh --check      # report only, change nothing
+```
+
+See [`docs/SETUP.md`](docs/SETUP.md) for the platform matrix, the release
+artifacts and the setup quirks (including the firewall port casting needs).
+
 Re-running it is a no-op rather than an error, and there is an undo:
 
 ```bash
@@ -562,10 +578,10 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the reasoning.
 
 ## Requirements
 
-Rust 1.86+ (edition 2024). Linux, macOS and Windows are supported by the stack;
-Linux/Wayland is what has been exercised. `mpv`/libmpv is optional — without it
-the desktop app falls back to handing playback to an external `mpv` process, and
-the CLI still works.
+Rust 1.95+ (edition 2024; the desktop app's egui/eframe set the floor). Linux,
+macOS and Windows are supported by the stack; Linux/Wayland is what has been
+exercised. `mpv`/libmpv is optional — without it the desktop app falls back to
+handing playback to an external `mpv` process, and the CLI still works.
 
 ## License
 

@@ -1,0 +1,148 @@
+name: Release
+
+# Tag `vX.Y.Z` (or run this by hand) to build the binaries for every supported
+# platform and attach them to a GitHub Release.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release, e.g. v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # The tag being released: the pushed tag, or the one typed for a manual run.
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  archive:
+    name: archive (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+            ext: tar.gz
+            universal: false
+          - os: macos-latest
+            name: macos-universal
+            ext: tar.gz
+            universal: true
+          - os: windows-latest
+            name: windows-x86_64
+            ext: zip
+            universal: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Add macOS targets
+        if: matrix.universal
+        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+      - name: Build
+        if: ${{ !matrix.universal }}
+        run: cargo build --release --locked
+
+      - name: Build and fuse a universal macOS binary
+        if: matrix.universal
+        run: |
+          cargo build --release --locked --target x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          mkdir -p target/release
+          for bin in reel reel-desktop; do
+            lipo -create -output "target/release/$bin" \
+              "target/x86_64-apple-darwin/release/$bin" \
+              "target/aarch64-apple-darwin/release/$bin"
+          done
+
+      - name: Read the version
+        id: v
+        shell: bash
+        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Package
+        shell: bash
+        run: |
+          packaging/make-archive.sh \
+            --bin-dir target/release \
+            --version "${{ steps.v.outputs.version }}" \
+            --name "reel-${{ steps.v.outputs.version }}-${{ matrix.name }}" \
+            --ext "${{ matrix.ext }}" \
+            --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reel-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  packages:
+    name: linux packages (.deb, .rpm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Read the version
+        id: v
+        shell: bash
+        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build the packages
+        run: packaging/make-package.sh --version "${{ steps.v.outputs.version }}" --out dist --deb --rpm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reel-linux-packages
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: [archive, packages]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          repo="${{ github.repository }}"
+          if gh release view "$RELEASE_TAG" --repo "$repo" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" --repo "$repo" --clobber dist/*
+          else
+            gh release create "$RELEASE_TAG" --repo "$repo" \
+              --title "reel $RELEASE_TAG" \
+              --generate-notes \
+              dist/*
+          fi

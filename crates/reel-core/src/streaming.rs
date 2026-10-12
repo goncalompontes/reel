@@ -17,12 +17,26 @@
 //! that is killed before it can clean up is identifiable and swept on the next
 //! start.
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Process-unique counter, so two streams never share a directory even after a
 /// torrent is removed and re-added.
 static NEXT_STREAM: AtomicU64 = AtomicU64::new(0);
+
+/// Marks a scratch root as belonging to a running process.
+const LOCK_NAME: &str = ".reel-lock";
+
+/// Held open (and exclusively locked) for the lifetime of the process, so a
+/// later run can tell this scratch root belongs to a live process.
+///
+/// The liveness test has to work on every platform: an OS file lock is portable,
+/// while `/proc` is Linux-only. Without it, macOS would sweep a *running*
+/// process's scratch (Unix lets you unlink files that are still open), which is
+/// how a second instance could corrupt a live stream.
+static ROOT_LOCK: OnceLock<Option<File>> = OnceLock::new();
 
 /// The default scratch root for this process.
 pub fn scratch_root() -> PathBuf {
@@ -35,6 +49,7 @@ pub fn scratch_root() -> PathBuf {
 /// attempt is cleared so `create_new` in librqbit's storage always succeeds.
 pub fn new_stream_dir(root: &Path) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(root)?;
+    claim_root(root);
     let index = NEXT_STREAM.fetch_add(1, Ordering::Relaxed);
     let dir = root.join(format!("stream-{index}"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -51,26 +66,50 @@ pub fn sweep_stale_scratch() {
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(pid) = name.strip_prefix("reel-stream-").and_then(|s| s.parse::<u32>().ok())
-        else {
+        if name
+            .strip_prefix("reel-stream-")
+            .and_then(|s| s.parse::<u32>().ok())
+            .is_none()
+        {
             continue;
-        };
-        if name == current || pid_alive(pid) {
+        }
+        if name == current || root_in_use(&entry.path()) {
             continue;
         }
         let _ = std::fs::remove_dir_all(entry.path());
     }
 }
 
-fn pid_alive(pid: u32) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        false
+/// Claim `root` for this process, once. Best-effort: a root that cannot be
+/// locked is still usable, it just cannot be told apart from a stale one.
+fn claim_root(root: &Path) {
+    ROOT_LOCK.get_or_init(|| {
+        let file = File::options()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(root.join(LOCK_NAME))
+            .ok()?;
+        // Holding the handle open is the claim; the lock is what the sweeper
+        // tests. If the lock fails we keep the handle anyway.
+        let _ = file.try_lock();
+        Some(file)
+    });
+}
+
+/// Whether another live process still owns `dir`.
+///
+/// A held lock means the owner is running; taking the lock means it is gone. A
+/// directory with no lock file is from an older build, or a crash before the
+/// claim, so it is treated as stale.
+fn root_in_use(dir: &Path) -> bool {
+    let Ok(file) = File::open(dir.join(LOCK_NAME)) else {
+        return false;
+    };
+    match file.try_lock() {
+        Ok(()) => false,
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(_)) => false,
     }
 }
 
@@ -105,5 +144,28 @@ mod tests {
 
         sweep_stale_scratch();
         assert!(!stale.exists(), "a dead process's scratch should be removed");
+    }
+
+    #[test]
+    fn a_live_process_scratch_is_kept() {
+        let parent = std::env::temp_dir();
+        // A root that is *not* this process's own, so the name-equality skip
+        // does not apply and the liveness check is what protects it.
+        let live = parent.join("reel-stream-4294967293");
+        let _ = std::fs::remove_dir_all(&live);
+        std::fs::create_dir_all(&live).unwrap();
+        // Hold the lock the way a running process would.
+        let lock = File::options()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(live.join(LOCK_NAME))
+            .unwrap();
+        lock.try_lock().unwrap();
+
+        sweep_stale_scratch();
+        assert!(live.exists(), "a held lock means the owner is alive");
+
+        let _ = std::fs::remove_dir_all(&live);
     }
 }

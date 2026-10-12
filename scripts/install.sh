@@ -18,6 +18,10 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 
+# Shared dependency helpers: package-manager detection, prompts, tool lookups.
+# shellcheck source=lib/deps.sh
+. "$HERE/lib/deps.sh"
+
 PREFIX="${PREFIX:-$HOME/.local}"
 DESTDIR="${DESTDIR:-}"
 DO_BUILD=1
@@ -27,6 +31,10 @@ WITH_SOLVER=1
 SOLVER_PORT=""
 UNINSTALL=0
 QUIET=0
+# Dependency handling: answer every prompt yes, only report, or just check.
+ASSUME_YES=0
+NO_DEPS=0
+CHECK=0
 
 # systemd user units live somewhere else again when the prefix is a user's.
 systemd_user_dir() {
@@ -50,9 +58,18 @@ Options:
   --with-service    Also install a systemd user unit for `reel serve`
   --without-solver  Do not install the bundled Cloudflare solver (ext.to)
   --solver-port N   Port the bundled solver listens on. Default: 8391
+  -y, --yes         Answer yes to every dependency prompt
+  --no-deps         Never install system packages; only report what is missing
+  --check           Report the runtime dependencies and exit; install nothing.
+                    This is the "doctor": it says what is present and what each
+                    missing tool would break.
   --uninstall       Remove everything this script installs
   -q, --quiet       Only print problems
   -h, --help        This message
+
+reel builds and runs without any optional tool. This installer reports (and,
+with your consent, installs) the ones that unlock features: ffmpeg/ffprobe for
+casting and transcoding, and mpv/libmpv for embedded playback.
 
 Environment: PREFIX and DESTDIR are honoured if set.
 EOF
@@ -69,6 +86,9 @@ while [ $# -gt 0 ]; do
     --with-service) WITH_SERVICE=1; shift ;;
     --without-solver) WITH_SOLVER=0; shift ;;
     --solver-port) SOLVER_PORT="${2:?--solver-port needs a number}"; shift 2 ;;
+    --yes|-y) ASSUME_YES=1; shift ;;
+    --no-deps) NO_DEPS=1; shift ;;
+    --check) CHECK=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     -q|--quiet) QUIET=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -129,6 +149,51 @@ refresh_caches() {
     update-desktop-database "$(DEST "$APP_DIR")" 2>/dev/null || true
   command -v gtk-update-icon-cache >/dev/null 2>&1 &&
     gtk-update-icon-cache -qtf "$(DEST "$PREFIX/share/icons/hicolor")" 2>/dev/null || true
+}
+
+# Report, and with consent install, the tools reel shells out to at runtime.
+#
+# None is a build dependency: reel builds and starts without any of them and
+# says what is missing at the moment it is needed. This is the "doctor" that
+# names each one up front and what it unlocks.
+check_runtime_dependencies() {
+  PKG_MANAGER="$(detect_package_manager)"
+  say ""
+  say "Runtime dependencies (optional — reel runs without them):"
+
+  if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
+    say "  ffmpeg/ffprobe   found: $(command -v ffmpeg)"
+  else
+    install_dependency "ffmpeg/ffprobe" "$(pkg_for "$PKG_MANAGER" ffmpeg)" \
+      "casting to a TV (DLNA/Chromecast) and transcoding need both; playback is unaffected"
+  fi
+
+  if command -v mpv >/dev/null 2>&1 || have_library libmpv; then
+    say "  mpv/libmpv       found"
+  else
+    install_dependency "mpv (libmpv)" "$(pkg_for "$PKG_MANAGER" mpv)" \
+      "embedded playback needs libmpv; without it reel hands playback to an external mpv, and cannot play video at all if that is missing too"
+  fi
+
+  # ext.to's solver clears Cloudflare with a real browser on a virtual display.
+  # During a normal install the solver installer resolves these itself; the
+  # doctor reports them too, so one command shows the whole picture.
+  if [ "$CHECK" -eq 1 ] && [ "$WITH_SOLVER" -eq 1 ]; then
+    local browser
+    browser="$(find_browser)"
+    if [ -n "$browser" ]; then
+      say "  Chrome/Chromium  found: $browser"
+    else
+      install_dependency "Chrome/Chromium" "$(pkg_for "$PKG_MANAGER" browser)" \
+        "the bundled solver needs a browser, so ext.to search will not work"
+    fi
+    if command -v Xvfb >/dev/null 2>&1; then
+      say "  Xvfb             found"
+    else
+      install_dependency "Xvfb" "$(pkg_for "$PKG_MANAGER" xvfb)" \
+        "the solver runs its browser on a virtual display, so ext.to search will not work"
+    fi
+  fi
 }
 
 do_uninstall() {
@@ -243,14 +308,25 @@ do_install() {
       say "Note: not installing the bundled solver into a staging tree. Run"
       say "  scripts/install-solver.sh --prefix <real prefix>"
       say "from the package's post-install step so ext.to works."
-    elif [ -n "$SOLVER_PORT" ]; then
-      "$HERE/install-solver.sh" --prefix "$PREFIX" --port "$SOLVER_PORT"
     else
-      "$HERE/install-solver.sh" --prefix "$PREFIX"
+      # Pass the consent flags through: the solver is where Chrome and Xvfb get
+      # resolved, and it must respect the same --yes / --no-deps choices.
+      solver_args=(--prefix "$PREFIX")
+      if [ -n "$SOLVER_PORT" ]; then solver_args+=(--port "$SOLVER_PORT"); fi
+      if [ "$ASSUME_YES" -eq 1 ]; then solver_args+=(--yes); fi
+      if [ "$NO_DEPS" -eq 1 ]; then solver_args+=(--no-deps); fi
+      "$HERE/install-solver.sh" "${solver_args[@]}"
     fi
   fi
 
   refresh_caches
+
+  # What reel shells out to at runtime, reported (and, with consent, installed)
+  # after the files are in place. Skipped in a staging tree: a package build
+  # must not touch the build machine's packages.
+  if [ -z "$DESTDIR" ]; then
+    check_runtime_dependencies
+  fi
 
   # Validate what we wrote, so a broken desktop entry is caught here and not by
   # the user wondering why there is no launcher.
@@ -275,6 +351,14 @@ do_install() {
     say "Enable the daemon with: systemctl --user enable --now reel.service"
   fi
 }
+
+if [ "$CHECK" -eq 1 ]; then
+  # The doctor: report only. Never install a package or write a file.
+  NO_DEPS=1
+  say "reel dependency check (nothing will be installed or written)"
+  check_runtime_dependencies
+  exit 0
+fi
 
 if [ "$UNINSTALL" -eq 1 ]; then
   do_uninstall
