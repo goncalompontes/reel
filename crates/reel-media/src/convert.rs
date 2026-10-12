@@ -2,13 +2,17 @@
 //!
 //! Kept as pure functions returning argument vectors so the command lines can
 //! be asserted on without spawning anything.
+//!
+//! Inputs are strings, not paths: ffmpeg and ffprobe accept URLs, and a
+//! torrent's bytes are served over HTTP (its on-disk file is incomplete while
+//! it downloads), so the loopback stream URL is the natural input.
 
 use std::path::Path;
 
 use crate::probe::Probe;
 
 /// Arguments for `ffprobe`, which writes the JSON [`Probe::from_json`] reads.
-pub fn probe_args(input: &Path) -> Vec<String> {
+pub fn probe_args(input: &str) -> Vec<String> {
     vec![
         "-v".into(),
         "error".into(),
@@ -16,7 +20,7 @@ pub fn probe_args(input: &Path) -> Vec<String> {
         "json".into(),
         "-show_format".into(),
         "-show_streams".into(),
-        input.to_string_lossy().into_owned(),
+        input.to_string(),
     ]
 }
 
@@ -25,7 +29,7 @@ pub fn probe_args(input: &Path) -> Vec<String> {
 ///
 /// Seek accuracy is limited (only bytes produced so far are available), which
 /// is why the cache tees this to a file for later range requests.
-pub fn remux_stream_args(input: &Path) -> Vec<String> {
+pub fn remux_stream_args(input: &str) -> Vec<String> {
     let mut args = common_args(input);
     args.extend(
         [
@@ -46,8 +50,9 @@ pub fn remux_stream_args(input: &Path) -> Vec<String> {
 ///
 /// Video is copied when it is already 8-bit H.264 at or below the cap;
 /// otherwise it is re-encoded. Audio is copied when a TV will decode it
-/// (`aac`/`mp3`) and re-encoded to AAC otherwise.
-pub fn transcode_args(input: &Path, probe: &Probe, max_height: u32, output: &Path) -> Vec<String> {
+/// (`aac`/`mp3`) and re-encoded to AAC otherwise. A pure remux is just this
+/// with every stream copyable.
+pub fn transcode_args(input: &str, probe: &Probe, max_height: u32, output: &Path) -> Vec<String> {
     let mut args = common_args(input);
     args.extend(video_args(probe, max_height));
     args.extend(audio_args(probe));
@@ -56,14 +61,14 @@ pub fn transcode_args(input: &Path, probe: &Probe, max_height: u32, output: &Pat
     args
 }
 
-fn common_args(input: &Path) -> Vec<String> {
+fn common_args(input: &str) -> Vec<String> {
     vec![
         "-hide_banner".into(),
         "-nostdin".into(),
         "-loglevel".into(),
         "error".into(),
         "-i".into(),
-        input.to_string_lossy().into_owned(),
+        input.to_string(),
         // `?` makes the stream optional, so audio-only files still work.
         "-map".into(),
         "0:v:0?".into(),
@@ -112,11 +117,8 @@ fn audio_args(probe: &Probe) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::probe::{Audio, Video};
-    use std::path::PathBuf;
 
-    fn input() -> PathBuf {
-        PathBuf::from("/in/movie.mkv")
-    }
+    const INPUT: &str = "http://127.0.0.1:3030/stream/1/0";
 
     fn probe(video: Option<Video>, audio: Option<Audio>) -> Probe {
         Probe {
@@ -141,15 +143,15 @@ mod tests {
 
     #[test]
     fn probe_asks_for_json() {
-        let args = probe_args(&input());
+        let args = probe_args(INPUT);
         assert_eq!(&args[..2], ["-v", "error"]);
         assert!(args.contains(&"json".to_string()));
-        assert_eq!(args.last().unwrap(), "/in/movie.mkv");
+        assert_eq!(args.last().unwrap(), INPUT);
     }
 
     #[test]
     fn remux_copies_everything_to_a_fragmented_stream() {
-        let args = remux_stream_args(&input());
+        let args = remux_stream_args(INPUT);
         let joined = args.join(" ");
         assert!(joined.contains("-c copy"));
         assert!(joined.contains("frag_keyframe"));
@@ -160,7 +162,7 @@ mod tests {
     #[test]
     fn transcode_copies_compatible_h264_and_aac() {
         let args = transcode_args(
-            &input(),
+            INPUT,
             &probe(
                 Some(h264()),
                 Some(Audio {
@@ -189,7 +191,7 @@ mod tests {
             bit_depth: Some(10),
         };
         let args = transcode_args(
-            &input(),
+            INPUT,
             &probe(
                 Some(hevc),
                 Some(Audio {
@@ -209,7 +211,7 @@ mod tests {
     #[test]
     fn transcode_only_reencodes_the_audio_when_video_is_fine() {
         let args = transcode_args(
-            &input(),
+            INPUT,
             &probe(
                 Some(h264()),
                 Some(Audio {

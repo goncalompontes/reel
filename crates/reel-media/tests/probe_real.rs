@@ -55,7 +55,10 @@ async fn probes_a_generated_matroska_file() {
         .expect("spawn ffmpeg");
     assert!(status.success(), "ffmpeg failed to build the sample");
 
-    let probe = tools.probe(&file).await.expect("probe the sample");
+    let probe = tools
+        .probe(&file.to_string_lossy())
+        .await
+        .expect("probe the sample");
     assert_eq!(probe.video_codec(), Some("mpeg4"));
     assert_eq!(probe.audio_codec(), Some("aac"));
     assert!(probe.is_matroska());

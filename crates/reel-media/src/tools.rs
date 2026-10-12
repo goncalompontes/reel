@@ -41,8 +41,8 @@ impl Tools {
             .and_then(|exe| exe.parent().map(Path::to_path_buf))
     }
 
-    /// Inspect a file.
-    pub async fn probe(&self, input: &Path) -> Result<Probe> {
+    /// Inspect a file or stream URL.
+    pub async fn probe(&self, input: &str) -> Result<Probe> {
         let output = tokio::process::Command::new(&self.ffprobe)
             .args(convert::probe_args(input))
             .stdin(std::process::Stdio::null())
@@ -61,7 +61,7 @@ impl Tools {
     ///
     /// The child is killed when dropped, so ending the HTTP response stops the
     /// conversion.
-    pub fn spawn_remux(&self, input: &Path) -> Result<tokio::process::Child> {
+    pub fn spawn_remux(&self, input: &str) -> Result<tokio::process::Child> {
         tokio::process::Command::new(&self.ffmpeg)
             .args(convert::remux_stream_args(input))
             .stdin(std::process::Stdio::null())
@@ -75,7 +75,7 @@ impl Tools {
     /// Run a full conversion to `output`, waiting for it to finish.
     pub async fn transcode(
         &self,
-        input: &Path,
+        input: &str,
         probe: &Probe,
         max_height: u32,
         output: &Path,
