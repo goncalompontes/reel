@@ -152,7 +152,7 @@ impl CastService {
         let listener = runtime
             .block_on(reel_http::bind(SocketAddr::new(
                 Ipv4Addr::UNSPECIFIED.into(),
-                0,
+                settings.cast_media_port,
             )))
             .map_err(|error| format!("could not open a LAN media port: {error}"))?;
         let port = listener

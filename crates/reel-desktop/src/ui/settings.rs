@@ -459,6 +459,25 @@ impl App {
             .size(11.0),
         );
 
+        let mut port = draft.cast_media_port as i32;
+        ui.horizontal(|ui| {
+            ui.label("LAN media port (0 = automatic)");
+            if ui
+                .add(egui::DragValue::new(&mut port).range(0..=65535))
+                .changed()
+            {
+                draft.cast_media_port = port as u16;
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "If a firewall is running (e.g. ufw), allow this port from your LAN — \
+                 otherwise the TV cannot fetch the stream and casting fails with UPnP \
+                 error 716.",
+            )
+            .color(theme::TEXT_DIM)
+            .size(11.0),
+        );
         ui.add_space(10.0);
         ui.label(
             egui::RichText::new("When a file is not directly playable")

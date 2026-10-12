@@ -147,6 +147,11 @@ pub struct CatalogSettings {
     #[serde(default)]
     pub allow_hevc_passthrough: bool,
 
+    /// TCP port for the LAN media server. A fixed port lets a firewall rule
+    /// allow the TV through; `0` asks the OS for one.
+    #[serde(default = "default_cast_media_port")]
+    pub cast_media_port: u16,
+
     /// Path to an `ffmpeg` binary. `None` uses a bundled copy, then `PATH`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ffmpeg_path: Option<String>,
@@ -183,6 +188,10 @@ fn default_stream_cache_mb() -> u32 {
 
 fn default_conversion_max_height() -> u32 {
     1080
+}
+
+fn default_cast_media_port() -> u16 {
+    41337
 }
 
 /// Trim a text setting and treat an empty result as unset.
@@ -222,6 +231,7 @@ impl Default for CatalogSettings {
             conversion_mode: ConversionMode::default(),
             conversion_max_height: default_conversion_max_height(),
             allow_hevc_passthrough: false,
+            cast_media_port: default_cast_media_port(),
             ffmpeg_path: None,
         }
     }
@@ -412,6 +422,7 @@ mod tests {
             !settings.allow_hevc_passthrough,
             "passthrough must be opted into"
         );
+        assert_eq!(settings.cast_media_port, 41337);
     }
 
     #[test]
