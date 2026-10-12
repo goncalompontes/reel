@@ -440,6 +440,10 @@ pub trait Backend {
     /// Start (or repeat) a renderer search.
     fn refresh_cast_devices(&self) {}
 
+    /// Find a renderer at a specific address (IP, `ip:port`, or a URL) and add
+    /// it. The escape hatch for networks that block SSDP multicast.
+    fn add_cast_device(&self, _address: String) {}
+
     /// Cast a torrent file to the renderer with the given UDN.
     fn start_cast(&self, _udn: String, _torrent_id: usize, _file_id: usize, _title: String) {}
 

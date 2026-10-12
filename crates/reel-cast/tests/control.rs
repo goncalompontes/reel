@@ -20,7 +20,7 @@ use url::Url;
 
 use reel_cast::CastError;
 use reel_cast::session::{CastSession, SessionState};
-use reel_cast::target::{CastTarget, describe};
+use reel_cast::target::{CastTarget, describe, probe_host};
 
 const AV: &str = "urn:schemas-upnp-org:service:AVTransport:1";
 
@@ -328,6 +328,22 @@ async fn session_tracks_state_and_position() {
 
     assert_eq!(session.title(), "Episode 1");
     assert_eq!(session.media_url(), "http://10.0.0.1/media/x.mp4");
+}
+
+#[tokio::test]
+async fn probe_host_finds_a_renderer_without_ssdp() {
+    let (addr, _renderer) = start().await;
+    let devices = probe_host(
+        addr.ip(),
+        addr.port(),
+        addr.port(),
+        Duration::from_millis(500),
+    )
+    .await
+    .unwrap();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].name(), "Fake TV");
+    assert!(devices[0].av_transport().is_some());
 }
 
 #[tokio::test]

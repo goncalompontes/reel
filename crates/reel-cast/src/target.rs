@@ -5,9 +5,14 @@
 //! the SOAP documents from [`crate::soap`] to the device's `AVTransport` and
 //! `RenderingControl` control URLs.
 
+use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use url::Url;
 
 use crate::device::{self, DeviceDescription, Service};
@@ -90,6 +95,104 @@ pub async fn discover_devices(timeout: Duration) -> Result<Vec<CastDevice>> {
             Err(error) => {
                 tracing::debug!(location = %response.location, %error, "could not describe renderer")
             }
+        }
+    }
+    Ok(devices)
+}
+
+/// The default connect timeout for a port scan.
+const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_millis(120);
+
+/// Resolve a user-entered address to renderers.
+///
+/// Accepts an IP (scanning its port range), `ip:port` (scanning just that
+/// port), or a full description URL (fetched directly). This is the escape
+/// hatch for networks that drop SSDP multicast between clients.
+pub async fn probe_address(address: &str) -> Result<Vec<CastDevice>> {
+    let address = address.trim();
+
+    if let Ok(ip) = address.parse::<IpAddr>() {
+        return probe_host(ip, 1024, 65535, DEFAULT_PROBE_TIMEOUT).await;
+    }
+    if let Some((host, port)) = address.rsplit_once(':') {
+        if let (Ok(ip), Ok(port)) = (host.parse::<IpAddr>(), port.parse::<u16>()) {
+            return probe_host(ip, port, port, DEFAULT_PROBE_TIMEOUT).await;
+        }
+    }
+
+    let location = CastError::parse_url(address)?;
+    let client = reqwest::Client::new();
+    Ok(vec![describe(&client, &location).await?])
+}
+
+/// Scan a single host for DLNA MediaRenderers, bypassing SSDP.
+///
+/// Some networks drop SSDP multicast between clients, and some renderers ignore
+/// unicast `M-SEARCH`. This reaches them anyway: it probes
+/// `first_port..=last_port` for open TCP sockets and fetches each one as a UPnP
+/// description, keeping the devices that expose `AVTransport`.
+pub async fn probe_host(
+    ip: IpAddr,
+    first_port: u16,
+    last_port: u16,
+    connect_timeout: Duration,
+) -> Result<Vec<CastDevice>> {
+    let permits = Arc::new(Semaphore::new(2048));
+    let mut tasks: JoinSet<Option<u16>> = JoinSet::new();
+    let mut open: Vec<u16> = Vec::new();
+
+    for port in first_port..=last_port {
+        // The permit moves into the task, so the scan stays bounded.
+        let Ok(permit) = permits.clone().acquire_owned().await else {
+            break;
+        };
+        tasks.spawn(async move {
+            let _permit = permit;
+            match tokio::time::timeout(connect_timeout, TcpStream::connect((ip, port))).await {
+                Ok(Ok(_)) => Some(port),
+                _ => None,
+            }
+        });
+        while let Some(joined) = tasks.try_join_next() {
+            if let Ok(Some(port)) = joined {
+                open.push(port);
+            }
+        }
+    }
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok(Some(port)) = joined {
+            open.push(port);
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()?;
+    // Vendors disagree on where the description lives; "/" and the two common
+    // filenames cover every device seen so far.
+    const PATHS: [&str; 5] = [
+        "/",
+        "/description.xml",
+        "/rootDesc.xml",
+        "/dd.xml",
+        "/upnp/desc.xml",
+    ];
+
+    let mut devices: Vec<CastDevice> = Vec::new();
+    for port in open {
+        for path in PATHS {
+            let Ok(location) = Url::parse(&format!("http://{ip}:{port}{path}")) else {
+                continue;
+            };
+            let Ok(device) = describe(&client, &location).await else {
+                continue;
+            };
+            // This port served a description; stop trying paths on it.
+            let duplicate = devices.iter().any(|seen| seen.udn() == device.udn());
+            if device.av_transport().is_some() && !duplicate {
+                devices.push(device);
+            }
+            break;
         }
     }
     Ok(devices)

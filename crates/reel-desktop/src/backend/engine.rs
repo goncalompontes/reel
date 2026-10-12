@@ -1600,6 +1600,12 @@ impl Backend for EngineBackend {
         }
     }
 
+    fn add_cast_device(&self, address: String) {
+        if let Some(cast) = self.cast() {
+            cast.add_by_address(&address);
+        }
+    }
+
     fn start_cast(&self, udn: String, torrent_id: usize, file_id: usize, title: String) {
         if let Some(cast) = self.cast() {
             cast.start_cast(udn, torrent_id, file_id, title);

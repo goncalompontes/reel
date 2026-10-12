@@ -88,7 +88,12 @@ impl App {
 
                 let devices = self.backend.cast_devices();
                 if devices.is_empty() && !self.backend.cast_discovering() {
-                    ui.label(egui::RichText::new("No renderers found.").color(theme::TEXT_DIM));
+                    ui.label(
+                        egui::RichText::new(
+                            "No renderers found. If your TV supports DLNA, add it by address below.",
+                        )
+                        .color(theme::TEXT_DIM),
+                    );
                 }
                 let mut chosen: Option<String> = None;
                 for device in &devices {
@@ -101,6 +106,31 @@ impl App {
                         }
                     });
                 }
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Add by address");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.cast_address)
+                            .hint_text("192.168.1.50")
+                            .desired_width(130.0),
+                    );
+                    if ui.button("Add").clicked() {
+                        let address = self.cast_address.trim().to_string();
+                        if !address.is_empty() {
+                            self.backend.add_cast_device(address);
+                        }
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Use this when the TV does not appear (some networks block discovery).",
+                    )
+                    .size(11.0)
+                    .color(theme::TEXT_DIM),
+                );
+
                 if let Some(udn) = chosen {
                     if let Some((torrent_id, file_id, title)) = self.cast_pending.clone() {
                         self.backend.start_cast(udn, torrent_id, file_id, title);

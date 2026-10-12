@@ -30,7 +30,9 @@ pub use error::{CastError, Result};
 pub use session::{CastSession, SessionState};
 pub use soap::{MediaInfo, PositionInfo, SoapFault, SoapRequest, TransportInfo};
 pub use ssdp::SsdpResponse;
-pub use target::{CastDevice, CastTarget, DlnaTarget, describe, discover_devices};
+pub use target::{
+    CastDevice, CastTarget, DlnaTarget, describe, discover_devices, probe_address, probe_host,
+};
 
 /// UPnP `AVTransport` transport states, as reported by `GetTransportInfo`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

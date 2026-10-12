@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reel_cast::session::{CastSession, SessionState};
-use reel_cast::{CastDevice, DlnaTarget, didl, discover_devices};
+use reel_cast::{CastDevice, DlnaTarget, didl, discover_devices, probe_address};
 use reel_catalog::{CatalogSettings, ConversionMode};
 use reel_core::Engine;
 use reel_http::{MediaState, build_media_router};
@@ -290,6 +290,41 @@ impl CastService {
                     guard.devices = devices;
                 }
                 Err(error) => tracing::warn!(%error, "renderer search failed"),
+            }
+        });
+    }
+
+    /// Find a renderer at a specific address and add it to the list.
+    ///
+    /// Accepts an IP, `ip:port`, or a description URL. This bypasses SSDP, for
+    /// networks that drop multicast between clients.
+    pub fn add_by_address(&self, address: &str) {
+        let address = address.trim().to_string();
+        if address.is_empty() {
+            return;
+        }
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.discovering = true;
+        }
+        let inner = self.inner.clone();
+        self.runtime.spawn(async move {
+            let found = probe_address(&address).await;
+            let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+            guard.discovering = false;
+            match found {
+                Ok(devices) if devices.is_empty() => {
+                    tracing::info!(%address, "no renderer found at that address")
+                }
+                Ok(devices) => {
+                    for device in devices {
+                        if !guard.devices.iter().any(|seen| seen.udn() == device.udn()) {
+                            tracing::info!(name = device.name(), %address, "added renderer by address");
+                            guard.devices.push(device);
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!(%address, %error, "address scan failed"),
             }
         });
     }

@@ -295,6 +295,8 @@ pub struct App {
     /// The cast picker popover, and the file to cast when a device is chosen.
     cast_open: bool,
     cast_pending: Option<(usize, usize, String)>,
+    /// The "Add by address" text in the cast picker.
+    cast_address: String,
     player: PlayerController,
     /// Last time the mouse or a key moved, for hiding the chrome in fullscreen.
     player_last_activity: Instant,
@@ -395,6 +397,7 @@ impl App {
             settings_section: SettingsSection::General,
             cast_open: false,
             cast_pending: None,
+            cast_address: String::new(),
             player: PlayerController::new(),
             player_last_activity: Instant::now(),
             player_controls_hidden: false,
