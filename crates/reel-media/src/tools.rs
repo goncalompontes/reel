@@ -61,9 +61,13 @@ impl Tools {
     ///
     /// The child is killed when dropped, so ending the HTTP response stops the
     /// conversion.
-    pub fn spawn_remux(&self, input: &str) -> Result<tokio::process::Child> {
+    pub fn spawn_remux(
+        &self,
+        input: &str,
+        video_tag: Option<&str>,
+    ) -> Result<tokio::process::Child> {
         tokio::process::Command::new(&self.ffmpeg)
-            .args(convert::remux_stream_args(input))
+            .args(convert::remux_stream_args(input, video_tag))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

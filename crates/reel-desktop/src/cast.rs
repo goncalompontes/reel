@@ -121,6 +121,9 @@ pub struct CastService {
     session: Arc<tokio::sync::Mutex<Option<CastSession>>>,
     /// Resolving this stops the LAN media server.
     shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// MP4 sample-entry tag for the current live remux (`hvc1` for HEVC), set
+    /// when a cast is prepared and read by the live source.
+    remux_tag: Arc<Mutex<Option<String>>>,
 }
 
 impl CastService {
@@ -163,18 +166,27 @@ impl CastService {
 
         // Live remux: ffmpeg reads the loopback stream and writes a fragmented
         // MP4, which the LAN endpoint streams and tees into the cache.
+        let remux_tag: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let live_source: reel_http::LiveSource = {
             let engine = engine.clone();
             let ffmpeg = tools.ffmpeg.clone();
             let cache = cache.clone();
             let loopback = loopback_base.clone();
+            let remux_tag = remux_tag.clone();
             Arc::new(move |id: usize, file_id: usize| {
                 let length = engine.probe_file(id, file_id).ok()?.length;
                 let info_hash = engine.view(id).ok()?.info_hash;
                 let key = CacheKey::for_plan(info_hash, file_id as u64, length, &MediaPlan::Remux);
                 let source = format!("{loopback}/stream/{id}/{file_id}");
+                let tag = remux_tag
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 let mut command = tokio::process::Command::new(&ffmpeg);
-                command.args(reel_media::convert::remux_stream_args(&source));
+                command.args(reel_media::convert::remux_stream_args(
+                    &source,
+                    tag.as_deref(),
+                ));
                 Some(reel_http::LiveSession {
                     command,
                     tee: Some(cache.path_for(&key)),
@@ -211,6 +223,7 @@ impl CastService {
             inner: Arc::new(Mutex::new(Inner::default())),
             session: Arc::new(tokio::sync::Mutex::new(None)),
             shutdown: Mutex::new(Some(shutdown_tx)),
+            remux_tag,
         })
     }
 
@@ -381,6 +394,7 @@ impl CastService {
         let token = self.token.clone();
         let session_slot = self.session.clone();
         let inner = self.inner.clone();
+        let remux_tag = self.remux_tag.clone();
 
         self.runtime.spawn(async move {
             let result = prepare_and_start(
@@ -395,6 +409,7 @@ impl CastService {
                 engine_id,
                 file_id,
                 &title,
+                &remux_tag,
             )
             .await;
 
@@ -527,10 +542,20 @@ async fn prepare_and_start(
     id: usize,
     file_id: usize,
     title: &str,
+    remux_tag: &Arc<Mutex<Option<String>>>,
 ) -> anyhow::Result<CastSession> {
     let source_url = format!("{loopback_base}/stream/{id}/{file_id}");
     let probe = tools.probe(&source_url).await?;
     let plan = plan(&probe, &options);
+
+    // HEVC in MP4 must carry the `hvc1` sample-entry tag, or televisions report
+    // the format as unrecognised. Remembered for the live-remux command.
+    let video_tag = probe
+        .video
+        .as_ref()
+        .is_some_and(|video| matches!(video.codec.as_str(), "hevc" | "h265"))
+        .then(|| "hvc1".to_string());
+    *remux_tag.lock().unwrap_or_else(|e| e.into_inner()) = video_tag;
 
     let (url, seekable, converted) = match plan {
         MediaPlan::Original => (original_url(lan_base, token, id, file_id), true, false),

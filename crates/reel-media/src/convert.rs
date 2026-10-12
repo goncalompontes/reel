@@ -27,14 +27,21 @@ pub fn probe_args(input: &str) -> Vec<String> {
 /// Arguments for a live remux: copy every stream into a fragmented MP4 on
 /// stdout, which starts playing immediately without seeking to the end.
 ///
+/// `video_tag` sets the MP4 sample-entry tag for the video stream. HEVC must be
+/// `hvc1`, not ffmpeg's default `hev1`, or televisions reject it as an unknown
+/// format. It is `None` for other codecs (an incompatible tag errors).
+///
 /// Seek accuracy is limited (only bytes produced so far are available), which
 /// is why the cache tees this to a file for later range requests.
-pub fn remux_stream_args(input: &str) -> Vec<String> {
+pub fn remux_stream_args(input: &str, video_tag: Option<&str>) -> Vec<String> {
     let mut args = common_args(input);
+    args.extend(["-c", "copy"].map(String::from));
+    if let Some(tag) = video_tag {
+        args.push("-tag:v".to_string());
+        args.push(tag.to_string());
+    }
     args.extend(
         [
-            "-c",
-            "copy",
             "-movflags",
             "frag_keyframe+empty_moov+default_base_moof",
             "-f",
@@ -151,12 +158,19 @@ mod tests {
 
     #[test]
     fn remux_copies_everything_to_a_fragmented_stream() {
-        let args = remux_stream_args(INPUT);
+        let args = remux_stream_args(INPUT, None);
         let joined = args.join(" ");
         assert!(joined.contains("-c copy"));
         assert!(joined.contains("frag_keyframe"));
         assert_eq!(args.last().unwrap(), "pipe:1");
         assert!(joined.contains("-sn"));
+        assert!(!joined.contains("-tag:v"));
+    }
+
+    #[test]
+    fn remux_tags_hevc_as_hvc1() {
+        let joined = remux_stream_args(INPUT, Some("hvc1")).join(" ");
+        assert!(joined.contains("-tag:v hvc1"));
     }
 
     #[test]
