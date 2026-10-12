@@ -4729,7 +4729,10 @@ dependencies = [
 name = "reel-cast"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "axum",
  "quick-xml",
+ "reqwest",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

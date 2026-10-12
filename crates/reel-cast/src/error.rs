@@ -42,6 +42,19 @@ pub enum CastError {
         /// Human-readable description.
         description: String,
     },
+
+    /// A request to the device failed at the transport level.
+    #[error("request to the device failed: {0}")]
+    Request(#[from] reqwest::Error),
+
+    /// The device answered with a non-success HTTP status and no SOAP fault.
+    #[error("device returned HTTP {status}: {body}")]
+    HttpStatus {
+        /// HTTP status code.
+        status: u16,
+        /// Response body, for context.
+        body: String,
+    },
 }
 
 impl CastError {
