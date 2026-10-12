@@ -122,6 +122,41 @@ pub struct CatalogSettings {
     /// regardless unless seeding is enabled outside the app.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upload_limit_kib: Option<u32>,
+
+    /// Stream to DLNA/UPnP renderers on the local network. Off by default: it
+    /// opens a LAN-facing, token-gated media port.
+    #[serde(default)]
+    pub allow_lan_streaming: bool,
+
+    /// LAN address to advertise in cast URLs. `None` picks the primary
+    /// non-loopback IPv4 automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast_lan_address: Option<String>,
+
+    /// How far to go when a file is not directly playable.
+    #[serde(default)]
+    pub conversion_mode: ConversionMode,
+
+    /// Quality cap, in pixels, applied when re-encoding.
+    #[serde(default = "default_conversion_max_height")]
+    pub conversion_max_height: u32,
+
+    /// Path to an `ffmpeg` binary. `None` uses a bundled copy, then `PATH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ffmpeg_path: Option<String>,
+}
+
+/// How much conversion the user allows when casting an incompatible file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConversionMode {
+    /// Only cast files a typical TV can already play.
+    Off,
+    /// Rewrap the container, but never re-encode.
+    Remux,
+    /// Rewrap when possible, re-encode only when necessary.
+    #[default]
+    Auto,
 }
 
 fn default_true() -> bool {
@@ -138,6 +173,10 @@ fn default_stream_buffer_mb() -> u32 {
 
 fn default_stream_cache_mb() -> u32 {
     1024
+}
+
+fn default_conversion_max_height() -> u32 {
+    1080
 }
 
 /// Trim a text setting and treat an empty result as unset.
@@ -172,6 +211,11 @@ impl Default for CatalogSettings {
             peer_limit: None,
             download_limit_kib: None,
             upload_limit_kib: None,
+            allow_lan_streaming: false,
+            cast_lan_address: None,
+            conversion_mode: ConversionMode::default(),
+            conversion_max_height: default_conversion_max_height(),
+            ffmpeg_path: None,
         }
     }
 }
@@ -275,6 +319,9 @@ impl CatalogSettings {
         self.ext_to_cookie = trim_blank(self.ext_to_cookie.take());
         self.ext_to_user_agent = trim_blank(self.ext_to_user_agent.take());
         self.ext_to_solver_url = trim_blank(self.ext_to_solver_url.take());
+        self.cast_lan_address = trim_blank(self.cast_lan_address.take());
+        self.ffmpeg_path = trim_blank(self.ffmpeg_path.take());
+        self.conversion_max_height = self.conversion_max_height.clamp(144, 4320);
     }
 }
 
@@ -343,6 +390,37 @@ mod tests {
         );
         assert!(settings.subtitles_enabled);
         assert_eq!(settings.default_volume, 100.0);
+    }
+
+    #[test]
+    fn casting_defaults_are_conservative() {
+        let settings = CatalogSettings::default();
+        assert!(
+            !settings.allow_lan_streaming,
+            "opening a LAN media port is opt-in"
+        );
+        assert_eq!(settings.conversion_mode, ConversionMode::Auto);
+        assert_eq!(settings.conversion_max_height, 1080);
+    }
+
+    #[test]
+    fn conversion_mode_round_trips_as_lowercase() {
+        let dir = scratch("conversion");
+        CatalogSettings {
+            conversion_mode: ConversionMode::Remux,
+            conversion_max_height: 720,
+            ..Default::default()
+        }
+        .save(&dir)
+        .unwrap();
+
+        let loaded = CatalogSettings::load(&dir);
+        assert_eq!(loaded.conversion_mode, ConversionMode::Remux);
+        assert_eq!(loaded.conversion_max_height, 720);
+
+        let raw = std::fs::read_to_string(CatalogSettings::path(&dir)).unwrap();
+        assert!(raw.contains("\"remux\""), "stored mode should be readable");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

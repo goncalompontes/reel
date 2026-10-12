@@ -30,6 +30,8 @@ use reel_core::{
     AddOptions, AddSource, Engine, EngineConfig, LibraryEntry, LibraryStore, StoredFile,
 };
 
+use crate::cast::CastService;
+
 /// How many metadata lookups may be in flight at once. Providers rate-limit, and
 /// a library can be large.
 const MAX_CONCURRENT_LOOKUPS: usize = 2;
@@ -505,6 +507,8 @@ pub struct EngineBackend {
     /// Last measured cache figures, so the settings page does not walk the
     /// cache directory on every frame.
     cache_stats: Mutex<Option<CacheStats>>,
+    /// Casting to DLNA renderers, when enabled and available.
+    cast: Option<CastService>,
 }
 
 impl EngineBackend {
@@ -652,6 +656,25 @@ impl EngineBackend {
         )));
         let media = Arc::new(Mutex::new(MediaStore::load(&MediaStore::path(&data_dir))));
 
+        // Casting is opt-in: it opens a LAN-facing media port, so it only runs
+        // when the setting is on and ffmpeg is available.
+        let cast = match CastService::new(
+            engine.clone(),
+            base_url.clone(),
+            data_dir.clone(),
+            &catalog_options.settings,
+            runtime.handle().clone(),
+        ) {
+            Ok(service) => {
+                service.refresh_devices();
+                Some(service)
+            }
+            Err(reason) => {
+                tracing::info!(%reason, "casting is not available");
+                None
+            }
+        };
+
         let backend = Self {
             runtime,
             engine,
@@ -665,6 +688,7 @@ impl EngineBackend {
             stream_cache: Mutex::new(HashMap::new()),
             playing: Mutex::new(None),
             cache_stats: Mutex::new(None),
+            cast,
         };
 
         // The media store owns what is being kept. Adopt any old per-torrent
@@ -676,6 +700,14 @@ impl EngineBackend {
         backend.restore_downloads();
         backend.enrich_library();
         Ok(backend)
+    }
+
+    /// The casting service, when the LAN media server is running.
+    ///
+    /// `None` means casting is off or unavailable (the setting is disabled, or
+    /// ffmpeg is missing).
+    pub fn cast(&self) -> Option<&CastService> {
+        self.cast.as_ref()
     }
 
     fn push(&self, event: BackendEvent) {

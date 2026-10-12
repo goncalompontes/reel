@@ -19,6 +19,8 @@ reel-core.workspace = true
 reel-http.workspace = true
 reel-player.workspace = true
 reel-catalog.workspace = true
+reel-cast.workspace = true
+reel-media.workspace = true
 
 anyhow.workspace = true
 clap.workspace = true

@@ -52,7 +52,7 @@ pub use provider::{MetadataProvider, NullProvider, StaticProvider, TmdbProvider}
 pub use release::{FileInput, MediaKind, Release, ReleaseAttributes, Trust, analyse, parse_one};
 pub use rows::{Row, RowKind, WorkRow, build_rows, build_work_rows};
 pub use search::{SearchAggregator, SearchError, SearchHit, SearchQuery, SearchResults};
-pub use settings::{CatalogSettings, KeySource};
+pub use settings::{CatalogSettings, ConversionMode, KeySource};
 pub use tmdb::TmdbClient;
 pub use work::{
     EpisodeVariant, Version, Work, WorkEpisode, WorkExtra, WorkMember, WorkSeason, build_works,
