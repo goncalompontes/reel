@@ -21,8 +21,10 @@ ROOT="${ROOT:-/tmp/opencode/reel-e2e-data}"
 
 PASS=0
 FAIL=0
+SKIP=0
 ok()   { echo "  PASS  $*"; PASS=$((PASS+1)); }
 bad()  { echo "  FAIL  $*"; FAIL=$((FAIL+1)); }
+skip() { echo "  SKIP  $*"; SKIP=$((SKIP+1)); }
 check(){ if [ "$2" = "$3" ]; then ok "$1 ($2)"; else bad "$1: expected [$3] got [$2]"; fi; }
 jq_()  { python3 -c "import json,sys; d=json.load(sys.stdin); print($1)" 2>/dev/null || echo ""; }
 
@@ -195,7 +197,13 @@ echo "== 17. native playback: libmpv decodes the torrent stream =="
 # video pipeline (libmpv, the same decoder mpv and VLC use) and must produce
 # actual picture while the torrent is still incomplete.
 DUMP="${DUMP_FRAME:-$HERE/../target/debug/examples/dump_frame}"
-if [ ! -x "$DUMP" ]; then
+# Steps 17-20 need embedded libmpv at a client API reel has verified (>= 2.5).
+# A distro mpv older than that is refused on purpose, so a runner whose mpv is
+# older can set REEL_E2E_SKIP_PLAYBACK to skip them rather than fail. Unset, the
+# steps run and must pass — which is what a developer machine wants.
+if [ "${REEL_E2E_SKIP_PLAYBACK:-0}" = "1" ]; then
+  skip "native playback steps 17-20 (REEL_E2E_SKIP_PLAYBACK=1: libmpv not exercised)"
+elif [ ! -x "$DUMP" ]; then
   bad "dump_frame not built (run: cargo build -p reel-player --example dump_frame)"
 else
   PLAYER_LOG="$ROOT/logs/player.log"
@@ -338,7 +346,9 @@ echo "== 24. the installed launcher points at a real binary =="
 # clicks an icon. A desktop entry whose Exec cannot be found does nothing at
 # all: no window, no message, no journal entry.
 PREFIX_TREE="$ROOT/install-prefix"
-"$HERE/install.sh" --prefix "$PREFIX_TREE" --no-build --quiet >/dev/null 2>&1
+# --debug: this suite runs the debug binaries, so the installer must place the
+# same profile (it defaults to release, which CI does not build here).
+"$HERE/install.sh" --prefix "$PREFIX_TREE" --debug --no-build --quiet >/dev/null 2>&1
 ENTRY="$PREFIX_TREE/share/applications/reel.desktop"
 
 if [ -f "$ENTRY" ]; then
@@ -360,6 +370,16 @@ if [ -f "$ENTRY" ]; then
 else
   bad "the installer wrote no desktop entry"
 fi
+
+# The doctor must report the runtime dependencies without changing anything.
+if "$HERE/install.sh" --check > "$ROOT/logs/doctor.log" 2>&1; then
+  ok "install.sh --check (the doctor) exits cleanly"
+else
+  bad "install.sh --check failed"
+fi
+grep -q "Runtime dependencies" "$ROOT/logs/doctor.log" \
+  && ok "the doctor reported the runtime dependencies" \
+  || bad "the doctor printed no dependency report"
 
 echo "== 25. watching one episode fetches only that episode =="
 # The season-pack case. Adding with media_only selects every playable file, so
@@ -481,5 +501,5 @@ curl -s --max-time 60 -o "$PACK/chunk.bin" -r 0-32767 "$URL"
 check "the episode streams" "$(stat -c%s "$PACK/chunk.bin" 2>/dev/null || echo 0)" "32768"
 
 echo
-echo "===== $PASS passed, $FAIL failed ====="
+echo "===== $PASS passed, $FAIL failed, $SKIP skipped ====="
 exit $(( FAIL > 0 ))

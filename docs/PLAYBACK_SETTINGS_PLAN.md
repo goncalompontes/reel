@@ -226,3 +226,34 @@ session, so a persisted store of sources (magnet/info hash + metadata +
 actively streaming or downloading. `Play` ensures a temporary-storage torrent
 and removes it on stop; `Download` ensures a filesystem-storage torrent and
 keeps it. This is implemented as a separate pass, after merging lands.
+
+---
+
+# Later passes
+
+> **Storage pass.** The hand-rolled temporary `TorrentStorage` was removed. A
+> stream now uses librqbit's own `FilesystemStorageFactory` in a per-stream
+> directory under the temp dir: files are created at full length and written at
+> their offsets, so only fetched bytes allocate and there is no whole-file RAM
+> buffer or zero-filling spill. `stream_memory_budget` is gone. The vendored
+> read-ahead window is configurable (`stream_lookahead_bytes`, from the Stream
+> buffer setting), and the old `readahead_bytes` governor — wrong for a windowed
+> fetch — is removed.
+>
+> **Stable stream URLs.** `AddOptions::preferred_id` makes a re-add reuse the
+> engine id, so a player holding a URL across a `recycle` still resolves it. The
+> HTTP stream handler waits briefly for a torrent being re-added instead of
+> 404ing, and the resume fast path resumes before changing the file selection.
+>
+> **Media-owned downloads.** `reel-catalog/src/media.rs` adds a persisted
+> `MediaStore` (`media.json`): a download is owned by a media key (a film or an
+> episode) and references files by `(info_hash, path)`. The backend derives each
+> source's engine selection from it, so a download survives a re-add, a reorder
+> and a restart, and each copy is independently downloadable. Old per-torrent
+> state is adopted once.
+>
+> **A real bug this fixed.** A synthesized (not-live) torrent view built its
+> stream path as `/stream/{id}/{name}`, missing the file id, so a play that
+> captured the view during a re-add handed mpv a URL the router answered with
+> `400 Bad Request` ("loading failed"). Stream paths now come from one tested
+> helper.

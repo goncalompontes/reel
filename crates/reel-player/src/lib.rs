@@ -41,6 +41,10 @@ pub fn embedded_available() -> Result<(), PlayerError> {
 /// The libmpv client API version reported at runtime, if libmpv loads.
 pub fn mpv_api_version() -> Option<(u64, u64)> {
     let lib = ffi::MpvLib::load().ok()?;
-    let version = unsafe { (lib.mpv_client_api_version)() };
+    // `mpv_client_api_version` returns `c_ulong`, which is 64-bit on Linux and
+    // 32-bit on Windows; widen it so the split is target-independent. The cast
+    // is a no-op on Linux, hence the allow.
+    #[allow(clippy::unnecessary_cast)]
+    let version = unsafe { (lib.mpv_client_api_version)() } as u64;
     Some((version >> 16, version & 0xffff))
 }

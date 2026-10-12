@@ -6,6 +6,9 @@
 //! torrent engine plus its HTTP streaming API run in-process.
 
 pub mod backend;
+pub mod cast;
+pub mod components;
+pub mod icons;
 pub mod player;
 pub mod testing;
 pub mod theme;
@@ -13,7 +16,7 @@ pub mod ui;
 
 pub use backend::{
     Backend, BackendCapabilities, BackendEvent, CatalogOptions, CatalogStatus, EngineBackend,
-    FakeBackend, LibraryItem, PlayerCapability,
+    FakeBackend, FakeCast, LibraryItem, PlayerCapability,
 };
 pub use player::{PlaybackInfo, PlaybackStats, PlayerController};
 pub use ui::{App, RowLayout, Screen};

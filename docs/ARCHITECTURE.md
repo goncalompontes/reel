@@ -204,14 +204,12 @@ the two agree on what a title is.
 `NullProvider` is what you get with no API key, and `StaticProvider` backs the
 tests and `--demo`. The UI never knows which is in use.
 
-`SearchBackend` is the seam for *discovery*. Exactly one implementation is
-bundled — `backends::archive_org`, the Internet Archive — chosen because it
-indexes only public-domain and Creative Commons film, and because it doubles as
-the reference implementation: one HTTP request, no scraping, no credentials.
+`SearchBackend` is the seam for *discovery*. The bundled implementation is
+`backends::ext_to`, a general torrent index. It also serves as the reference
+for scraping and handling a site behind a Cloudflare challenge.
 
 Where the *rest* of the results come from is the operator's decision and their
-responsibility, which is why the seam is a trait and
-`docs/ADDING_A_SOURCE.md` exists. `SearchAggregator` merges sources, drops hits
+responsibility, which is why the seam is a trait. `SearchAggregator` merges sources, drops hits
 with no magnet or `.torrent` URL, sorts by seeders then popularity then size, and
 reports per-backend failures rather than hiding them behind an empty list.
 
@@ -270,13 +268,18 @@ entry that depends on `PATH`. The key is therefore stored in
 editable from the settings page. The environment still wins when it is set, so
 scripts and one-off runs are unaffected.
 
-### Watch positions are per file
+### Watch positions are per file and per media
 
 `WatchHistory` keys entries as `<info hash>#<file id>`. A series is one torrent
 with many episodes, and a single position per torrent would resume episode one at
 episode two's timestamp. Entries without a `#` are the older format and are still
 read, so an existing history is not lost. `History::recent` collapses to one
 entry per torrent, because "continue watching" is about the show, not the file.
+
+Alongside it, the media store (`media.json`) keeps the position by *media key*
+(`work.key#s01e02`), computed the same way the UI's `Work` grouping is. That is
+what lets a resume follow the episode to a different release: the media-keyed
+position is read first, and the per-file history is the fallback.
 
 ### Fetching one file at a time
 
@@ -300,6 +303,21 @@ watched. With realistic sizes — gigabytes per episode, 2 MiB pieces — that i
 negligible; the first version of the test used 700 KB fixtures against the 2 MiB
 default, which put the entire torrent in two pieces and made selection look
 broken when it was working exactly as designed.
+
+### Downloads and resume belong to the media
+
+A download is not a property of a torrent. It is recorded in a media store
+(`reel-catalog/src/media.rs`, persisted as `media.json`) keyed by the media —
+`work.key#movie`, `work.key#s01e02`, or an air date — and it references files by
+`(info hash, path)`, never by the engine's positional `file_id`. The backend
+then *derives* each source's engine selection from the store, so a download
+survives the torrent being re-added, reordered, or replaced by another release,
+and each copy of a film or episode stays independently downloadable. The old
+per-torrent state is adopted once on first run.
+
+Storage was once a hand-rolled `TorrentStorage` (whole files in RAM, spilled to
+scratch). It is now librqbit's own filesystem storage, pointed at a per-stream
+temp directory: sparse files written at their offsets, no whole-file buffer.
 
 ## reel-desktop
 
@@ -325,6 +343,12 @@ broken when it was working exactly as designed.
 * **The catalog cache is where posters render from.** Metadata and images are
   fetched once, written to disk, and referenced as `file://` URIs, so a restart
   costs no API calls and no image downloads.
+* **Downloads are owned by the media, not the torrent.** A `MediaStore`
+  (`media.json`) records what the user asked to keep against a film or episode
+  and the backend reconciles each source from it. The UI passes a media key, and
+  every stream path is built by one tested helper — a two-segment path would
+  make the router read the file name as a file id and answer `400`, which showed
+  up as mpv's "loading failed".
 
 ## Where this goes next
 
@@ -332,12 +356,12 @@ Everything in the original plan is now built. What is left is either optional or
 needs a decision from whoever runs the app.
 
 * **More search sources.** The seam, the aggregator, the search screen and the
-  failure reporting are all done, and `archive_org` is a complete template.
-  Adding one is a single struct; see `docs/ADDING_A_SOURCE.md`.
-* **Web seeds (BEP-19).** Internet Archive torrents carry HTTP web seeds that
-  librqbit does not implement, so playback on such sources depends on the
-  Archive's seeders. Supporting web seeds would make any web-seeded torrent
-  stream reliably, and is the highest-value engine feature left.
+  failure reporting are all done; `ext_to` is the bundled template. Adding a
+  source is a single struct.
+* **Web seeds (BEP-19).** Some torrents carry HTTP web seeds that librqbit does
+  not implement, so playback on those torrents depends on regular peers.
+  Supporting web seeds would make them stream reliably, and is the highest-value
+  engine feature left.
 * **In-window subtitles.** mpv renders subtitles into the frame today, which
   works but costs CPU on the software renderer. Reading the subtitle track and
   drawing it in egui would be cheaper and more controllable.
@@ -347,4 +371,3 @@ needs a decision from whoever runs the app.
 * **Transcoding**, for clients that cannot take the original bytes — the same
   reason an embedded browser engine would not have been a substitute for a real
   player.
-

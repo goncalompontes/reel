@@ -69,6 +69,10 @@ pub struct LibraryEntry {
     /// The user asked to keep this on disk, so it is re-added at startup.
     #[serde(default)]
     pub downloading: bool,
+    /// The user paused this download. Kept so a paused download does not
+    /// quietly resume the next time the app starts.
+    #[serde(default)]
+    pub paused: bool,
     pub added_at: i64,
 }
 
@@ -91,6 +95,7 @@ impl LibraryStore {
         match std::fs::read(path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                 tracing::warn!(path = %path.display(), error = %e, "ignoring unreadable library");
+                crate::quarantine_corrupt(path);
                 Self::default()
             }),
             Err(_) => Self::default(),
@@ -168,6 +173,7 @@ impl LibraryStore {
             primary_file_id: None,
             selected_files: Vec::new(),
             downloading: false,
+            paused: false,
             added_at,
         });
         id

@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 
 use reel_core::EngineConfig;
-use reel_desktop::backend::{Backend, CatalogOptions, EngineBackend};
+use reel_desktop::backend::{Backend, CatalogOptions, EngineBackend, MediaDownload};
 
 fn scratch_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("reel-test-{}-{name}", std::process::id()));
@@ -122,7 +122,7 @@ fn a_pack_streams_and_downloads_only_the_chosen_episode() {
     let pack = dir.join("pack");
     std::fs::create_dir_all(&pack).unwrap();
     for n in 1..=3u8 {
-        let bytes: Vec<u8> = (0..96 * 1024).map(|i| ((i as u8).wrapping_add(n * 7)) as u8).collect();
+        let bytes: Vec<u8> = (0..96 * 1024).map(|i| (i as u8).wrapping_add(n * 7)).collect();
         std::fs::write(pack.join(format!("Some.Show.S01E{n:02}.mkv")), bytes).unwrap();
     }
     let torrent_path = dir.join("pack.torrent");
@@ -161,7 +161,14 @@ fn a_pack_streams_and_downloads_only_the_chosen_episode() {
     backend.add(torrent_path.to_str().unwrap(), true);
     wait_until("the pack to appear", || !backend.library().is_empty());
     let id = backend.library().into_iter().next().unwrap().torrent.id;
-    wait_until("the pack to be live", || backend.is_live(id));
+    // It becomes live, then settles paused because nothing has been told to
+    // play. Wait for both rather than racing the transition.
+    wait_until("the pack to be live and paused", || {
+        backend.is_live(id)
+            && backend
+                .item(id)
+                .is_some_and(|item| item.torrent.stats.is_paused())
+    });
 
     let included = |backend: &EngineBackend| -> Vec<usize> {
         backend
@@ -176,10 +183,6 @@ fn a_pack_streams_and_downloads_only_the_chosen_episode() {
     };
 
     // Added as a stream: paused, nothing is being fetched yet.
-    assert!(
-        backend.item(id).expect("the pack").torrent.stats.is_paused(),
-        "a stream pack waits to be told what to play"
-    );
     assert!(!backend.item(id).expect("the pack").downloading);
 
     // Play episode 2: it resumes, and fetches only episode 2.
@@ -190,7 +193,11 @@ fn a_pack_streams_and_downloads_only_the_chosen_episode() {
     assert_eq!(included(&backend), vec![1], "only the played episode is fetched");
 
     // Download episode 2: only it is kept, not the whole pack.
-    backend.download_files(id, &[1]);
+    backend.download_media(vec![MediaDownload {
+        key: "pack#s01e02".into(),
+        torrent_id: id,
+        files: vec![1],
+    }]);
     wait_until("the download to be marked", || {
         backend.item(id).expect("the pack").downloading
     });
@@ -203,8 +210,48 @@ fn a_pack_streams_and_downloads_only_the_chosen_episode() {
         "downloading one episode must not fetch the whole pack"
     );
 
-    // Stop it again in one action.
-    backend.stop_download(id);
+    // Adding another episode to an existing download must not recycle the
+    // source: it already uses filesystem storage, so the engine only narrows.
+    let engine_before = backend
+        .item(id)
+        .expect("the pack")
+        .torrent
+        .files[0]
+        .stream
+        .torrent_id;
+    backend.download_media(vec![MediaDownload {
+        key: "pack#s01e03".into(),
+        torrent_id: id,
+        files: vec![2],
+    }]);
+    wait_until("the second download", || {
+        backend.item(id).is_some_and(|item| item.kept_files.len() == 2)
+    });
+    let engine_after = backend
+        .item(id)
+        .expect("the pack")
+        .torrent
+        .files[0]
+        .stream
+        .torrent_id;
+    assert_eq!(
+        engine_before, engine_after,
+        "adding a download to an existing download must not re-add the source"
+    );
+
+    // Stop both in one action.
+    backend.stop_media_download(vec![
+        MediaDownload {
+            key: "pack#s01e02".into(),
+            torrent_id: id,
+            files: vec![1],
+        },
+        MediaDownload {
+            key: "pack#s01e03".into(),
+            torrent_id: id,
+            files: vec![2],
+        },
+    ]);
     wait_until("the download to stop", || {
         !backend.item(id).expect("the pack").downloading
     });
@@ -282,16 +329,45 @@ fn streaming_is_temporary_and_downloading_is_opt_in() {
     wait("the torrent to be live", Box::new(|| backend.is_live(id)));
 
     // Keep it: this switches to filesystem storage and marks it a download.
-    backend.download_files(id, &[0]);
+    backend.download_media(vec![MediaDownload {
+        key: "lifecycle#movie".into(),
+        torrent_id: id,
+        files: vec![0],
+    }]);
     wait("the download to be marked", Box::new(|| {
         backend.item(id).is_some_and(|item| item.downloading)
     }));
 
+    // The download is owned by the media and persisted by media key, not by
+    // the torrent's positional file id.
+    {
+        let store =
+            reel_catalog::MediaStore::load(&reel_catalog::MediaStore::path(&dir.join("catalog")));
+        assert!(
+            store.is_downloaded("lifecycle#movie"),
+            "the download must be recorded against the media"
+        );
+        assert_eq!(store.len(), 1);
+    }
+
     // Stop keeping it: files are deleted and it goes back to temporary.
-    backend.stop_download(id);
+    backend.stop_media_download(vec![MediaDownload {
+        key: "lifecycle#movie".into(),
+        torrent_id: id,
+        files: vec![0],
+    }]);
     wait("the download to be cleared", Box::new(|| {
         backend.item(id).is_some_and(|item| !item.downloading)
     }));
+
+    {
+        let store =
+            reel_catalog::MediaStore::load(&reel_catalog::MediaStore::path(&dir.join("catalog")));
+        assert!(
+            !store.is_downloaded("lifecycle#movie"),
+            "stopping a download must clear the media record"
+        );
+    }
 
     // The title is still in the library even though the torrent was recycled.
     assert!(backend.item(id).is_some(), "the library outlives the torrent");
@@ -379,11 +455,11 @@ fn the_bundled_source_searches_through_the_app_backend() {
 
     assert_eq!(
         backend.search_sources().iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-        ["archive.org"],
-        "the bundled source should be registered"
+        ["ext.to"],
+        "only ext.to should be bundled"
     );
 
-    backend.search("nosferatu");
+    backend.search(&reel_catalog::SearchQuery::new("nosferatu"));
 
     // The search runs on the runtime and reports back through events.
     let mut hits = None;
@@ -413,4 +489,168 @@ fn the_bundled_source_searches_through_the_app_backend() {
     println!("torrent: {}", hits[0].torrent_url.as_deref().unwrap_or(""));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A download belongs to the media, not the torrent, so it has to survive a
+/// restart even though the torrent is re-added from its saved `.torrent`.
+#[test]
+fn a_media_download_survives_a_restart() {
+    let dir = scratch_dir("media-restart");
+    std::fs::create_dir_all(dir.join("payload")).unwrap();
+    std::fs::write(dir.join("payload/data.bin"), vec![7u8; 64 * 1024]).unwrap();
+    let torrent_path = dir.join("data.torrent");
+    {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let created = runtime
+            .block_on(reel_core::create_torrent_file(
+                &dir.join("payload"),
+                None,
+                Vec::new(),
+                Some(16 * 1024),
+            ))
+            .expect("create torrent");
+        std::fs::write(&torrent_path, &created.bytes).unwrap();
+    }
+
+    let scratch = scratch_dir("media-restart-state");
+    let data_dir = dir.join("catalog");
+    let download_dir = dir.join("downloads");
+
+    let id = {
+        let backend = EngineBackend::start_with_options(
+            EngineConfig {
+                disable_dht: true,
+                disable_trackers: true,
+                persist_session: false,
+                stream_scratch_dir: Some(scratch.clone()),
+                ..EngineConfig::new(&download_dir)
+            },
+            CatalogOptions {
+                api_key: None,
+                settings: Default::default(),
+                data_dir: data_dir.clone(),
+                disable_bundled_sources: true,
+            },
+        )
+        .expect("backend");
+        backend.add(torrent_path.to_str().unwrap(), true);
+        wait_until("the title", || !backend.library().is_empty());
+        let id = backend.library().into_iter().next().unwrap().torrent.id;
+        backend.download_media(vec![MediaDownload {
+            key: "movie".into(),
+            torrent_id: id,
+            files: vec![0],
+        }]);
+        wait_until("the download", || {
+            backend.item(id).is_some_and(|item| item.downloading)
+        });
+        id
+        // The backend is dropped here, simulating a quit.
+    };
+
+    let backend = EngineBackend::start_with_options(
+        EngineConfig {
+            disable_dht: true,
+            disable_trackers: true,
+            persist_session: false,
+            stream_scratch_dir: Some(scratch.clone()),
+            ..EngineConfig::new(&download_dir)
+        },
+        CatalogOptions {
+            api_key: None,
+            settings: Default::default(),
+            data_dir: data_dir.clone(),
+            disable_bundled_sources: true,
+        },
+    )
+    .expect("restarted backend");
+
+    wait_until("the title after restart", || backend.item(id).is_some());
+    let item = backend.item(id).expect("the title");
+    assert!(
+        item.downloading,
+        "a media download must survive a restart"
+    );
+    assert_eq!(item.kept_files, vec![0]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// A resume position belongs to the episode, not the torrent, so watching it
+/// in one release must resume the same episode in another release of the show.
+#[test]
+fn a_watch_position_follows_the_episode_to_another_release() {
+    let dir = scratch_dir("watch-follow");
+
+    // Two releases of the same episode: same file name, different bytes, so
+    // they have different info hashes but the same work and episode.
+    let mut torrents = Vec::new();
+    for (name, seed) in [("release-a", 1u8), ("release-b", 2u8)] {
+        let root = dir.join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Show.S01E01.mkv"), vec![seed; 96 * 1024]).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let created = runtime
+            .block_on(reel_core::create_torrent_file(
+                &root,
+                None,
+                Vec::new(),
+                Some(16 * 1024),
+            ))
+            .expect("create torrent");
+        let path = dir.join(format!("{name}.torrent"));
+        std::fs::write(&path, &created.bytes).unwrap();
+        torrents.push(path);
+    }
+
+    let scratch = scratch_dir("watch-follow-state");
+    let backend = EngineBackend::start_with_options(
+        EngineConfig {
+            disable_dht: true,
+            disable_trackers: true,
+            persist_session: false,
+            stream_scratch_dir: Some(scratch.clone()),
+            ..EngineConfig::new(dir.join("downloads"))
+        },
+        CatalogOptions {
+            api_key: None,
+            settings: Default::default(),
+            data_dir: dir.join("catalog"),
+            disable_bundled_sources: true,
+        },
+    )
+    .expect("backend");
+
+    for torrent in &torrents {
+        backend.add(torrent.to_str().unwrap(), true);
+    }
+    wait_until("both releases", || backend.library().len() == 2);
+
+    let library = backend.library();
+    let first = &library[0];
+    let second = &library[1];
+    let first_hash = first.entry.info_hash.clone();
+    let second_id = second.torrent.id;
+
+    backend.record_watch(&first_hash, 0, None, None, 420.0, Some(1000.0));
+    backend.take_events();
+
+    let follow = backend
+        .item(second_id)
+        .expect("the other release")
+        .entry
+        .watch_by_file
+        .get(&0)
+        .cloned();
+    let resume_matches = follow
+        .as_ref()
+        .is_some_and(|progress| (progress.position - 420.0).abs() < 0.001);
+    assert!(
+        resume_matches,
+        "the other release should resume at the same episode position, got {follow:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&scratch);
 }

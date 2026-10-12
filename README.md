@@ -1,5 +1,8 @@
 # reel
 
+[![CI](https://github.com/goncalompontes/reel/actions/workflows/ci.yml/badge.svg)](https://github.com/goncalompontes/reel/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/goncalompontes/reel?include_prereleases&sort=semver)](https://github.com/goncalompontes/reel/releases)
+
 A native desktop client for streaming torrents, with a Netflix-shaped catalog.
 
 `reel` is a Rust workspace: a torrent engine, an HTTP streaming server, a
@@ -11,10 +14,8 @@ metadata provider so the library shows posters and synopses instead of release
 names.
 
 **Status: engine, streaming, player, catalog, search and desktop app all work
-end to end.** Exactly one search source is bundled — the Internet Archive, which
-serves public-domain and Creative Commons film — and adding your own is a
-documented, tested extension point: see
-[`docs/ADDING_A_SOURCE.md`](docs/ADDING_A_SOURCE.md).
+end to end.** ext.to, a general torrent index, is bundled behind a
+`SearchBackend` trait, so adding another source is a single struct.
 
 ---
 
@@ -43,13 +44,14 @@ documented, tested extension point: see
 | Per-episode resume positions | done |
 | On-disk metadata and artwork cache | done |
 | Search screen + pluggable sources | done |
-| Bundled sources | one: the Internet Archive (public domain / CC film) |
+| Bundled search source | ext.to (Cloudflare cleared by a bundled FlareSolverr) |
 | Settings file as the canonical configuration (not env) | done |
 | Merge copies of a film or show into one title | done |
-| Temporary streaming: memory first, spills to scratch, freed on stop | done |
+| Temporary streaming: sparse scratch storage, freed on stop | done |
 | Streams only the window around the playhead (patched librqbit) | done |
 | Never seeds — upload is compiled out and the session flag is set | done |
-| Downloads are per item, with a Downloaded state and removal | done |
+| Downloads are per media, with a Downloaded state and removal | done |
+| Media store: downloads/resume owned by the film or episode, not the torrent | done |
 | Library survives independently of the torrent session | done |
 | Subtitles: embedded tracks, sidecar files, track and delay controls | done |
 | Audio track, speed and aspect controls; fullscreen + shortcuts | done |
@@ -72,6 +74,35 @@ no root and is already on the `PATH` of most desktop Linux setups. It writes:
 | `~/.local/share/applications/reel.desktop` | launcher entry, with an **absolute** `Exec` |
 | `~/.local/share/icons/hicolor/{16..256,scalable}/apps/reel.{png,svg}` | icons |
 | `~/.local/share/licenses/reel/` | licence texts |
+| `~/.local/lib/reel/solver/` | the bundled Cloudflare solver (FlareSolverr) that ext.to uses |
+
+The solver is installed automatically so ext.to works out of the box; reel
+starts it on demand. It drives a real Chrome, so it needs Chrome/Chromium and
+Xvfb on the system — if either is missing the installer offers to install it with
+your package manager (answer the prompt, or pass `--yes` to accept, or
+`--no-deps` to only report). Pass `--without-solver` to skip the solver entirely,
+or `--solver-port N` to change its port.
+
+reel itself builds and runs on Linux, macOS and Windows. The shell installer and
+the bundled solver are Linux-only; on macOS or Windows, build the binaries with
+`cargo` and (for ext.to) point the solver URL in Settings at a FlareSolverr you
+run yourself.
+
+### Dependencies
+
+reel builds and runs without any optional tool, and says what is missing when it
+is needed. `scripts/install.sh --check` is the doctor: it reports what a machine
+has — `ffmpeg`/`ffprobe` for casting, `mpv`/libmpv for embedded playback,
+Chrome + Xvfb for the ext.to solver — and what each missing one would break. A
+normal install offers to install them with your package manager (`--yes` to
+accept every prompt, `--no-deps` to only report).
+
+```bash
+scripts/install.sh --check      # report only, change nothing
+```
+
+See [`docs/SETUP.md`](docs/SETUP.md) for the platform matrix, the release
+artifacts and the setup quirks (including the firewall port casting needs).
 
 Re-running it is a no-op rather than an error, and there is an undo:
 
@@ -202,10 +233,26 @@ The catalog is verified separately by `crates/reel-catalog`:
   downloads landing in the cache, clean misses, and a cached lookup still
   working with the network gone.
 
-Search sources are covered the same way: `archive_org`'s parsing is unit-tested
-against fixtures with the field-type inconsistencies the real API produces, plus
-an `#[ignore]`d test that searches the live Archive and checks the torrent URL it
-produces actually resolves.
+The ext.to parser is unit-tested against a trimmed copy of a real results page —
+the `<span>`-split titles, the labelled value cells, a row with no magnet link,
+and the Cloudflare challenge page — with its own `#[ignore]`d test that confirms
+the live site is either scraped or reported as a challenge rather than
+mis-parsed.
+
+To get real results from ext.to, set a clearance cookie from a browser that has
+solved the site's challenge once:
+
+```bash
+EXTTO_COOKIE='cf_clearance=...; __cf_bm=...' \
+EXTTO_USER_AGENT='Mozilla/5.0 ... Firefox/128.0' \
+  reel
+```
+
+The cookie is tied to that user agent and to your IP, and it expires, so it has
+to be refreshed from the browser when searches start failing. Until a cookie is
+set, ext.to is listed in Settings as needing setup and skipped by searches;
+once one is set and later goes stale, searches report the challenge instead of
+returning nothing.
 
 There is also an `#[ignore]`d test that talks to the **real** TMDB API:
 
@@ -224,7 +271,7 @@ generated from each title. A key is what turns that into real posters, synopses,
 episode titles and thumbnails.
 
 **What you need: a free TMDB account.** Nothing else. No key is needed for image
-downloads or for the bundled Internet Archive search source.
+downloads.
 
 1. Make an account at `themoviedb.org`.
 2. Settings → API → request a key. Either type works:
@@ -348,11 +395,11 @@ Two things resume, and they resume independently:
   per torrent: a series is one torrent with many episodes, and one position for
   all of them would resume episode one at episode two's timestamp. Each episode
   row shows its own resume point, and *Continue watching* points at the newest.
-* **What you had already downloaded.** The session is persisted by default, so a
-  part-fetched episode comes back as a part-fetched episode and continues, not
-  as an empty file. Verified by stopping a throttled download partway,
-  restarting, and checking both that progress was retained and that the retained
-  bytes matched the source.
+* **What you asked to keep, per media.** A download is owned by the *media* —
+  a film, an episode, a season — not by the torrent that happens to hold it. It
+  is recorded in a media store keyed by the title and episode, referencing files
+  by path, so it survives the torrent being re-added, reordered, or replaced by
+  another release. See *Streaming is temporary* and *Downloads are per media*.
 
 ## Streaming is temporary
 
@@ -366,45 +413,42 @@ library, the bytes do not.
   ranges, so upstream would fetch a whole episode even for a stream. A small
   vendored patch (`vendor/librqbit`) makes a stream-only torrent fetch **only the
   window around the playhead** — never the beginning of a file you resumed
-  halfway through, and never the whole file. Seeking moves the window.
-* **Storage.** A streamed torrent uses temporary storage: pieces stay in RAM up
-  to a budget (512 MiB by default) and spill, whole files at a time, to a scratch
-  directory under the system temp dir. Nothing is written to your download
-  folder, and the scratch is deleted when the stream is released.
-* **Nothing survives a crash either.** Spill files are unlinked as soon as they
-  are created, so the bytes live only while the process holds them: even
-  `kill -9` frees the space. Empty scratch directories left by a dead process are
-  swept on the next start.
-* **Why not a pure RAM cache.** librqbit's reader trusts the chunk tracker's
-  have-bit and reads storage directly, so an evicted piece is a hard stream
-  error; a bounded cache that evicts is unsafe for a seeker. Keeping whole files
-  while they fit, and spilling the rest, is bounded *and* seek-safe.
-* **Released on stop.** When you leave the player, a title that is not being
-  downloaded is removed from the engine and re-added paused, so its temporary
-  storage is freed. The library keeps the title; playing it again brings it back
-  from the saved `.torrent` (offline, instantly) and the player waits for it.
-* **Downloading is per item.** There is one way to download — a version, an
-  episode, or a whole season — and **Download** / **Stop download** toggle it
-  on that row. The backend keeps the set of files you asked for, and manages
-  storage, re-adding and cleanup behind that. Downloading one episode of a pack
-  keeps that episode and nothing else; playing another episode does not cancel
-  what is already being kept.
+  halfway through, and never the whole file. Seeking moves the window, and the
+  window size is the **Stream buffer (MB)** setting.
+* **Storage is librqbit's own, pointed at a scratch directory.** A streamed
+  torrent does not use a custom storage engine: it uses the engine's filesystem
+  storage in a per-stream directory under the system temp dir. Files are created
+  at their full length and written at their offsets, so unwritten ranges stay
+  sparse holes and only the fetched bytes allocate — there is no whole-file
+  buffer and nothing is written to your download folder.
+* **A crash leaves only the scratch directory.** The scratch files are not
+  secret: a killed process can leave its per-PID directory behind. It is swept on
+  the next start, and releasing the stream deletes it.
+* **Released or cached on stop.** When you leave the player, a stream-only title
+  is kept in the session so replay is instant; it fetches nothing while idle (the
+  picker has no window without an active stream), and the session cache bound
+  (default 1 GiB) evicts the least recently watched. A download is left alone.
+* **Downloads are per media.** There is one way to download — a version, an
+  episode, or a whole season — and **Download** / **Stop download** toggle it on
+  that row. The backend records the intent against the media, resolves it to the
+  files of whichever source holds them, and manages storage, re-adding and
+  cleanup behind that. Downloading one episode of a pack keeps that episode and
+  nothing else; each copy is independently downloadable and removable.
 * **A clear download state.** Each row carries its own progress bar while it
   downloads, and turns into **Downloaded** with a *Remove download* button once
   the file is complete — not a forever "Stop download" at 100%.
 * **Replay is instant in the same session.** Leaving the player keeps the stream
-  instead of discarding it: a stream-only torrent with no active stream fetches
-  nothing, so it costs no bandwidth, and the buffer *and* the peer connections
-  both survive — pressing play again does not have to reconnect. **Settings →
-  Playback → Session cache (MB)** bounds how much is kept
-  across titles (default 1 GiB); when it overflows the least recently watched
-  streams are released, but the one you just left is kept even if it alone
-  exceeds the cap — evicting what you are about to resume would be the wrong
-  choice. `0` releases each stream as soon as playback stops.
-* **The library is durable.** Since a streamed torrent is removed when it stops,
+  instead of discarding it: the buffer *and* the peer connections both survive,
+  and pressing play again does not have to reconnect. **Settings → Playback →
+  Session cache (MB)** bounds how much is kept across titles (default 1 GiB);
+  when it overflows the least recently watched streams are released, but the one
+  you just left is kept even if it alone exceeds the cap — evicting what you are
+  about to resume would be the wrong choice. `0` releases each stream as soon as
+  playback stops.
+* **The library is durable.** A streamed torrent can be removed when it stops, so
   a persisted `library.json` (plus a saved `.torrent` per title) is what makes a
-  title stay in the library. Downloads are re-added at startup; streams wait
-  until you play them.
+  title stay in the library, and a persisted `media.json` is what makes a
+  download and its resume point survive independently of it.
 
 ## One title, several torrents
 
@@ -495,8 +539,11 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the reasoning.
 * **Metadata enrichment runs in the background.** At most two lookups are in
   flight at once, each title is attempted once per session, and results arrive
   as events, so a library of two hundred titles does not stall the first frame.
-* **Watch positions are keyed by info hash**, not torrent id, so they survive a
-  restart, and writes are throttled to a few seconds.
+* **Watch positions are keyed by info hash and by media**, so they survive a
+  restart and follow an episode to whichever release holds it; writes are
+  throttled to a few seconds. **Downloads are keyed by media** (a film or an
+  episode) and reference files by path, so they survive a torrent being
+  re-added or replaced by another release.
 
 ## Notes and caveats
 
@@ -524,15 +571,6 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the reasoning.
   blocks rather than erroring, because that is what a buffering player wants.
   Clients should set their own timeout; a request can outlive the reason it was
   made.
-* **Content and sources.** This is a general-purpose BitTorrent client and HTTP
-  server. Use it for content you own or are licensed to distribute. Exactly one
-  search source is bundled, chosen because it indexes only material anyone may
-  share; anything else you add is your decision and your responsibility.
-* **The bundled source needs a swarm.** Internet Archive torrents carry
-  BEP-19 HTTP web seeds, which librqbit does not implement, so playback depends
-  on the Archive's own seeders. Popular items are well seeded; obscure ones may
-  not be. Web-seed support would fix this properly and is the most valuable
-  engine feature left.
 * **Matching.** Title matching prefers "no match" over a wrong match, so some
   films simply will not be found. That is deliberate: a confidently wrong poster
   is worse than generated artwork. If a title is wrong, the fix belongs in
@@ -543,10 +581,10 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the reasoning.
 
 ## Requirements
 
-Rust 1.86+ (edition 2024). Linux, macOS and Windows are supported by the stack;
-Linux/Wayland is what has been exercised. `mpv`/libmpv is optional — without it
-the desktop app falls back to handing playback to an external `mpv` process, and
-the CLI still works.
+Rust 1.95+ (edition 2024; the desktop app's egui/eframe set the floor). Linux,
+macOS and Windows are supported by the stack; Linux/Wayland is what has been
+exercised. `mpv`/libmpv is optional — without it the desktop app falls back to
+handing playback to an external `mpv` process, and the CLI still works.
 
 ## License
 

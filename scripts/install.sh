@@ -18,12 +18,23 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 
+# Shared dependency helpers: package-manager detection, prompts, tool lookups.
+# shellcheck source=lib/deps.sh
+. "$HERE/lib/deps.sh"
+
 PREFIX="${PREFIX:-$HOME/.local}"
 DESTDIR="${DESTDIR:-}"
 DO_BUILD=1
+PROFILE=release
 WITH_SERVICE=0
+WITH_SOLVER=1
+SOLVER_PORT=""
 UNINSTALL=0
 QUIET=0
+# Dependency handling: answer every prompt yes, only report, or just check.
+ASSUME_YES=0
+NO_DEPS=0
+CHECK=0
 
 # systemd user units live somewhere else again when the prefix is a user's.
 systemd_user_dir() {
@@ -41,11 +52,24 @@ Install reel.
 Options:
   --prefix DIR      Where to install. Default: ~/.local
   --destdir DIR     Staging root, for packaging. Default: empty
-  --no-build        Do not run cargo; use existing release binaries
+  --no-build        Do not run cargo; use the existing binaries in target/
+  --debug           Build and install a debug build (target/debug) instead of
+                    the release build. Implies an unoptimised, slower app.
   --with-service    Also install a systemd user unit for `reel serve`
+  --without-solver  Do not install the bundled Cloudflare solver (ext.to)
+  --solver-port N   Port the bundled solver listens on. Default: 8391
+  -y, --yes         Answer yes to every dependency prompt
+  --no-deps         Never install system packages; only report what is missing
+  --check           Report the runtime dependencies and exit; install nothing.
+                    This is the "doctor": it says what is present and what each
+                    missing tool would break.
   --uninstall       Remove everything this script installs
   -q, --quiet       Only print problems
   -h, --help        This message
+
+reel builds and runs without any optional tool. This installer reports (and,
+with your consent, installs) the ones that unlock features: ffmpeg/ffprobe for
+casting and transcoding, and mpv/libmpv for embedded playback.
 
 Environment: PREFIX and DESTDIR are honoured if set.
 EOF
@@ -58,7 +82,13 @@ while [ $# -gt 0 ]; do
     --prefix) PREFIX="${2:?--prefix needs a directory}"; shift 2 ;;
     --destdir) DESTDIR="${2:?--destdir needs a directory}"; shift 2 ;;
     --no-build) DO_BUILD=0; shift ;;
+    --debug) PROFILE=debug; shift ;;
     --with-service) WITH_SERVICE=1; shift ;;
+    --without-solver) WITH_SOLVER=0; shift ;;
+    --solver-port) SOLVER_PORT="${2:?--solver-port needs a number}"; shift 2 ;;
+    --yes|-y) ASSUME_YES=1; shift ;;
+    --no-deps) NO_DEPS=1; shift ;;
+    --check) CHECK=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     -q|--quiet) QUIET=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -79,6 +109,7 @@ APP_DIR="$PREFIX/share/applications"
 ICON_SCALABLE_DIR="$PREFIX/share/icons/hicolor/scalable/apps"
 LICENSE_DIR="$PREFIX/share/licenses/reel"
 SERVICE_DIR="$(systemd_user_dir)"
+SOLVER_DIR="$PREFIX/lib/reel/solver"
 
 # Raster sizes installed alongside the scalable icon: not every launcher and
 # taskbar reads SVG.
@@ -120,6 +151,51 @@ refresh_caches() {
     gtk-update-icon-cache -qtf "$(DEST "$PREFIX/share/icons/hicolor")" 2>/dev/null || true
 }
 
+# Report, and with consent install, the tools reel shells out to at runtime.
+#
+# None is a build dependency: reel builds and starts without any of them and
+# says what is missing at the moment it is needed. This is the "doctor" that
+# names each one up front and what it unlocks.
+check_runtime_dependencies() {
+  PKG_MANAGER="$(detect_package_manager)"
+  say ""
+  say "Runtime dependencies (optional — reel runs without them):"
+
+  if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
+    say "  ffmpeg/ffprobe   found: $(command -v ffmpeg)"
+  else
+    install_dependency "ffmpeg/ffprobe" "$(pkg_for "$PKG_MANAGER" ffmpeg)" \
+      "casting to a TV (DLNA/Chromecast) and transcoding need both; playback is unaffected"
+  fi
+
+  if command -v mpv >/dev/null 2>&1 || have_library libmpv; then
+    say "  mpv/libmpv       found"
+  else
+    install_dependency "mpv (libmpv)" "$(pkg_for "$PKG_MANAGER" mpv)" \
+      "embedded playback needs libmpv; without it reel hands playback to an external mpv, and cannot play video at all if that is missing too"
+  fi
+
+  # ext.to's solver clears Cloudflare with a real browser on a virtual display.
+  # During a normal install the solver installer resolves these itself; the
+  # doctor reports them too, so one command shows the whole picture.
+  if [ "$CHECK" -eq 1 ] && [ "$WITH_SOLVER" -eq 1 ]; then
+    local browser
+    browser="$(find_browser)"
+    if [ -n "$browser" ]; then
+      say "  Chrome/Chromium  found: $browser"
+    else
+      install_dependency "Chrome/Chromium" "$(pkg_for "$PKG_MANAGER" browser)" \
+        "the bundled solver needs a browser, so ext.to search will not work"
+    fi
+    if command -v Xvfb >/dev/null 2>&1; then
+      say "  Xvfb             found"
+    else
+      install_dependency "Xvfb" "$(pkg_for "$PKG_MANAGER" xvfb)" \
+        "the solver runs its browser on a virtual display, so ext.to search will not work"
+    fi
+  fi
+}
+
 do_uninstall() {
   say "Removing reel from $PREFIX"
   # `installed_files` with the service flag only covers what this run would
@@ -147,30 +223,44 @@ do_uninstall() {
     [ -d "$(DEST "$dir")" ] && rmdir --ignore-fail-on-non-empty -p "$(DEST "$dir")" 2>/dev/null || true
   done
 
+  # The bundled solver is a directory tree (a Python venv plus FlareSolverr), so
+  # it is not in `installed_files`.
+  if [ -d "$(DEST "$SOLVER_DIR")" ]; then
+    rm -rf "$(DEST "$SOLVER_DIR")"
+    say "  removed $SOLVER_DIR"
+    rmdir --ignore-fail-on-non-empty -p "$(DEST "$PREFIX/lib/reel")" 2>/dev/null || true
+  fi
+
   refresh_caches
   say "Done. Your data in ~/.local/share/reel was left alone."
 }
 
 do_install() {
+  local bin_dir="$ROOT/target/$PROFILE"
+
   if [ "$DO_BUILD" -eq 1 ]; then
-    say "Building release binaries..."
-    ( cd "$ROOT" && cargo build --release --locked )
+    say "Building $PROFILE binaries..."
+    if [ "$PROFILE" = release ]; then
+      ( cd "$ROOT" && cargo build --release --locked )
+    else
+      ( cd "$ROOT" && cargo build --locked )
+    fi
   fi
 
   local bin
   for bin in reel reel-desktop; do
-    if [ ! -x "$ROOT/target/release/$bin" ]; then
-      printf 'missing %s; run without --no-build\n' "$ROOT/target/release/$bin" >&2
+    if [ ! -x "$bin_dir/$bin" ]; then
+      printf 'missing %s; run without --no-build\n' "$bin_dir/$bin" >&2
       exit 1
     fi
   done
 
-  say "Installing to $PREFIX"
+  say "Installing to $PREFIX ($PROFILE build)"
   install -d "$(DEST "$BIN_DIR")" "$(DEST "$APP_DIR")" "$(DEST "$ICON_SCALABLE_DIR")" "$(DEST "$LICENSE_DIR")"
 
-  install -m755 "$ROOT/target/release/reel" "$(DEST "$BIN_DIR/reel")"
+  install -m755 "$bin_dir/reel" "$(DEST "$BIN_DIR/reel")"
   say "  $BIN_DIR/reel"
-  install -m755 "$ROOT/target/release/reel-desktop" "$(DEST "$BIN_DIR/reel-desktop")"
+  install -m755 "$bin_dir/reel-desktop" "$(DEST "$BIN_DIR/reel-desktop")"
   say "  $BIN_DIR/reel-desktop"
 
   # The launcher gets an absolute Exec: a GUI session does not read shell rc
@@ -210,7 +300,33 @@ do_install() {
     say "  $SERVICE_DIR/reel.service"
   fi
 
+  # The Cloudflare solver that ext.to needs, installed beside the binary. reel
+  # finds it relative to its own path and starts it on demand.
+  if [ "$WITH_SOLVER" -eq 1 ]; then
+    say ""
+    if [ -n "$DESTDIR" ]; then
+      say "Note: not installing the bundled solver into a staging tree. Run"
+      say "  scripts/install-solver.sh --prefix <real prefix>"
+      say "from the package's post-install step so ext.to works."
+    else
+      # Pass the consent flags through: the solver is where Chrome and Xvfb get
+      # resolved, and it must respect the same --yes / --no-deps choices.
+      solver_args=(--prefix "$PREFIX")
+      if [ -n "$SOLVER_PORT" ]; then solver_args+=(--port "$SOLVER_PORT"); fi
+      if [ "$ASSUME_YES" -eq 1 ]; then solver_args+=(--yes); fi
+      if [ "$NO_DEPS" -eq 1 ]; then solver_args+=(--no-deps); fi
+      "$HERE/install-solver.sh" "${solver_args[@]}"
+    fi
+  fi
+
   refresh_caches
+
+  # What reel shells out to at runtime, reported (and, with consent, installed)
+  # after the files are in place. Skipped in a staging tree: a package build
+  # must not touch the build machine's packages.
+  if [ -z "$DESTDIR" ]; then
+    check_runtime_dependencies
+  fi
 
   # Validate what we wrote, so a broken desktop entry is caught here and not by
   # the user wondering why there is no launcher.
@@ -235,6 +351,14 @@ do_install() {
     say "Enable the daemon with: systemctl --user enable --now reel.service"
   fi
 }
+
+if [ "$CHECK" -eq 1 ]; then
+  # The doctor: report only. Never install a package or write a file.
+  NO_DEPS=1
+  say "reel dependency check (nothing will be installed or written)"
+  check_runtime_dependencies
+  exit 0
+fi
 
 if [ "$UNINSTALL" -eq 1 ]; then
   do_uninstall

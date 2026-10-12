@@ -119,6 +119,9 @@ pub(crate) struct ManagedTorrentOptions {
     pub peer_limit: Option<usize>,
     /// Fetch only the window around an active stream, never the whole file.
     pub streaming_only: bool,
+    /// Bytes fetched ahead of the playhead when `streaming_only` is on. `None`
+    /// uses the built-in default.
+    pub stream_lookahead_bytes: Option<u64>,
     #[cfg(feature = "disable-upload")]
     pub _disable_upload: bool,
 }
@@ -126,6 +129,12 @@ pub(crate) struct ManagedTorrentOptions {
 impl ManagedTorrentOptions {
     pub fn streaming_only(&self) -> bool {
         self.streaming_only
+    }
+
+    /// How far ahead of the playhead to fetch, in bytes.
+    pub fn stream_lookahead_bytes(&self) -> u64 {
+        self.stream_lookahead_bytes
+            .unwrap_or(streaming::PER_STREAM_BUF_DEFAULT)
     }
 
     #[cfg(feature = "disable-upload")]

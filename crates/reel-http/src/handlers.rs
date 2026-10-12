@@ -1,5 +1,5 @@
 use std::convert::Infallible;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::body::Body;
@@ -17,7 +17,9 @@ use tokio_util::io::ReaderStream;
 use tracing::{debug, info, warn};
 
 use reel_core::model::AddOutcome;
-use reel_core::{AddOptions, AddRequest, AddSource, FileView, StatsView, TorrentView};
+use reel_core::{
+    AddOptions, AddRequest, AddSource, EngineError, FileProbe, FileView, StatsView, TorrentView,
+};
 
 use crate::error::HttpError;
 use crate::range;
@@ -157,6 +159,7 @@ pub async fn add_torrent(
                 // filesystem storage unless a caller explicitly asks otherwise.
                 ephemeral: false,
                 only_files: None,
+                preferred_id: None,
             },
         )
     };
@@ -305,7 +308,7 @@ async fn serve_file(
     file_id: usize,
     headers: &HeaderMap,
 ) -> Result<Response, HttpError> {
-    let probe = st.engine.probe_file(id, file_id)?;
+    let probe = probe_or_wait(&st, id, file_id).await?;
 
     let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     let parsed = match range::parse_range(range_header, probe.length) {
@@ -364,8 +367,35 @@ async fn serve_file(
         .map_err(|e| HttpError::internal(format!("building response: {e}")))
 }
 
-fn sanitize_filename(name: &str) -> String {
+pub(crate) fn sanitize_filename(name: &str) -> String {
     name.replace(['"', '\\', '\n', '\r', '/'], "_")
+}
+
+/// Look up a file, briefly waiting for a torrent that is being brought back.
+///
+/// A stream-only title is removed from the session when playback stops and
+/// re-added on the next play. Re-adding changes the engine id, and the player
+/// can open its URL in that window; a hard 404 there kills playback even though
+/// the torrent is milliseconds away. Wait a bounded time for it to appear
+/// instead of failing immediately.
+async fn probe_or_wait(
+    st: &AppState,
+    id: usize,
+    file_id: usize,
+) -> Result<FileProbe, HttpError> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match st.engine.probe_file(id, file_id) {
+            Ok(probe) => return Ok(probe),
+            Err(EngineError::TorrentNotFound(_)) | Err(EngineError::NoMetadata(_)) => {
+                if Instant::now() >= deadline {
+                    return st.engine.probe_file(id, file_id).map_err(Into::into);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 fn looks_like_source(source: &str) -> bool {

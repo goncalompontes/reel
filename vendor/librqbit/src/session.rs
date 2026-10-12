@@ -248,6 +248,10 @@ pub struct AddTorrentOptions {
     /// Fetch only the window around an active stream, never the whole file.
     #[serde(default)]
     pub streaming_only: bool,
+    /// Bytes to fetch ahead of the playhead when `streaming_only` is on.
+    /// `None` uses the built-in default.
+    #[serde(default)]
+    pub stream_lookahead_bytes: Option<u64>,
     /// A regex to only download files matching it.
     pub only_files_regex: Option<String>,
     /// An explicit list of file IDs to download.
@@ -1359,6 +1363,7 @@ impl Session {
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
                     streaming_only: opts.streaming_only,
+                    stream_lookahead_bytes: opts.stream_lookahead_bytes,
                     #[cfg(feature = "disable-upload")]
                     _disable_upload: self._disable_upload,
                 },

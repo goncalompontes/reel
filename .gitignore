@@ -1,3 +1,11 @@
 /target
 **/*.rs.bk
 *.pdb
+
+# Local agent/tooling state
+.opencode/
+
+# Snapshot test artifacts (regenerated on demand)
+crates/reel-desktop/tests/snapshots/*.diff.png
+crates/reel-desktop/tests/snapshots/*.new.png
+crates/reel-desktop/tests/snapshots/*.old.png

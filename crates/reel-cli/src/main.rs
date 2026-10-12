@@ -298,6 +298,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         pause_multi_file: false,
         ephemeral: false,
         only_files: None,
+        preferred_id: None,
     };
 
     // Adds run *after* the API is up, and off the startup path. Resolving a
@@ -422,9 +423,5 @@ async fn create(args: CreateArgs) -> anyhow::Result<()> {
 }
 
 fn default_download_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("HOME") {
-        let candidate = PathBuf::from(dir).join("Downloads").join("reel");
-        return candidate;
-    }
-    PathBuf::from("./reel-downloads")
+    reel_core::paths::download_dir()
 }

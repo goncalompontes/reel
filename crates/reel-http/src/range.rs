@@ -14,12 +14,18 @@ pub struct ByteRange {
 }
 
 impl ByteRange {
+    /// Number of bytes. A range parsed from a header is never empty, but the
+    /// fields are public, so an inverted range built by hand counts as empty.
     pub fn len(&self) -> u64 {
-        self.end - self.start + 1
+        if self.is_empty() {
+            0
+        } else {
+            self.end - self.start + 1
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        false
+        self.end < self.start
     }
 }
 
@@ -197,5 +203,13 @@ mod tests {
     fn range_len() {
         assert_eq!(ByteRange { start: 0, end: 0 }.len(), 1);
         assert_eq!(ByteRange { start: 0, end: 999 }.len(), 1000);
+    }
+
+    #[test]
+    fn an_inverted_range_is_empty() {
+        let inverted = ByteRange { start: 10, end: 5 };
+        assert!(inverted.is_empty());
+        assert_eq!(inverted.len(), 0);
+        assert!(!ByteRange { start: 5, end: 10 }.is_empty());
     }
 }

@@ -1,0 +1,27 @@
+[package]
+name = "reel-cast-gcast"
+description = "Google Cast / FCast casting for reel, via the FCast sender SDK"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+reel-cast.workspace = true
+
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+
+# The SDK owns the CASTV2/TLS protocol and mDNS discovery for both Google Cast
+# and FCast; reel wraps its device API behind `reel_cast::CastTarget`.
+fcast-sender-sdk = { version = "0.3", default-features = false, features = [
+    "chromecast",
+    "fcast",
+    "discovery",
+] }
+
+[dev-dependencies]
+# The SDK logs through `log`; the smoke-test example shows them.
+env_logger = "0.11"

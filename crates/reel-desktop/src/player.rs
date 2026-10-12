@@ -5,6 +5,7 @@
 //! [`PlayerController::video_ui`] and [`PlayerController::controls_ui`].
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use egui::{Color32, CornerRadius, Painter, Sense, Vec2};
 use reel_player::{Backend, Player, PlayerConfig, PlayerState};
@@ -62,8 +63,15 @@ pub struct PlayerController {
     /// Non-empty while the user drags the seek bar, so the reported position
     /// does not fight the drag.
     scrub_position: Option<f64>,
+    /// When the user last seeked. A big seek has to refill the demuxer cache
+    /// from a new position, which can take many seconds on a large file; the
+    /// stall watchdog must not mistake that for a wedge.
+    last_seek: Option<Instant>,
     created_with: Option<PlayerCapability>,
     preferences: PlaybackPreferences,
+    /// How many times the underlying mpv core has been built. A replay reuses
+    /// it; only a wedge or a capability change rebuilds it.
+    rebuilds: u64,
     /// Whether the window is currently fullscreen.
     fullscreen: bool,
 }
@@ -84,7 +92,9 @@ impl PlayerController {
             error: None,
             volume: 100.0,
             scrub_position: None,
+            last_seek: None,
             created_with: None,
+            rebuilds: 0,
             preferences: PlaybackPreferences {
                 subtitles_enabled: true,
                 subtitle_language: None,
@@ -225,20 +235,43 @@ impl PlayerController {
         }
         self.created_with = Some(capability.clone());
         self.player = Some(player);
+        self.rebuilds += 1;
         Ok(())
     }
 
+    /// How many mpv cores have been built. Used by tests to prove a replay
+    /// reuses the core instead of rebuilding it.
+    pub fn player_rebuilds(&self) -> u64 {
+        self.rebuilds
+    }
+
     pub fn close(&mut self) {
+        // Stop the current file but keep the mpv core. A replay then reuses its
+        // demuxer cache, index and decoder, which is what makes a resume cheap
+        // instead of a fresh container probe. The core is dropped only by
+        // [`Self::reset`], which a wedged stream calls.
         if let Some(player) = self.player.as_ref() {
             player.set_target_size(None);
             let _ = player.stop();
         }
-        // Drop the whole mpv instance rather than reusing it. A reused core
-        // keeps its demuxer cache, decoder and seek index, and after a seeked
-        // HEVC stream it has been seen to wedge: the server has bytes queued and
-        // mpv simply stops reading them. A fresh core per play costs a few tens
-        // of milliseconds and cannot inherit that state.
-        self.player = None;
+        self.current = None;
+        self.scrub_position = None;
+        self.texture = None;
+        self.last_sequence = 0;
+    }
+
+    /// Drop the mpv core so the next play builds a fresh one.
+    ///
+    /// Only for a stream that has wedged — the server has bytes queued and mpv
+    /// has stopped consuming them, which a fresh decoder clears. Doing this on
+    /// every play was what threw away the cache the session buffer exists to
+    /// exploit.
+    pub fn reset(&mut self) {
+        if let Some(player) = self.player.take() {
+            player.set_target_size(None);
+            let _ = player.stop();
+        }
+        self.created_with = None;
         self.current = None;
         self.scrub_position = None;
         self.texture = None;
@@ -251,10 +284,17 @@ impl PlayerController {
         }
     }
 
-    pub fn seek_relative(&self, delta: f64) {
+    pub fn seek_relative(&mut self, delta: f64) {
         if let Some(player) = self.player.as_ref() {
             let _ = player.seek_relative(delta);
+            self.last_seek = Some(Instant::now());
         }
+    }
+
+    /// Whether the user seeked within `within`. The stall watchdog uses this to
+    /// give a seek time to buffer before deciding the stream is wedged.
+    pub fn seeked_within(&self, within: std::time::Duration) -> bool {
+        self.last_seek.is_some_and(|at| at.elapsed() < within)
     }
 
     pub fn set_volume(&mut self, volume: f32) {
@@ -329,14 +369,15 @@ impl PlayerController {
     ///
     /// The video is letterboxed inside the available space and rendered at the
     /// surface's physical pixel size, so it stays sharp on HiDPI displays.
-    pub fn video_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    pub fn video_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> egui::Response {
         let avail = ui.available_size();
-        let (rect, _response) = ui.allocate_exact_size(avail, Sense::hover());
+        // The video area senses clicks so the app can wire click-to-pause.
+        let (rect, response) = ui.allocate_exact_size(avail, Sense::click());
         let painter = ui.painter().clone();
         painter.rect_filled(rect, CornerRadius::ZERO, Color32::BLACK);
 
         let Some(player) = self.player.as_ref() else {
-            return;
+            return response;
         };
 
         let ppp = ctx.pixels_per_point();
@@ -358,11 +399,8 @@ impl PlayerController {
                     texture.set(image, egui::TextureOptions::LINEAR);
                 }
                 _ => {
-                    self.texture = Some(ctx.load_texture(
-                        "reel-video",
-                        image,
-                        egui::TextureOptions::LINEAR,
-                    ));
+                    self.texture =
+                        Some(ctx.load_texture("reel-video", image, egui::TextureOptions::LINEAR));
                 }
             }
             self.last_sequence = snapshot.sequence;
@@ -391,6 +429,8 @@ impl PlayerController {
                 theme::TEXT_DIM,
             );
         }
+
+        response
     }
 
     fn is_embedded_ready(&self) -> bool {
@@ -434,10 +474,18 @@ impl PlayerController {
             if ui.button(play_label).clicked() {
                 self.toggle_pause();
             }
-            if ui.button("\u{23ee}  10s").on_hover_text("Back 10 seconds").clicked() {
+            if ui
+                .button("\u{23ee}  10s")
+                .on_hover_text("Back 10 seconds")
+                .clicked()
+            {
                 self.seek_relative(-10.0);
             }
-            if ui.button("\u{23ed}  30s").on_hover_text("Forward 30 seconds").clicked() {
+            if ui
+                .button("\u{23ed}  30s")
+                .on_hover_text("Forward 30 seconds")
+                .clicked()
+            {
                 self.seek_relative(30.0);
             }
 
@@ -462,11 +510,7 @@ impl PlayerController {
                     } else {
                         "\u{26f6}"
                     };
-                    if ui
-                        .button(icon)
-                        .on_hover_text("Fullscreen (F)")
-                        .clicked()
-                    {
+                    if ui.button(icon).on_hover_text("Fullscreen (F)").clicked() {
                         toggle_fullscreen = true;
                     }
                 }
@@ -595,7 +639,10 @@ impl PlayerController {
             });
 
             ui.menu_button("Aspect", |ui| {
-                if ui.selectable_label(state.aspect_override.is_none(), "Auto").clicked() {
+                if ui
+                    .selectable_label(state.aspect_override.is_none(), "Auto")
+                    .clicked()
+                {
                     set_aspect = Some(None);
                     ui.close();
                 }
@@ -664,11 +711,27 @@ impl PlayerController {
         filled.set_right(track.left() + track.width() * fraction);
         painter.rect_filled(filled, CornerRadius::same(3), theme::ACCENT);
 
-        let knob_x = if duration > 0.0 { filled.right() } else { track.left() };
+        let knob_x = if duration > 0.0 {
+            filled.right()
+        } else {
+            track.left()
+        };
         painter.circle_filled(egui::pos2(knob_x, bar_rect.center().y), 6.0, theme::ACCENT);
 
         if bar_rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default())) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            // Scrub preview: the time under the pointer.
+            if duration > 0.0 {
+                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    let fraction =
+                        ((pos.x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0);
+                    response
+                        .clone()
+                        .on_hover_text_at_pointer(reel_core::fmt::human_duration(
+                            fraction as f64 * duration,
+                        ));
+                }
+            }
         }
 
         if duration <= 0.0 {
@@ -699,6 +762,7 @@ impl PlayerController {
         if let Some(target) = seek_to {
             if let Some(player) = self.player.as_ref() {
                 let _ = player.seek_absolute(target);
+                self.last_seek = Some(Instant::now());
             }
         }
     }
@@ -710,10 +774,7 @@ impl PlayerController {
 /// wrong fit shows up as a stretched or cropped picture, which is easy to miss
 /// by eye and hard to prove from a static snapshot.
 pub fn fit_into(available: egui::Rect, aspect: f32) -> egui::Rect {
-    if !aspect.is_finite()
-        || aspect <= 0.0
-        || available.width() <= 0.0
-        || available.height() <= 0.0
+    if !aspect.is_finite() || aspect <= 0.0 || available.width() <= 0.0 || available.height() <= 0.0
     {
         return available;
     }
@@ -743,7 +804,10 @@ mod tests {
         let fitted = fit_into(rect(400.0, 100.0), 16.0 / 9.0);
         assert!((fitted.height() - 100.0).abs() < 0.01);
         assert!((fitted.width() - 177.78).abs() < 0.01);
-        assert!((fitted.center().x - 200.0).abs() < 0.01, "must stay centred");
+        assert!(
+            (fitted.center().x - 200.0).abs() < 0.01,
+            "must stay centred"
+        );
     }
 
     #[test]

@@ -22,7 +22,11 @@ depends=('gcc-libs')
 makedepends=('cargo' 'rust')
 # libmpv is loaded at runtime, so the app builds and runs without it and simply
 # cannot play video until it is present.
-optdepends=('mpv: video playback via libmpv, and the external-player fallback')
+optdepends=(
+  'mpv: video playback via libmpv, and the external-player fallback'
+  'chromium: clears the Cloudflare challenge for the ext.to source'
+  'xorg-server-xvfb: virtual display for the ext.to solver'
+)
 provides=('reel-cli' 'reel-desktop')
 # The release profile sets its own LTO and codegen-units.
 options=('!lto')
@@ -46,6 +50,12 @@ package() {
   cd "$startdir"
   # One layout, one source of truth: the same script users run.
   scripts/install.sh --prefix /usr --destdir "$pkgdir" --no-build --with-service
+
+  # The bundled Cloudflare solver is not staged here (it needs network and a
+  # Python 3.11 via `uv`, which a clean chroot does not have). Packaged installs
+  # should run, as the user:
+  #   scripts/install-solver.sh --prefix /usr
+  # or simply skip ext.to. See scripts/install-solver.sh.
 
   # The licence is declared in two files; makepkg expects a directory too.
   install -d "$pkgdir/usr/share/licenses/$pkgname"

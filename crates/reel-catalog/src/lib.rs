@@ -8,9 +8,8 @@
 //!
 //! * It knows nothing about torrents or HTTP streaming — it takes a title and a
 //!   year and answers with [`model::Metadata`].
-//! * It ships **no search backends**. [`search::SearchBackend`] exists so a
-//!   source can be plugged in by whoever runs the app, and the crate's own tests
-//!   use a fake.
+//! * Search sources are pluggable behind [`search::SearchBackend`]; the bundled
+//!   ext.to backend lives in [`backends`], and the crate's own tests use a fake.
 //! * The metadata source is behind [`provider::MetadataProvider`], so the app
 //!   runs without any API key (generated artwork, no synopsis) and tests run
 //!   without a network.
@@ -28,6 +27,7 @@ pub mod cache;
 pub mod error;
 pub mod history;
 pub mod matching;
+pub mod media;
 pub mod model;
 pub mod provider;
 pub mod release;
@@ -37,11 +37,14 @@ pub mod settings;
 pub mod tmdb;
 pub mod work;
 
-pub use backends::ArchiveOrgBackend;
+pub use backends::ExtToBackend;
 pub use cache::CatalogCache;
 pub use error::CatalogError;
 pub use history::WatchHistory;
 pub use matching::{LookupQuery, MatchScore};
+pub use media::{
+    DownloadRecord, MediaRef, MediaStore, episode_key, episode_key_parts, legacy_key, movie_key,
+};
 pub use model::{
     Artwork, ArtworkKind, ArtworkRef, ArtworkSize, Candidate, CatalogEntry, Metadata, WatchProgress,
 };
@@ -49,7 +52,7 @@ pub use provider::{MetadataProvider, NullProvider, StaticProvider, TmdbProvider}
 pub use release::{FileInput, MediaKind, Release, ReleaseAttributes, Trust, analyse, parse_one};
 pub use rows::{Row, RowKind, WorkRow, build_rows, build_work_rows};
 pub use search::{SearchAggregator, SearchError, SearchHit, SearchQuery, SearchResults};
-pub use settings::{CatalogSettings, KeySource};
+pub use settings::{CatalogSettings, ConversionMode, HwAccel, KeySource};
 pub use tmdb::TmdbClient;
 pub use work::{
     EpisodeVariant, Version, Work, WorkEpisode, WorkExtra, WorkMember, WorkSeason, build_works,
@@ -57,17 +60,11 @@ pub use work::{
 };
 
 /// Where the cache and watch history live by default, under a data directory.
+///
+/// Delegates to [`reel_core::paths::data_dir`], which knows each platform's
+/// convention (and honours `REEL_DATA_DIR`).
 pub fn default_data_dir() -> std::path::PathBuf {
-    if let Ok(dir) = std::env::var("REEL_DATA_DIR") {
-        return std::path::PathBuf::from(dir);
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        return std::path::PathBuf::from(home)
-            .join(".local")
-            .join("share")
-            .join("reel");
-    }
-    std::path::PathBuf::from("./reel-data")
+    reel_core::paths::data_dir()
 }
 
 /// Build a provider from an optional API key.

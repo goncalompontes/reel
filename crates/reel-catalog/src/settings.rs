@@ -11,6 +11,8 @@
 //! first-run fallback when nothing has been saved yet, so scripts keep working
 //! but saving in the app always takes effect.
 
+// `Write` is only needed by the private-mode writer below, which is Unix-only.
+#[cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -20,7 +22,7 @@ pub const API_KEY_ENV: &str = "REEL_TMDB_API_KEY";
 const FILE_NAME: &str = "settings.json";
 
 /// Everything the app remembers between runs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CatalogSettings {
     /// TMDB key: a v3 API key or a v4 read access token. Both work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -41,9 +43,27 @@ pub struct CatalogSettings {
     #[serde(default = "default_true")]
     pub subtitles_enabled: bool,
 
-    /// Register the bundled search sources (the Internet Archive).
+    /// Register the ext.to search source.
     #[serde(default = "default_true")]
-    pub enable_bundled_sources: bool,
+    pub ext_to_enabled: bool,
+
+    /// ext.to base URL, for a mirror. `None` uses `https://ext.to`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext_to_base_url: Option<String>,
+
+    /// ext.to Cloudflare clearance cookie (`cf_clearance=…; …`). The app solves
+    /// the challenge itself; this is an override for when that is not enough.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext_to_cookie: Option<String>,
+
+    /// The user agent bound to `ext_to_cookie`; Cloudflare ties clearance to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext_to_user_agent: Option<String>,
+
+    /// Optional FlareSolverr-compatible solver endpoint, used only when the
+    /// built-in solver cannot clear a challenge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext_to_solver_url: Option<String>,
 
     /// Merge torrents that are the same film or show into one library title.
     #[serde(default = "default_true")]
@@ -52,6 +72,13 @@ pub struct CatalogSettings {
     /// Preferred subtitle language, e.g. `en`. `None` lets mpv choose.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle_language: Option<String>,
+
+    /// Preferred audio language, e.g. `en`. When set and the file has a
+    /// matching track, that track is cast (which forces a conversion, since a
+    /// DLNA renderer cannot switch tracks); otherwise the file's first audio
+    /// track is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_language: Option<String>,
 
     /// Initial player volume, 0–100.
     #[serde(default = "default_volume")]
@@ -68,6 +95,150 @@ pub struct CatalogSettings {
     /// released. `0` releases each stream as soon as playback stops.
     #[serde(default = "default_stream_cache_mb")]
     pub stream_cache_mb: u32,
+
+    /// TCP/uTP port for peers. `None` lets the OS pick. Takes effect on the
+    /// next start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_port: Option<u16>,
+
+    /// Use the DHT for peer discovery.
+    #[serde(default = "default_true")]
+    pub dht_enabled: bool,
+
+    /// Announce to trackers.
+    #[serde(default = "default_true")]
+    pub trackers_enabled: bool,
+
+    /// Ask the router to open the listen port with UPnP.
+    #[serde(default)]
+    pub enable_upnp: bool,
+
+    /// Restrict all torrent networking to IPv4.
+    #[serde(default)]
+    pub ipv4_only: bool,
+
+    /// Hard cap on connected peers per torrent. `None` is the engine default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_limit: Option<usize>,
+
+    /// Download cap in KiB/s. `None` (or `0`) is unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_limit_kib: Option<u32>,
+
+    /// Upload cap in KiB/s. `None` (or `0`) is unlimited; uploads stay off
+    /// regardless unless seeding is enabled outside the app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_limit_kib: Option<u32>,
+
+    /// Stream to DLNA/UPnP renderers on the local network. Off by default: it
+    /// opens a LAN-facing, token-gated media port.
+    #[serde(default)]
+    pub allow_lan_streaming: bool,
+
+    /// LAN address to advertise in cast URLs. `None` picks the primary
+    /// non-loopback IPv4 automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast_lan_address: Option<String>,
+
+    /// How far to go when a file is not directly playable.
+    #[serde(default)]
+    pub conversion_mode: ConversionMode,
+
+    /// Quality cap, in pixels, applied when re-encoding.
+    #[serde(default = "default_conversion_max_height")]
+    pub conversion_max_height: u32,
+
+    /// Trust the renderer with H.265/HEVC (any bit depth) and AC3/EAC3 audio,
+    /// remuxing instead of re-encoding. Modern TVs handle these; older ones do
+    /// not.
+    #[serde(default)]
+    pub allow_hevc_passthrough: bool,
+
+    /// Why video encoding to use when a file must be re-encoded. `Auto` prefers
+    /// a hardware encoder when one is usable, and falls back to software.
+    #[serde(default)]
+    pub conversion_hwaccel: HwAccel,
+
+    /// TCP port for the LAN media server. A fixed port lets a firewall rule
+    /// allow the TV through; `0` asks the OS for one.
+    #[serde(default = "default_cast_media_port")]
+    pub cast_media_port: u16,
+
+    /// Path to an `ffmpeg` binary. `None` uses a bundled copy, then `PATH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ffmpeg_path: Option<String>,
+
+    /// The renderer most recently cast to, so the picker can pin it and label
+    /// it "last used". Only a hint: the connection itself is never persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast_last_device_udn: Option<String>,
+
+    /// Friendly name of the renderer most recently cast to, for the same hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast_last_device_name: Option<String>,
+
+    /// Pass HEVC through even when the renderer does not advertise it.
+    ///
+    /// Many televisions — LG webOS especially — under-report HEVC support in
+    /// `ConnectionManager`, which would otherwise force a needless re-encode
+    /// and drop subtitles embedded in the container. On by default; turn it off
+    /// for a TV that genuinely cannot decode HEVC.
+    #[serde(default = "default_true")]
+    pub cast_trust_hevc: bool,
+}
+
+/// How much conversion the user allows when casting an incompatible file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConversionMode {
+    /// Only cast files a typical TV can already play.
+    Off,
+    /// Rewrap the container, but never re-encode.
+    Remux,
+    /// Rewrap when possible, re-encode only when necessary.
+    #[default]
+    Auto,
+}
+
+/// Which video encoder to use when a re-encode is unavoidable.
+///
+/// The pinning variants exist so a user can force a particular encoder from
+/// `settings.json`; the Settings UI only exposes `Auto` and `Off`. Anything but
+/// `Auto` falls back to software when the pinned encoder is not usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HwAccel {
+    /// Use a hardware encoder when one is usable, else software.
+    #[default]
+    Auto,
+    /// Always encode on the CPU (`libx264`).
+    Off,
+    /// Linux VA-API (Intel/AMD GPUs).
+    Vaapi,
+    /// Intel Quick Sync Video.
+    Qsv,
+    /// NVIDIA NVENC.
+    Nvenc,
+    /// macOS VideoToolbox.
+    #[serde(rename = "videotoolbox")]
+    VideoToolbox,
+    /// Windows AMD AMF.
+    Amf,
+}
+
+impl HwAccel {
+    /// A short label for the Settings UI.
+    pub fn label(&self) -> &'static str {
+        match self {
+            HwAccel::Auto => "Auto",
+            HwAccel::Off => "CPU",
+            HwAccel::Vaapi => "VA-API",
+            HwAccel::Qsv => "Quick Sync",
+            HwAccel::Nvenc => "NVENC",
+            HwAccel::VideoToolbox => "VideoToolbox",
+            HwAccel::Amf => "AMF",
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -86,6 +257,21 @@ fn default_stream_cache_mb() -> u32 {
     1024
 }
 
+fn default_conversion_max_height() -> u32 {
+    1080
+}
+
+fn default_cast_media_port() -> u16 {
+    41337
+}
+
+/// Trim a text setting and treat an empty result as unset.
+fn trim_blank(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 impl Default for CatalogSettings {
     fn default() -> Self {
         Self {
@@ -93,12 +279,36 @@ impl Default for CatalogSettings {
             download_dir: None,
             stream_only: default_true(),
             subtitles_enabled: default_true(),
-            enable_bundled_sources: default_true(),
+            ext_to_enabled: default_true(),
+            ext_to_base_url: None,
+            ext_to_cookie: None,
+            ext_to_user_agent: None,
+            ext_to_solver_url: None,
             merge_works: default_true(),
             subtitle_language: None,
+            audio_language: None,
             default_volume: default_volume(),
             stream_buffer_mb: default_stream_buffer_mb(),
             stream_cache_mb: default_stream_cache_mb(),
+            listen_port: None,
+            dht_enabled: default_true(),
+            trackers_enabled: default_true(),
+            enable_upnp: false,
+            ipv4_only: false,
+            peer_limit: None,
+            download_limit_kib: None,
+            upload_limit_kib: None,
+            allow_lan_streaming: false,
+            cast_lan_address: None,
+            conversion_mode: ConversionMode::default(),
+            conversion_max_height: default_conversion_max_height(),
+            allow_hevc_passthrough: false,
+            conversion_hwaccel: HwAccel::default(),
+            cast_media_port: default_cast_media_port(),
+            ffmpeg_path: None,
+            cast_last_device_udn: None,
+            cast_last_device_name: None,
+            cast_trust_hevc: default_true(),
         }
     }
 }
@@ -115,6 +325,7 @@ impl CatalogSettings {
         match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                 tracing::warn!(path = %path.display(), error = %e, "ignoring unreadable settings");
+                reel_core::quarantine_corrupt(&path);
                 Self::default()
             }),
             Err(_) => Self::default(),
@@ -192,11 +403,19 @@ impl CatalogSettings {
             .take()
             .map(|lang| lang.trim().to_string())
             .filter(|lang| !lang.is_empty());
+        self.audio_language = trim_blank(self.audio_language.take());
         self.download_dir = self
             .download_dir
             .take()
             .map(|dir| dir.trim().to_string())
             .filter(|dir| !dir.is_empty());
+        self.ext_to_base_url = trim_blank(self.ext_to_base_url.take());
+        self.ext_to_cookie = trim_blank(self.ext_to_cookie.take());
+        self.ext_to_user_agent = trim_blank(self.ext_to_user_agent.take());
+        self.ext_to_solver_url = trim_blank(self.ext_to_solver_url.take());
+        self.cast_lan_address = trim_blank(self.cast_lan_address.take());
+        self.ffmpeg_path = trim_blank(self.ffmpeg_path.take());
+        self.conversion_max_height = self.conversion_max_height.clamp(144, 4320);
     }
 }
 
@@ -259,9 +478,82 @@ mod tests {
     #[test]
     fn defaults_are_streaming_first() {
         let settings = CatalogSettings::default();
-        assert!(settings.stream_only, "streaming is the primary way to use the app");
+        assert!(
+            settings.stream_only,
+            "streaming is the primary way to use the app"
+        );
         assert!(settings.subtitles_enabled);
         assert_eq!(settings.default_volume, 100.0);
+    }
+
+    #[test]
+    fn casting_defaults_are_conservative() {
+        let settings = CatalogSettings::default();
+        assert!(
+            !settings.allow_lan_streaming,
+            "opening a LAN media port is opt-in"
+        );
+        assert_eq!(settings.conversion_mode, ConversionMode::Auto);
+        assert_eq!(settings.conversion_max_height, 1080);
+        assert!(
+            !settings.allow_hevc_passthrough,
+            "passthrough must be opted into"
+        );
+        assert_eq!(settings.cast_media_port, 41337);
+    }
+
+    #[test]
+    fn hwaccel_defaults_to_auto_and_round_trips_as_lowercase() {
+        assert_eq!(CatalogSettings::default().conversion_hwaccel, HwAccel::Auto);
+
+        let dir = scratch("hwaccel");
+        CatalogSettings {
+            conversion_hwaccel: HwAccel::Nvenc,
+            ..Default::default()
+        }
+        .save(&dir)
+        .unwrap();
+
+        let loaded = CatalogSettings::load(&dir);
+        assert_eq!(loaded.conversion_hwaccel, HwAccel::Nvenc);
+        let raw = std::fs::read_to_string(CatalogSettings::path(&dir)).unwrap();
+        assert!(raw.contains("\"nvenc\""), "stored value should be readable");
+
+        // An unknown value must not stop startup. Like every other field, an
+        // unreadable file is quarantined and replaced with defaults.
+        let other = scratch("hwaccel-unknown");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(
+            CatalogSettings::path(&other),
+            br#"{"conversion_hwaccel":"warp-drive"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            CatalogSettings::load(&other).conversion_hwaccel,
+            HwAccel::Auto
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn conversion_mode_round_trips_as_lowercase() {
+        let dir = scratch("conversion");
+        CatalogSettings {
+            conversion_mode: ConversionMode::Remux,
+            conversion_max_height: 720,
+            ..Default::default()
+        }
+        .save(&dir)
+        .unwrap();
+
+        let loaded = CatalogSettings::load(&dir);
+        assert_eq!(loaded.conversion_mode, ConversionMode::Remux);
+        assert_eq!(loaded.conversion_max_height, 720);
+
+        let raw = std::fs::read_to_string(CatalogSettings::path(&dir)).unwrap();
+        assert!(raw.contains("\"remux\""), "stored mode should be readable");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -280,7 +572,11 @@ mod tests {
             .unwrap()
             .permissions()
             .mode();
-        assert_eq!(mode & 0o777, 0o600, "a credential must not be world readable");
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a credential must not be world readable"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -335,12 +631,45 @@ mod tests {
         let mut settings = CatalogSettings {
             download_dir: Some("  /tmp/x  ".into()),
             subtitle_language: Some("  en ".into()),
+            audio_language: Some(" fr ".into()),
             default_volume: 999.0,
+            ext_to_cookie: Some("   ".into()),
+            ext_to_base_url: Some("  https://mirror.example  ".into()),
             ..Default::default()
         };
         settings.normalise();
         assert_eq!(settings.download_dir.as_deref(), Some("/tmp/x"));
         assert_eq!(settings.subtitle_language.as_deref(), Some("en"));
+        assert_eq!(settings.audio_language.as_deref(), Some("fr"));
         assert_eq!(settings.default_volume, 130.0);
+        // A blank credential is unset, not an empty string.
+        assert_eq!(settings.ext_to_cookie, None);
+        assert_eq!(
+            settings.ext_to_base_url.as_deref(),
+            Some("https://mirror.example")
+        );
+    }
+
+    #[test]
+    fn the_search_source_settings_round_trip() {
+        let dir = scratch("search");
+        let settings = CatalogSettings {
+            ext_to_enabled: true,
+            ext_to_cookie: Some("cf_clearance=abc".into()),
+            ..Default::default()
+        };
+        settings.save(&dir).unwrap();
+        let loaded = CatalogSettings::load(&dir);
+        assert!(loaded.ext_to_enabled);
+        assert_eq!(loaded.ext_to_cookie.as_deref(), Some("cf_clearance=abc"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_archive_source_setting_cannot_register_a_backend() {
+        let loaded: CatalogSettings =
+            serde_json::from_str(r#"{"archive_org_enabled":true,"ext_to_enabled":false}"#).unwrap();
+        assert!(!loaded.ext_to_enabled);
+        assert!(crate::backends::bundled(&loaded).is_empty());
     }
 }
