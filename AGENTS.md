@@ -1,6 +1,7 @@
 # AGENTS.md
 
-`reel` — native torrent streaming/player. Rust workspace, edition 2024, no CI.
+`reel` — native torrent streaming/player. Rust workspace, edition 2024, CI on
+Linux, macOS and Windows (`.github/workflows/`).
 
 ## Commands
 
@@ -11,7 +12,9 @@ cargo test --workspace                        # ~190 tests (see gotchas below)
 cargo test -p reel-catalog matching::         # one crate, one module
 cargo test -p reel-desktop --test ui <name>   # one integration test file
 bash scripts/e2e.sh                           # real create->seed->stream; needs ffmpeg ffprobe curl python3
+REEL_E2E_SKIP_PLAYBACK=1 bash scripts/e2e.sh  # skip steps 17-20 where libmpv is older than client API 2.5
 scripts/install.sh                            # user-local (~/.local), no root; --prefix /usr, --uninstall
+scripts/install.sh --check                    # the dependency doctor: report only
 ```
 
 UI snapshot suites: `UPDATE_SNAPSHOTS=1 cargo test -p reel-desktop --test ui -- --test-threads=1`
@@ -20,6 +23,14 @@ UI snapshot suites: `UPDATE_SNAPSHOTS=1 cargo test -p reel-desktop --test ui -- 
 
 ## Gotchas (non-obvious, will bite you)
 
+- **The MSRV is 1.95, not 1.86.** egui/eframe 0.36 require it (wgpu needs 1.87);
+  the old 1.86 declaration was never buildable. Correcting it activated
+  MSRV-aware clippy lints, so clippy now suggests things it did not before (CI
+  runs clippy for visibility, but does not gate on it).
+- **The e2e's native-playback steps need libmpv at client API >= 2.5.** An older
+  distro mpv is refused by design; `REEL_E2E_SKIP_PLAYBACK=1` skips steps 17-20
+  (CI sets it). `dump_frame`'s seek step is occasionally flaky (the position
+  stays near 0); re-run before assuming a regression.
 - **The tree is not rustfmt-clean.** `cargo fmt` rewrites dozens of files. Do
   not run it repo-wide; match the surrounding style, and format only files you
   changed (many of those are already clean).
