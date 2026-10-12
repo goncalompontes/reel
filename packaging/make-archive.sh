@@ -77,11 +77,13 @@ trap 'rm -rf "$STAGE"' EXIT
 PKG="$STAGE/$NAME"
 mkdir -p "$PKG"
 
-install -m755 "$BIN_DIR/reel$EXE" "$PKG/reel$EXE"
-install -m755 "$BIN_DIR/reel-desktop$EXE" "$PKG/reel-desktop$EXE"
-install -m644 "$ROOT/LICENSE-MIT" "$PKG/LICENSE-MIT"
-install -m644 "$ROOT/LICENSE-APACHE" "$PKG/LICENSE-APACHE"
-install -m644 "$ROOT/README.md" "$PKG/README.md"
+cp "$BIN_DIR/reel$EXE" "$PKG/reel$EXE"
+cp "$BIN_DIR/reel-desktop$EXE" "$PKG/reel-desktop$EXE"
+chmod 755 "$PKG/reel$EXE" "$PKG/reel-desktop$EXE"
+cp "$ROOT/LICENSE-MIT" "$PKG/LICENSE-MIT"
+cp "$ROOT/LICENSE-APACHE" "$PKG/LICENSE-APACHE"
+cp "$ROOT/README.md" "$PKG/README.md"
+chmod 644 "$PKG/LICENSE-MIT" "$PKG/LICENSE-APACHE" "$PKG/README.md"
 
 cat > "$PKG/INSTALL.md" <<EOF
 # reel $VERSION
