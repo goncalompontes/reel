@@ -21,6 +21,7 @@ ROOT="$(cd "$HERE/.." && pwd)"
 PREFIX="${PREFIX:-$HOME/.local}"
 DESTDIR="${DESTDIR:-}"
 DO_BUILD=1
+PROFILE=release
 WITH_SERVICE=0
 WITH_SOLVER=1
 SOLVER_PORT=""
@@ -43,7 +44,9 @@ Install reel.
 Options:
   --prefix DIR      Where to install. Default: ~/.local
   --destdir DIR     Staging root, for packaging. Default: empty
-  --no-build        Do not run cargo; use existing release binaries
+  --no-build        Do not run cargo; use the existing binaries in target/
+  --debug           Build and install a debug build (target/debug) instead of
+                    the release build. Implies an unoptimised, slower app.
   --with-service    Also install a systemd user unit for `reel serve`
   --without-solver  Do not install the bundled Cloudflare solver (ext.to)
   --solver-port N   Port the bundled solver listens on. Default: 8391
@@ -62,6 +65,7 @@ while [ $# -gt 0 ]; do
     --prefix) PREFIX="${2:?--prefix needs a directory}"; shift 2 ;;
     --destdir) DESTDIR="${2:?--destdir needs a directory}"; shift 2 ;;
     --no-build) DO_BUILD=0; shift ;;
+    --debug) PROFILE=debug; shift ;;
     --with-service) WITH_SERVICE=1; shift ;;
     --without-solver) WITH_SOLVER=0; shift ;;
     --solver-port) SOLVER_PORT="${2:?--solver-port needs a number}"; shift 2 ;;
@@ -167,25 +171,31 @@ do_uninstall() {
 }
 
 do_install() {
+  local bin_dir="$ROOT/target/$PROFILE"
+
   if [ "$DO_BUILD" -eq 1 ]; then
-    say "Building release binaries..."
-    ( cd "$ROOT" && cargo build --release --locked )
+    say "Building $PROFILE binaries..."
+    if [ "$PROFILE" = release ]; then
+      ( cd "$ROOT" && cargo build --release --locked )
+    else
+      ( cd "$ROOT" && cargo build --locked )
+    fi
   fi
 
   local bin
   for bin in reel reel-desktop; do
-    if [ ! -x "$ROOT/target/release/$bin" ]; then
-      printf 'missing %s; run without --no-build\n' "$ROOT/target/release/$bin" >&2
+    if [ ! -x "$bin_dir/$bin" ]; then
+      printf 'missing %s; run without --no-build\n' "$bin_dir/$bin" >&2
       exit 1
     fi
   done
 
-  say "Installing to $PREFIX"
+  say "Installing to $PREFIX ($PROFILE build)"
   install -d "$(DEST "$BIN_DIR")" "$(DEST "$APP_DIR")" "$(DEST "$ICON_SCALABLE_DIR")" "$(DEST "$LICENSE_DIR")"
 
-  install -m755 "$ROOT/target/release/reel" "$(DEST "$BIN_DIR/reel")"
+  install -m755 "$bin_dir/reel" "$(DEST "$BIN_DIR/reel")"
   say "  $BIN_DIR/reel"
-  install -m755 "$ROOT/target/release/reel-desktop" "$(DEST "$BIN_DIR/reel-desktop")"
+  install -m755 "$bin_dir/reel-desktop" "$(DEST "$BIN_DIR/reel-desktop")"
   say "  $BIN_DIR/reel-desktop"
 
   # The launcher gets an absolute Exec: a GUI session does not read shell rc
