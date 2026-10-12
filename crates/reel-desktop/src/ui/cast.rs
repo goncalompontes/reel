@@ -19,8 +19,8 @@ impl App {
             None => response.on_hover_text("Play on a TV on your network"),
         };
         if response.clicked() {
-            if let Some((torrent_id, file_id, title)) = self.cast_target() {
-                self.request_cast(torrent_id, file_id, title);
+            if let Some((torrent_id, info_hash, file_id, title)) = self.cast_target() {
+                self.request_cast(torrent_id, info_hash, file_id, title);
             } else {
                 // Nothing to cast yet: still show the picker so the reason is visible.
                 self.backend.refresh_cast_devices();
@@ -30,41 +30,52 @@ impl App {
     }
 
     /// Ask to cast a specific file, opening the device picker.
-    pub(crate) fn request_cast(&mut self, torrent_id: usize, file_id: usize, title: String) {
-        self.cast_pending = Some((torrent_id, file_id, title));
+    pub(crate) fn request_cast(
+        &mut self,
+        torrent_id: usize,
+        info_hash: String,
+        file_id: usize,
+        title: String,
+    ) {
+        self.cast_pending = Some((torrent_id, info_hash, file_id, title));
         self.backend.refresh_cast_devices();
         self.cast_open = true;
     }
 
     /// Start casting once a device is chosen.
     ///
-    /// A title that is not already streaming has no valid stream URL yet, so it
-    /// is started and the cast waits for [`crate::backend::BackendEvent::Ready`]
-    /// — otherwise the backend's probe hits a 404 and the cast fails.
+    /// Mirrors playback: start the files and wait for
+    /// [`crate::backend::BackendEvent::Ready`] before casting. A title that is
+    /// not already streaming has no valid stream URL yet (and a re-add changes
+    /// its engine id), so probing immediately gives a 404.
     pub(crate) fn begin_cast(
         &mut self,
         udn: String,
         torrent_id: usize,
+        info_hash: String,
         file_id: usize,
         title: String,
     ) {
-        if self.backend.is_live(torrent_id) {
-            self.backend.start_cast(udn, torrent_id, file_id, title);
-            return;
-        }
         self.start_streaming(torrent_id, &[file_id]);
-        self.pending_cast = Some((udn, torrent_id, file_id, title));
+        self.pending_cast = Some((udn, torrent_id, info_hash, file_id, title));
         self.set_toast("Preparing to stream\u{2026}", false);
     }
 
-    /// The file the current screen implies should be cast.
-    fn cast_target(&self) -> Option<(usize, usize, String)> {
+    /// The file the current screen implies should be cast, as
+    /// `(torrent id, info hash, file id, title)`.
+    fn cast_target(&self) -> Option<(usize, String, usize, String)> {
         if let Some(info) = self.player.current() {
-            return Some((info.torrent_id, info.file_id, info.title.clone()));
+            return Some((
+                info.torrent_id,
+                info.info_hash.clone(),
+                info.file_id,
+                info.title.clone(),
+            ));
         }
         let work = self.selected_work()?;
         let (torrent_id, file_id) = self.work_target(&work)?;
-        Some((torrent_id, file_id, work.heading()))
+        let info_hash = self.item(torrent_id)?.entry.info_hash.clone();
+        Some((torrent_id, info_hash, file_id, work.heading()))
     }
 
     /// The device picker popover.
@@ -153,8 +164,10 @@ impl App {
                 );
 
                 if let Some(udn) = chosen {
-                    if let Some((torrent_id, file_id, title)) = self.cast_pending.clone() {
-                        self.begin_cast(udn, torrent_id, file_id, title);
+                    if let Some((torrent_id, info_hash, file_id, title)) =
+                        self.cast_pending.clone()
+                    {
+                        self.begin_cast(udn, torrent_id, info_hash, file_id, title);
                         self.cast_open = false;
                     }
                 }

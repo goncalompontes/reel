@@ -1606,9 +1606,9 @@ impl Backend for EngineBackend {
         }
     }
 
-    fn start_cast(&self, udn: String, torrent_id: usize, file_id: usize, title: String) {
+    fn start_cast(&self, udn: String, info_hash: String, file_id: usize, title: String) {
         if let Some(cast) = self.cast() {
-            cast.start_cast(udn, torrent_id, file_id, title);
+            cast.start_cast(udn, info_hash, file_id, title);
         }
     }
 

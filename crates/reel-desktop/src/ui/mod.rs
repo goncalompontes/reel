@@ -293,12 +293,15 @@ pub struct App {
     /// Which Settings pane is showing.
     settings_section: SettingsSection,
     /// The cast picker popover, and the file to cast when a device is chosen.
+    /// The target is `(torrent id, info hash, file id, title)`; the info hash
+    /// resolves the live engine id, which changes when a stream is re-added.
     cast_open: bool,
-    cast_pending: Option<(usize, usize, String)>,
+    cast_pending: Option<(usize, String, usize, String)>,
     /// The "Add by address" text in the cast picker.
     cast_address: String,
-    /// A cast waiting for its title to start streaming: `(udn, torrent, file, title)`.
-    pending_cast: Option<(String, usize, usize, String)>,
+    /// A cast waiting for its title to start streaming:
+    /// `(udn, torrent id, info hash, file id, title)`.
+    pending_cast: Option<(String, usize, String, usize, String)>,
     player: PlayerController,
     /// Last time the mouse or a key moved, for hiding the chrome in fullscreen.
     player_last_activity: Instant,
@@ -1043,13 +1046,16 @@ impl App {
                         }
                     }
                     // A cast that was waiting for its title to come up.
-                    if let Some((udn, torrent_id, file_id, title)) = self.pending_cast.clone() {
+                    if let Some((udn, torrent_id, info_hash, file_id, title)) =
+                        self.pending_cast.clone()
+                    {
                         let matches = self
                             .item(torrent_id)
                             .is_some_and(|item| item.entry.info_hash == info_hash);
                         if matches {
                             self.pending_cast = None;
-                            self.backend.start_cast(udn, torrent_id, file_id, title);
+                            self.backend
+                                .start_cast(udn, info_hash, file_id, title);
                         }
                     }
                 }
@@ -1417,9 +1423,12 @@ mod tests {
     #[test]
     fn requesting_a_cast_remembers_the_target_and_opens_the_picker() {
         let mut app = app();
-        app.request_cast(7, 3, "Episode 1".to_string());
+        app.request_cast(7, "abc123".to_string(), 3, "Episode 1".to_string());
         assert!(app.cast_open, "the device picker should open");
-        assert_eq!(app.cast_pending, Some((7, 3, "Episode 1".to_string())));
+        assert_eq!(
+            app.cast_pending,
+            Some((7, "abc123".to_string(), 3, "Episode 1".to_string()))
+        );
         // The fake backend has no casting, so the picker explains why.
         assert!(app.backend.cast_unavailable().is_some());
     }

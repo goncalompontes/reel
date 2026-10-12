@@ -445,7 +445,11 @@ pub trait Backend {
     fn add_cast_device(&self, _address: String) {}
 
     /// Cast a torrent file to the renderer with the given UDN.
-    fn start_cast(&self, _udn: String, _torrent_id: usize, _file_id: usize, _title: String) {}
+    ///
+    /// Keyed by info hash, not the library id: a stream-only title is re-added
+    /// on demand and its engine id can change, so the id must be resolved when
+    /// the cast actually starts.
+    fn start_cast(&self, _udn: String, _info_hash: String, _file_id: usize, _title: String) {}
 
     /// Control the active cast.
     fn cast_action(&self, _action: crate::cast::CastAction) {}

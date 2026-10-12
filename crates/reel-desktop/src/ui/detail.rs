@@ -57,7 +57,11 @@ impl App {
             Some(DetailAction::PlayWorkFromStart) => self.restart_work(work_id),
             Some(DetailAction::Cast) => {
                 if let Some((torrent_id, file_id)) = self.work_target(&work) {
-                    self.request_cast(torrent_id, file_id, work.heading());
+                    if let Some(info_hash) =
+                        self.item(torrent_id).map(|item| item.entry.info_hash.clone())
+                    {
+                        self.request_cast(torrent_id, info_hash, file_id, work.heading());
+                    }
                 }
             }
             Some(DetailAction::MarkWatched) => self.mark_work_watched(&work),

@@ -330,7 +330,7 @@ impl CastService {
     }
 
     /// Cast a torrent file to the device with the given UDN.
-    pub fn start_cast(&self, udn: String, id: usize, file_id: usize, title: String) {
+    pub fn start_cast(&self, udn: String, info_hash: String, file_id: usize, title: String) {
         let device = self
             .inner
             .lock()
@@ -343,6 +343,21 @@ impl CastService {
         let Some(device) = device else {
             self.set_status(CastStatus::Failed {
                 message: "that device is no longer available".to_string(),
+            });
+            return;
+        };
+
+        // Resolve the live engine id now: a re-added stream-only title gets a
+        // new engine id, and the loopback stream URL is built from it.
+        let Some(engine_id) = self
+            .engine
+            .list()
+            .into_iter()
+            .find(|view| view.info_hash.eq_ignore_ascii_case(&info_hash))
+            .map(|view| view.id)
+        else {
+            self.set_status(CastStatus::Failed {
+                message: "that title is not streaming".to_string(),
             });
             return;
         };
@@ -377,7 +392,7 @@ impl CastService {
                 &lan_base,
                 &token,
                 &device,
-                id,
+                engine_id,
                 file_id,
                 &title,
             )
