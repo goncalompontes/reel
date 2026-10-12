@@ -40,18 +40,26 @@ impl CacheKey {
     }
 
     /// Build a key for a delivery plan.
+    ///
+    /// `audio_index` is the chosen audio stream, when the user picked one: a
+    /// different track produces different bytes, so it must not reuse the
+    /// default track's cached conversion.
     pub fn for_plan(
         info_hash: impl Into<String>,
         file_id: u64,
         length: u64,
         plan: &MediaPlan,
+        audio_index: Option<u32>,
     ) -> CacheKey {
-        let tag = match plan {
+        let mut tag = match plan {
             MediaPlan::Remux => "remux".to_string(),
             MediaPlan::Transcode { max_height } => format!("h264-{max_height}p"),
             MediaPlan::Original => "original".to_string(),
             MediaPlan::Unavailable { .. } => "unavailable".to_string(),
         };
+        if let Some(index) = audio_index {
+            tag.push_str(&format!("-a{index}"));
+        }
         CacheKey::new(info_hash, file_id, length, tag)
     }
 
@@ -220,17 +228,21 @@ mod tests {
         let key = CacheKey::new("abc/def", 3, 1000, "h264-1080p");
         assert_eq!(key.file_name(), "abc_def-3-1000-h264-1080p.mp4");
 
-        let remux = CacheKey::for_plan("abc", 0, 1, &MediaPlan::Remux);
+        let remux = CacheKey::for_plan("abc", 0, 1, &MediaPlan::Remux, None);
         assert_eq!(remux.file_name(), "abc-0-1-remux.mp4");
-        let transcode = CacheKey::for_plan("abc", 0, 1, &MediaPlan::Transcode { max_height: 720 });
+        let transcode =
+            CacheKey::for_plan("abc", 0, 1, &MediaPlan::Transcode { max_height: 720 }, None);
         assert_eq!(transcode.file_name(), "abc-0-1-h264-720p.mp4");
+        // A chosen audio stream gets its own cache entry.
+        let chosen = CacheKey::for_plan("abc", 0, 1, &MediaPlan::Remux, Some(3));
+        assert_eq!(chosen.file_name(), "abc-0-1-remux-a3.mp4");
     }
 
     #[test]
     fn contains_reflects_the_filesystem() {
         let dir = scratch("contains");
         let cache = ConversionCache::new(&dir, 1024);
-        let key = CacheKey::for_plan("hash", 0, 10, &MediaPlan::Remux);
+        let key = CacheKey::for_plan("hash", 0, 10, &MediaPlan::Remux, None);
         assert!(!cache.contains(&key));
         std::fs::write(cache.path_for(&key), b"x").unwrap();
         assert!(cache.contains(&key));

@@ -311,15 +311,32 @@ pub struct App {
     cast_pending: Option<CastTarget>,
     /// The "Add by address" text in the cast picker.
     cast_address: String,
-    /// A cast waiting for its title to start streaming: the chosen device UDN
-    /// and the title to cast.
-    pending_cast: Option<(String, CastTarget)>,
-    /// The cast actually running, remembered so stopping it can hand playback
-    /// back to this machine. Set when the renderer starts, cleared when it ends.
-    casting: Option<CastTarget>,
-    /// Whether the full cast remote is open. The cast keeps running when it is
-    /// closed; the header/rail control reopens it.
-    cast_view_open: bool,
+    /// The renderer playback is routed to, or `None` for local. Session-only:
+    /// choosing a device connects to it, and everything played goes there until
+    /// it is disconnected. `None` also when no cast is running.
+    cast_device: Option<crate::cast::DeviceInfo>,
+    /// The title most recently handed to the renderer, kept so the casting view
+    /// can name it, offer Up next, and retry after a failure.
+    cast_last: Option<CastTarget>,
+    /// The full-screen casting view. The cast keeps running when it is closed
+    /// (Back returns to browsing); the indicator reopens it.
+    cast_screen_open: bool,
+    /// Whether stopping the cast was deliberate. A deliberate stop hands
+    /// playback back here; a renderer that stopped on its own is only reported.
+    cast_stop_requested: bool,
+    /// Whether a deliberate stop should resume playback here ("Stop & watch
+    /// here") or just end the cast without playing anything ("Disconnect").
+    cast_resume_on_end: bool,
+    /// Whether subtitles are offered to the renderer when casting. Toggling it
+    /// re-casts at the current position; the renderer shows them from its own
+    /// subtitle menu.
+    cast_subtitles: bool,
+    /// Whether the renderer's master channel is muted, so the remote's mute
+    /// button can show its state. The volume itself is read from the renderer.
+    cast_muted: bool,
+    /// The audio stream the current cast should deliver, when the user picked
+    /// one in the remote. `None` uses the preferred language, then the first.
+    cast_audio_index: Option<u32>,
     player: PlayerController,
     /// Last time the mouse or a key moved, for hiding the chrome in fullscreen.
     player_last_activity: Instant,
@@ -422,9 +439,14 @@ impl App {
             cast_open: false,
             cast_pending: None,
             cast_address: String::new(),
-            pending_cast: None,
-            casting: None,
-            cast_view_open: false,
+            cast_device: None,
+            cast_last: None,
+            cast_screen_open: false,
+            cast_stop_requested: false,
+            cast_resume_on_end: false,
+            cast_subtitles: true,
+            cast_muted: false,
+            cast_audio_index: None,
             player: PlayerController::new(),
             player_last_activity: Instant::now(),
             player_controls_hidden: false,
@@ -482,6 +504,29 @@ impl App {
     /// Open the global Add modal. Exposed for tests and the debug tool.
     pub fn open_add(&mut self) {
         self.add_open = true;
+    }
+
+    /// Whether the casting view is showing. Exposed for tests.
+    pub fn is_cast_screen(&self) -> bool {
+        self.cast_screen_open && self.cast_device.is_some()
+    }
+
+    /// Whether a renderer is connected. Exposed for tests.
+    pub fn is_casting(&self) -> bool {
+        self.cast_device.is_some()
+    }
+
+    /// Connect to a renderer without playing anything, so casting surfaces can
+    /// be exercised without running discovery. Exposed for tests and the debug
+    /// tool.
+    pub fn connect_cast_for_test(&mut self, name: &str, udn: &str, open_screen: bool) {
+        self.cast_device = Some(crate::cast::DeviceInfo {
+            name: name.to_string(),
+            model: None,
+            udn: udn.to_string(),
+            kind: crate::cast::CastKind::Dlna,
+        });
+        self.cast_screen_open = open_screen;
     }
 
     /// Pushed views: `Work` stands on top of the root it was opened from, so
@@ -728,17 +773,34 @@ impl App {
     /// until [`crate::backend::BackendEvent::Ready`], and the URL is read from
     /// the refreshed library at that point.
     pub fn play_file(&mut self, _ctx: &egui::Context, torrent_id: usize, file_id: usize) {
-        self.prepare_play(torrent_id, file_id, None);
+        self.prepare_play(torrent_id, file_id, None, false);
     }
 
     /// Play a file, resuming at an explicit position instead of the saved watch
-    /// position. Used to hand a cast back to this machine.
+    /// position. Used to hand a cast back to this machine, so it always plays
+    /// here even while a device is connected.
     pub fn play_file_at(&mut self, torrent_id: usize, file_id: usize, position: f64) {
-        self.prepare_play(torrent_id, file_id, Some(position));
+        self.prepare_play(torrent_id, file_id, Some(position), true);
     }
 
     /// The shared body of [`Self::play_file`] and [`Self::play_file_at`].
-    fn prepare_play(&mut self, torrent_id: usize, file_id: usize, start_at: Option<f64>) {
+    ///
+    /// Playback has a single target: while a device is connected (and this is
+    /// not a deliberate hand-back to the local machine) the title is cast
+    /// instead of opened here.
+    fn prepare_play(
+        &mut self,
+        torrent_id: usize,
+        file_id: usize,
+        start_at: Option<f64>,
+        force_local: bool,
+    ) {
+        if !force_local {
+            if let Some(device) = self.cast_device.clone() {
+                self.cast_here(device, torrent_id, file_id, start_at);
+                return;
+            }
+        }
         let Some(item) = self.item(torrent_id) else {
             self.warn("That torrent is no longer in the library");
             return;
@@ -1078,24 +1140,6 @@ impl App {
                             self.open_player(torrent_id, file_id, start_at);
                         }
                     }
-                    // A cast that was waiting for its title to come up.
-                    if let Some((udn, target)) = self.pending_cast.clone() {
-                        let matches = self
-                            .item(target.torrent_id)
-                            .is_some_and(|item| item.entry.info_hash == info_hash);
-                        if matches {
-                            self.pending_cast = None;
-                            self.hand_over_to_cast(&target);
-                            self.backend.start_cast(
-                                udn,
-                                target.info_hash.clone(),
-                                target.file_id,
-                                target.title.clone(),
-                                target.start_at.map(Duration::from_secs_f64),
-                            );
-                            self.casting = Some(target);
-                        }
-                    }
                 }
                 BackendEvent::CastEnded {
                     position,
@@ -1377,13 +1421,22 @@ impl eframe::App for App {
             ctx.request_repaint_after(REFRESH_INTERVAL);
         }
 
+        // The casting view takes over the screen like the player, showing what
+        // is on the TV. Back (or Browse) returns to the shell, where the cast
+        // keeps running and the bar is the way back.
+        if self.cast_screen_open && self.cast_device.is_some() {
+            self.cast_screen(ui, &ctx);
+            self.draw_toast(ui, &ctx);
+            self.cast_picker(&ctx);
+            return;
+        }
+
         // The player is an overlay: it covers the shell and returns to whatever
         // the trail already shows when it closes.
         if self.player_open {
             self.player_screen(ui, &ctx);
             self.draw_toast(ui, &ctx);
             self.cast_picker(&ctx);
-            self.cast_overlay(&ctx);
             return;
         }
 
@@ -1419,9 +1472,9 @@ impl eframe::App for App {
                 .show(ui, |ui| self.header(ui));
         }
 
-        // A cast keeps running with its remote closed; this bar is the way back
+        // A cast keeps running with its view closed; this bar is the way back
         // to it (and to stop it) from anywhere in the app.
-        if self.backend.cast_status().is_some() && !self.cast_view_open {
+        if self.backend.cast_status().is_some() && !self.cast_screen_open {
             egui::Panel::bottom("cast-bar")
                 .frame(
                     egui::Frame::NONE
@@ -1450,7 +1503,6 @@ impl eframe::App for App {
         self.draw_toast(ui, &ctx);
         self.draw_remove_dialog(ui, &ctx);
         self.cast_picker(&ctx);
-        self.cast_overlay(&ctx);
     }
 
     fn on_exit(&mut self) {
@@ -1502,16 +1554,61 @@ mod tests {
     }
 
     #[test]
-    fn ending_a_cast_hands_playback_back_at_its_position() {
+    fn a_connected_device_routes_play_to_the_cast() {
         let mut app = app();
-        // A cast of Sintel (torrent 3, file 0) is running.
-        app.casting = Some(CastTarget {
+        app.connect_cast_for_test("Living Room TV", "uuid:tv", false);
+
+        let ctx = egui::Context::default();
+        // Sintel: torrent 3, file 0.
+        app.play_file(&ctx, 3, 0);
+
+        assert_eq!(
+            app.pending_play, None,
+            "a connected device must not open the local player"
+        );
+        assert!(
+            app.cast_last.is_some(),
+            "the play should have been handed to the renderer"
+        );
+        assert!(
+            !app.is_cast_screen(),
+            "casting must not take over the screen; the mini bar is the surface"
+        );
+    }
+
+    #[test]
+    fn handing_a_cast_back_plays_here() {
+        let mut app = app();
+        app.connect_cast_for_test("Living Room TV", "uuid:tv", false);
+
+        app.play_file_at(3, 0, 120.0);
+
+        assert_eq!(
+            app.pending_play,
+            Some((3, 0, Some(120.0))),
+            "a hand-back must resume on this machine, not the renderer"
+        );
+    }
+
+    #[test]
+    fn ending_a_deliberate_cast_hands_playback_back_at_its_position() {
+        let mut app = app();
+        // A cast of Sintel (torrent 3, file 0) is running on the TV.
+        app.cast_device = Some(crate::cast::DeviceInfo {
+            name: "Living Room TV".to_string(),
+            model: None,
+            udn: "uuid:tv".to_string(),
+            kind: crate::cast::CastKind::Dlna,
+        });
+        app.cast_last = Some(CastTarget {
             torrent_id: 3,
             info_hash: "abc123".to_string(),
             file_id: 0,
             title: "Sintel".to_string(),
             start_at: None,
         });
+        app.cast_stop_requested = true;
+        app.cast_resume_on_end = true;
 
         app.on_cast_ended(
             Some(Duration::from_secs(754)),
@@ -1519,8 +1616,8 @@ mod tests {
         );
 
         assert!(
-            app.casting.is_none(),
-            "the cast should be forgotten once it ends"
+            app.cast_device.is_none(),
+            "the device should be forgotten once the cast ends"
         );
         assert_eq!(
             app.pending_play,
@@ -1530,15 +1627,84 @@ mod tests {
     }
 
     #[test]
-    fn a_cast_that_finished_does_not_resume_here() {
+    fn disconnecting_ends_the_cast_without_playing_here() {
         let mut app = app();
-        app.casting = Some(CastTarget {
+        app.cast_device = Some(crate::cast::DeviceInfo {
+            name: "Living Room TV".to_string(),
+            model: None,
+            udn: "uuid:tv".to_string(),
+            kind: crate::cast::CastKind::Dlna,
+        });
+        app.cast_last = Some(CastTarget {
             torrent_id: 3,
             info_hash: "abc123".to_string(),
             file_id: 0,
             title: "Sintel".to_string(),
             start_at: None,
         });
+        app.cast_stop_requested = true;
+        app.cast_resume_on_end = false;
+
+        app.on_cast_ended(
+            Some(Duration::from_secs(754)),
+            Some(Duration::from_secs(1800)),
+        );
+
+        assert!(app.cast_device.is_none());
+        assert_eq!(
+            app.pending_play, None,
+            "a deliberate disconnect should not resume on this machine"
+        );
+    }
+
+    #[test]
+    fn a_cast_the_renderer_stopped_itself_does_not_resume_here() {
+        let mut app = app();
+        app.cast_device = Some(crate::cast::DeviceInfo {
+            name: "Living Room TV".to_string(),
+            model: None,
+            udn: "uuid:tv".to_string(),
+            kind: crate::cast::CastKind::Dlna,
+        });
+        app.cast_last = Some(CastTarget {
+            torrent_id: 3,
+            info_hash: "abc123".to_string(),
+            file_id: 0,
+            title: "Sintel".to_string(),
+            start_at: None,
+        });
+        // `cast_stop_requested` is false: the TV stopped on its own.
+
+        app.on_cast_ended(
+            Some(Duration::from_secs(754)),
+            Some(Duration::from_secs(1800)),
+        );
+
+        assert!(app.cast_device.is_none());
+        assert_eq!(
+            app.pending_play, None,
+            "a spontaneous stop must not yank the user into playback"
+        );
+    }
+
+    #[test]
+    fn a_deliberate_cast_that_finished_does_not_resume_here() {
+        let mut app = app();
+        app.cast_device = Some(crate::cast::DeviceInfo {
+            name: "Living Room TV".to_string(),
+            model: None,
+            udn: "uuid:tv".to_string(),
+            kind: crate::cast::CastKind::Dlna,
+        });
+        app.cast_last = Some(CastTarget {
+            torrent_id: 3,
+            info_hash: "abc123".to_string(),
+            file_id: 0,
+            title: "Sintel".to_string(),
+            start_at: None,
+        });
+        app.cast_stop_requested = true;
+        app.cast_resume_on_end = true;
 
         // Stopped 5 seconds from the end: nothing worth resuming.
         app.on_cast_ended(
@@ -1546,7 +1712,7 @@ mod tests {
             Some(Duration::from_secs(1800)),
         );
 
-        assert!(app.casting.is_none());
+        assert!(app.cast_device.is_none());
         assert_eq!(app.pending_play, None);
     }
 

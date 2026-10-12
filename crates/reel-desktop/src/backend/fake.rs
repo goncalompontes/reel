@@ -491,10 +491,13 @@ impl Backend for FakeBackend {
     fn start_cast(
         &self,
         _udn: String,
+        _torrent_id: usize,
         _info_hash: String,
         _file_id: usize,
         _title: String,
         _start_at: Option<Duration>,
+        _subtitles: bool,
+        _audio_index: Option<u32>,
     ) {
     }
 
@@ -508,6 +511,12 @@ impl Backend for FakeBackend {
 
     fn dismiss_cast(&self) {
         *self.cast.status.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn remember_cast_device(&self, name: &str, udn: &str) {
+        let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        settings.cast_last_device_udn = Some(udn.to_string());
+        settings.cast_last_device_name = Some(name.to_string());
     }
 }
 

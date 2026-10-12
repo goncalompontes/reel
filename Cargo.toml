@@ -6,6 +6,7 @@ members = [
     "crates/reel-player",
     "crates/reel-catalog",
     "crates/reel-cast",
+    "crates/reel-cast-gcast",
     "crates/reel-media",
     "crates/reel-cli",
     "crates/reel-desktop",
@@ -15,7 +16,12 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.86"
+# The real floor for building the workspace: the desktop app pulls eframe/egui
+# 0.36, which declare `rust-version = 1.95` (wgpu needs 1.87). Declaring 1.86
+# was wrong — cargo refuses to build those packages on anything older. The
+# headless crates (reel-core/-http/-cli) build on less, but the workspace is one
+# number.
+rust-version = "1.95"
 
 [workspace.dependencies]
 reel-core = { path = "crates/reel-core" }
@@ -24,6 +30,7 @@ reel-desktop = { path = "crates/reel-desktop" }
 reel-http = { path = "crates/reel-http" }
 reel-catalog = { path = "crates/reel-catalog" }
 reel-cast = { path = "crates/reel-cast" }
+reel-cast-gcast = { path = "crates/reel-cast-gcast" }
 reel-media = { path = "crates/reel-media" }
 
 anyhow = "1"
@@ -64,3 +71,10 @@ codegen-units = 1
 # queue when a torrent is stream-only. See vendor/librqbit.
 [patch.crates-io]
 librqbit = { path = "vendor/librqbit" }
+# The Google Cast Default Media Receiver rejects `streamType: NONE` (which the
+# sender SDK hardcodes) with `LOAD_FAILED`; a file load must be `BUFFERED`. See
+# vendor/fcast-sender-sdk. Port this patch on any SDK bump.
+fcast-sender-sdk = { path = "vendor/fcast-sender-sdk" }
+# Side-loaded subtitle tracks (`tracks` / `activeTrackIds`), which the sender SDK
+# could not attach. See vendor/fcast-sender-sdk/REEL_PATCHES.md.
+google-cast-protocol = { path = "vendor/google-cast-protocol" }

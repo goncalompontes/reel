@@ -55,20 +55,6 @@ impl App {
                 }
             }
             Some(DetailAction::PlayWorkFromStart) => self.restart_work(work_id),
-            Some(DetailAction::Cast) => {
-                if let Some((torrent_id, file_id)) = self.work_target(&work) {
-                    if let Some(item) = self.item(torrent_id) {
-                        let target = CastTarget {
-                            torrent_id,
-                            info_hash: item.entry.info_hash.clone(),
-                            file_id,
-                            title: work.heading(),
-                            start_at: resume_start_at(&item, file_id),
-                        };
-                        self.request_cast(target);
-                    }
-                }
-            }
             Some(DetailAction::MarkWatched) => self.mark_work_watched(&work),
             Some(DetailAction::Play(torrent_id, file_id)) => {
                 if let Some(ctx) = self.pending_ctx.clone() {
@@ -124,9 +110,16 @@ impl App {
         } else {
             !work.versions().is_empty()
         };
-        let play_label = match resumable {
-            Some(position) => format!("\u{25b6}  Resume {}", fmt::human_duration(position)),
-            None => "\u{25b6}  Play".to_string(),
+        let verb = match resumable {
+            Some(position) => format!("Resume {}", fmt::human_duration(position)),
+            None => "Play".to_string(),
+        };
+        // Where playback will go is part of the label: a connected renderer is
+        // the target, not this machine.
+        let play_label = format!("\u{25b6}  {verb}{}", self.cast_suffix());
+        let play_hint = match self.cast_device_name() {
+            Some(name) => format!("Plays on {name}"),
+            None => "Plays here".to_string(),
         };
         if ui
             .add_enabled(
@@ -134,22 +127,10 @@ impl App {
                 egui::Button::new(egui::RichText::new(play_label).size(15.0))
                     .min_size(Vec2::new(ui.available_width(), 34.0)),
             )
+            .on_hover_text(play_hint)
             .clicked()
         {
             *action = Some(DetailAction::PlayWork);
-        }
-
-        ui.add_space(4.0);
-        if ui
-            .add_enabled(
-                has_playable,
-                egui::Button::new(egui::RichText::new("Cast to a TV").size(13.0))
-                    .min_size(Vec2::new(ui.available_width(), 28.0)),
-            )
-            .on_hover_text("Play on a DLNA/UPnP renderer on your network")
-            .clicked()
-        {
-            *action = Some(DetailAction::Cast);
         }
 
         ui.add_space(4.0);
@@ -746,7 +727,6 @@ pub(crate) enum DetailAction {
     Play(usize, usize),
     PlayWork,
     PlayWorkFromStart,
-    Cast,
     Download {
         key: String,
         torrent_id: usize,

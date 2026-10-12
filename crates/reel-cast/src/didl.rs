@@ -16,6 +16,11 @@ pub const DC_NS: &str = "http://purl.org/dc/elements/1.1/";
 /// The UPnP metadata namespace (classes, artwork).
 pub const UPNP_NS: &str = "urn:schemas-upnp-org:metadata-1-0/upnp/";
 
+/// The Samsung/LG caption extension namespace. Both accept external subtitles
+/// advertised through `sec:CaptionInfoEx`, which is how a text sidecar reaches
+/// a renderer that will not read subtitles out of the container.
+pub const SEC_NS: &str = "http://www.sec.co.kr/";
+
 /// UPnP class for a single video.
 pub const CLASS_VIDEO: &str = "object.item.videoItem";
 
@@ -26,6 +31,16 @@ pub struct Resource {
     pub url: String,
     /// `protocolInfo`, as built by [`dlna::protocol_info`].
     pub protocol_info: String,
+}
+
+impl Resource {
+    /// A subtitle resource a renderer can fetch as a sidecar.
+    pub fn subtitle(url: impl Into<String>) -> Resource {
+        Resource {
+            url: url.into(),
+            protocol_info: "http-get:*:text/srt:*".to_string(),
+        }
+    }
 }
 
 /// A single item to hand to a renderer.
@@ -41,6 +56,9 @@ pub struct Item {
     pub class: String,
     /// Resources (usually one).
     pub resources: Vec<Resource>,
+    /// Subtitle sidecars. Emitted both as extra `<res>` elements and as
+    /// `sec:CaptionInfoEx`, which is what LG/Samsung sets actually read.
+    pub captions: Vec<Resource>,
 }
 
 impl Item {
@@ -64,7 +82,15 @@ impl Item {
                 protocol_info: dlna::protocol_info(dlna::mime_for_url(&url), seekable, converted),
                 url,
             }],
+            captions: Vec::new(),
         }
+    }
+
+    /// Attach subtitle sidecars, delivered as `<res>` elements and via
+    /// `sec:CaptionInfoEx`.
+    pub fn with_captions(mut self, captions: Vec<Resource>) -> Item {
+        self.captions = captions;
+        self
     }
 
     /// Serialise to a DIDL-Lite document.
@@ -74,6 +100,7 @@ impl Item {
         out.push_str(&format!(" xmlns=\"{DIDL_NS}\""));
         out.push_str(&format!(" xmlns:dc=\"{DC_NS}\""));
         out.push_str(&format!(" xmlns:upnp=\"{UPNP_NS}\""));
+        out.push_str(&format!(" xmlns:sec=\"{SEC_NS}\""));
         out.push('>');
         out.push_str(&format!(
             "<item id=\"{}\" parentID=\"{}\" restricted=\"1\">",
@@ -87,6 +114,19 @@ impl Item {
                 "<res protocolInfo=\"{}\">{}</res>",
                 escape(&resource.protocol_info),
                 escape(&resource.url)
+            ));
+        }
+        for caption in &self.captions {
+            out.push_str(&format!(
+                "<res protocolInfo=\"{}\">{}</res>",
+                escape(&caption.protocol_info),
+                escape(&caption.url)
+            ));
+        }
+        for caption in &self.captions {
+            out.push_str(&format!(
+                "<sec:CaptionInfoEx sec:type=\"srt\">{}</sec:CaptionInfoEx>",
+                escape(&caption.url)
             ));
         }
         out.push_str("</item></DIDL-Lite>");
@@ -141,5 +181,15 @@ mod tests {
     fn escapes_the_title() {
         let xml = Item::video("Tom & Jerry", "http://h/x.mp4", true, false).to_xml();
         assert!(xml.contains("<dc:title>Tom &amp; Jerry</dc:title>"));
+    }
+
+    #[test]
+    fn advertises_subtitles_as_res_and_caption_info() {
+        let xml = Item::video("Episode", "http://h/x.mkv", true, false)
+            .with_captions(vec![Resource::subtitle("http://h/sub.srt")])
+            .to_xml();
+        assert!(xml.contains("xmlns:sec=\"http://www.sec.co.kr/\""));
+        assert!(xml.contains("<res protocolInfo=\"http-get:*:text/srt:*\">http://h/sub.srt</res>"));
+        assert!(xml.contains("<sec:CaptionInfoEx sec:type=\"srt\">http://h/sub.srt</sec:CaptionInfoEx>"));
     }
 }

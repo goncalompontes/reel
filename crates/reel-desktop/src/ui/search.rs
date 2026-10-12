@@ -509,6 +509,7 @@ impl App {
                         {
                             let can_play = hit.is_usable() || hit.detail_url.is_some();
                             let pending = self.search_actions.get(&hit.key()).copied();
+                            let suffix = self.cast_suffix();
                             if let Some(phase) = pending {
                                 search_action_indicator(ui, phase);
                             }
@@ -516,9 +517,12 @@ impl App {
                                 .add_enabled(
                                     can_play && pending.is_none(),
                                     egui::Button::new(
-                                        egui::RichText::new(format!("{}  Play best", icons::PLAY))
-                                            .size(14.0)
-                                            .family(theme::semibold(ui.ctx())),
+                                        egui::RichText::new(format!(
+                                            "{}  Play best{suffix}",
+                                            icons::PLAY
+                                        ))
+                                        .size(14.0)
+                                        .family(theme::semibold(ui.ctx())),
                                     )
                                     .fill(theme::ACCENT_DEEP)
                                     .corner_radius(theme::CONTROL_RADIUS)
@@ -901,7 +905,8 @@ impl App {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let pending = self.search_actions.get(&hit.key()).copied();
-                        search_actions_ui(ui, hit, pending, actions);
+                        let destination = self.cast_device_name();
+                        search_actions_ui(ui, hit, pending, actions, destination.as_deref());
                     });
                 });
             });
@@ -942,15 +947,28 @@ pub(crate) fn search_actions_ui(
     hit: &SearchHit,
     pending: Option<SearchActionPhase>,
     actions: &mut SearchActions,
+    destination: Option<&str>,
 ) {
     let can_add = hit.is_usable() || hit.detail_url.is_some();
     if let Some(phase) = pending {
         search_action_indicator(ui, phase);
     }
+    let play_label = if destination.is_some() {
+        "Play on TV"
+    } else {
+        "Play"
+    };
+    let play_hover = match destination {
+        Some(device) => format!("Add this result and play its best file on {device}"),
+        None => "Add this result and start streaming its best file".to_string(),
+    };
     if ui
-        .add_enabled(can_add && pending.is_none(), egui::Button::new("Play"))
+        .add_enabled(
+            can_add && pending.is_none(),
+            egui::Button::new(play_label),
+        )
         .on_disabled_hover_text("This result has no magnet or .torrent URL")
-        .on_hover_text("Add this result and start streaming its best file")
+        .on_hover_text(play_hover)
         .clicked()
     {
         actions.play = Some(hit.clone());

@@ -15,13 +15,15 @@
 
 pub mod cache;
 pub mod convert;
+pub mod encoders;
 pub mod error;
 pub mod plan;
 pub mod probe;
 pub mod tools;
 
 pub use cache::{CacheKey, ConversionCache};
+pub use encoders::{AvailableEncoders, VideoEncoder};
 pub use error::{MediaError, Result};
 pub use plan::{MediaPlan, PlanOptions, SinkSupport, TranscodeMode, plan};
-pub use probe::{Audio, Probe, Video};
+pub use probe::{Audio, AudioTrack, Probe, SubtitleTrack, Video};
 pub use tools::Tools;

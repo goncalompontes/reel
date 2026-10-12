@@ -61,6 +61,17 @@ fn av(action: &'static str, mut arguments: Vec<(&'static str, String)>) -> SoapR
     }
 }
 
+/// A `RenderingControl` action, with `InstanceID` first.
+fn rendering(action: &'static str, mut arguments: Vec<(&'static str, String)>) -> SoapRequest {
+    let mut all = vec![("InstanceID", "0".to_string())];
+    all.append(&mut arguments);
+    SoapRequest {
+        service_type: RENDERING_CONTROL,
+        action,
+        arguments: all,
+    }
+}
+
 /// `SetAVTransportURI`: point the renderer at a URL and its DIDL-Lite metadata.
 pub fn set_av_transport_uri(uri: &str, metadata: &str) -> SoapRequest {
     av(
@@ -68,6 +79,20 @@ pub fn set_av_transport_uri(uri: &str, metadata: &str) -> SoapRequest {
         vec![
             ("CurrentURI", uri.to_string()),
             ("CurrentURIMetaData", metadata.to_string()),
+        ],
+    )
+}
+
+/// `SetNextAVTransportURI`: queue the next item for gapless playback.
+///
+/// Best-effort: many renderers ignore it, so a failure here must not fail the
+/// cast.
+pub fn set_next_av_transport_uri(uri: &str, metadata: &str) -> SoapRequest {
+    av(
+        "SetNextAVTransportURI",
+        vec![
+            ("NextURI", uri.to_string()),
+            ("NextURIMetaData", metadata.to_string()),
         ],
     )
 }
@@ -115,15 +140,38 @@ pub fn get_media_info() -> SoapRequest {
 
 /// `RenderingControl.SetVolume` for the master channel.
 pub fn set_volume(volume: u8) -> SoapRequest {
-    SoapRequest {
-        service_type: RENDERING_CONTROL,
-        action: "SetVolume",
-        arguments: vec![
-            ("InstanceID", "0".to_string()),
+    rendering(
+        "SetVolume",
+        vec![
             ("Channel", "Master".to_string()),
             ("DesiredVolume", volume.min(100).to_string()),
         ],
-    }
+    )
+}
+
+/// `RenderingControl.GetVolume` for the master channel.
+pub fn get_volume() -> SoapRequest {
+    rendering("GetVolume", vec![("Channel", "Master".to_string())])
+}
+
+/// `RenderingControl.SetMute` for the master channel.
+pub fn set_mute(muted: bool) -> SoapRequest {
+    rendering(
+        "SetMute",
+        vec![
+            ("Channel", "Master".to_string()),
+            ("DesiredMute", if muted { "1" } else { "0" }.to_string()),
+        ],
+    )
+}
+
+/// Parse a `GetVolume` response's `CurrentVolume` (0–100).
+pub fn parse_volume(document: &str) -> Result<u8> {
+    let response = response_node(document)?;
+    response
+        .child_text("CurrentVolume")
+        .and_then(|value| value.trim().parse::<u8>().ok())
+        .ok_or_else(|| CastError::Missing("CurrentVolume".into()))
 }
 
 /// Transport state and speed, from a `GetTransportInfo` response.
@@ -327,6 +375,18 @@ mod tests {
     }
 
     #[test]
+    fn builds_set_next_av_transport_uri() {
+        let request = set_next_av_transport_uri("http://h/next.mp4", "<DIDL-Lite/>");
+        assert_eq!(
+            request.soap_action(),
+            "\"urn:schemas-upnp-org:service:AVTransport:1#SetNextAVTransportURI\""
+        );
+        let body = request.envelope();
+        assert!(body.contains("<NextURI>http://h/next.mp4</NextURI>"));
+        assert!(body.contains("<NextURIMetaData>&lt;DIDL-Lite/&gt;</NextURIMetaData>"));
+    }
+
+    #[test]
     fn play_includes_speed() {
         let body = play().envelope();
         assert!(body.contains("<Speed>1</Speed>"));
@@ -357,6 +417,35 @@ mod tests {
             }
             other => panic!("expected a fault, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn builds_volume_and_mute_actions() {
+        let volume = set_volume(150);
+        assert_eq!(
+            volume.soap_action(),
+            "\"urn:schemas-upnp-org:service:RenderingControl:1#SetVolume\""
+        );
+        let body = volume.envelope();
+        assert!(body.contains("<Channel>Master</Channel>"));
+        assert!(body.contains("<DesiredVolume>100</DesiredVolume>"));
+
+        assert!(set_mute(true).envelope().contains("<DesiredMute>1</DesiredMute>"));
+        assert!(set_mute(false).envelope().contains("<DesiredMute>0</DesiredMute>"));
+        assert_eq!(
+            get_volume().soap_action(),
+            "\"urn:schemas-upnp-org:service:RenderingControl:1#GetVolume\""
+        );
+    }
+
+    #[test]
+    fn parses_volume() {
+        let document = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>
+            <u:GetVolumeResponse xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1">
+              <CurrentVolume>42</CurrentVolume>
+            </u:GetVolumeResponse></s:Body></s:Envelope>"#;
+        assert_eq!(parse_volume(document).unwrap(), 42);
+        assert!(parse_volume("<s:Envelope><s:Body><u:X/></s:Body></s:Envelope>").is_err());
     }
 
     #[test]

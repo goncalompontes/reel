@@ -16,9 +16,10 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use tower_http::cors::{Any, CorsLayer};
 use bytes::Bytes;
 use reel_core::Engine;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -111,7 +112,23 @@ fn tokens_match(expected: &str, given: &str) -> bool {
 }
 
 /// Build the LAN media router.
+///
+/// CORS is wide open, unlike the loopback API: browser-based receivers (Google
+/// Cast's web receiver, a `<video>` tag) fetch these URLs cross-origin, and the
+/// surface is read-only and gated by the per-run token in the path, so an origin
+/// allow-list would only get in the way. `Range` is exposed so a receiver can
+/// seek, and the range headers so it can size the media.
 pub fn build_media_router(state: MediaState) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::HEAD, Method::OPTIONS])
+        .allow_headers([header::RANGE, header::CONTENT_TYPE])
+        .expose_headers([
+            header::CONTENT_LENGTH,
+            header::CONTENT_RANGE,
+            header::ACCEPT_RANGES,
+        ]);
+
     Router::new()
         .route("/media/{token}/original/{id}/{file_id}", get(original))
         .route(
@@ -124,6 +141,8 @@ pub fn build_media_router(state: MediaState) -> Router {
             get(remux_named),
         )
         .route("/media/{token}/converted/{name}", get(converted))
+        .route("/media/{token}/subtitle/{name}", get(subtitle))
+        .layer(cors)
         .with_state(state)
 }
 
@@ -286,11 +305,44 @@ async fn converted(
     AxumPath((token, name)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, HttpError> {
-    if !st.authorized(&token) {
+    serve_cache(&st, &token, &name, "video/mp4", headers).await
+}
+
+/// Serve a subtitle file from the cache directory. The renderer fetches this
+/// itself, so it is served with a subtitle content type rather than the video
+/// one. The type follows the extension: `.vtt` for browser-based receivers,
+/// otherwise SubRip.
+async fn subtitle(
+    State(st): State<MediaState>,
+    AxumPath((token, name)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, HttpError> {
+    serve_cache(&st, &token, &name, subtitle_mime(&name), headers).await
+}
+
+/// The content type for a subtitle file, by extension: WebVTT for browser-based
+/// receivers, SubRip otherwise.
+fn subtitle_mime(name: &str) -> &'static str {
+    if name.to_ascii_lowercase().ends_with(".vtt") {
+        "text/vtt; charset=utf-8"
+    } else {
+        "text/srt; charset=utf-8"
+    }
+}
+
+/// Serve a file from the conversion cache directory, honouring `Range`.
+async fn serve_cache(
+    st: &MediaState,
+    token: &str,
+    name: &str,
+    mime: &str,
+    headers: HeaderMap,
+) -> Result<Response, HttpError> {
+    if !st.authorized(token) {
         return Err(HttpError::not_found("no such media"));
     }
 
-    let path = converted_path(&st.converted_dir, &name)?;
+    let path = converted_path(&st.converted_dir, name)?;
     let not_converted = || HttpError::not_found("that file has not been converted");
     let metadata = tokio::fs::metadata(&path)
         .await
@@ -317,8 +369,8 @@ async fn converted(
         total,
         offset,
         length,
-        "video/mp4",
-        &name,
+        mime,
+        name,
         body,
     ))
 }
@@ -403,6 +455,55 @@ fn converted_path(dir: &Path, name: &str) -> Result<PathBuf, HttpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reel_core::EngineConfig;
+
+    /// A browser-based receiver must be able to fetch media cross-origin, so the
+    /// LAN router answers a CORS preflight even though `/api/*` does not.
+    #[tokio::test]
+    async fn the_media_router_allows_cross_origin_fetches() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let dir = std::env::temp_dir().join(format!("reel-http-cors-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = EngineConfig::new(&dir);
+        config.persist_session = false;
+        config.disable_dht = true;
+        config.disable_trackers = true;
+        let engine = Engine::new(config).await.unwrap();
+        let state = MediaState::new(engine, "tok", dir.join("conv"), "DLNA.ORG_OP=01");
+        let router = build_media_router(state);
+
+        let request = Request::builder()
+            .method("OPTIONS")
+            .uri("/media/tok/subtitle/x.vtt")
+            .header("Origin", "http://receiver.example")
+            .header("Access-Control-Request-Method", "GET")
+            .header("Access-Control-Request-Headers", "range")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("access-control-allow-origin").unwrap(),
+            "*",
+            "a cross-origin receiver must be allowed"
+        );
+        assert!(
+            headers.get("access-control-allow-methods").is_some(),
+            "the preflight must advertise the methods"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subtitle_mime_follows_the_extension() {
+        assert_eq!(subtitle_mime("sub-abc-1.vtt"), "text/vtt; charset=utf-8");
+        assert_eq!(subtitle_mime("sub-abc-1.SRT"), "text/srt; charset=utf-8");
+        assert_eq!(subtitle_mime("no-extension"), "text/srt; charset=utf-8");
+    }
 
     #[test]
     fn tokens_are_compared_exactly() {

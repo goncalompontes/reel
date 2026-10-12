@@ -95,6 +95,11 @@ pub struct CastSession {
     state: SessionState,
     position: Option<Duration>,
     duration: Option<Duration>,
+    /// The media's real duration, from the probe. A live stream (fragmented
+    /// remux/transcode) reports its duration as "however much has played", so
+    /// the renderer's value must not be trusted for the total or for deciding
+    /// that playback reached the end.
+    duration_hint: Option<Duration>,
 }
 
 impl CastSession {
@@ -107,7 +112,14 @@ impl CastSession {
             state: SessionState::Idle,
             position: None,
             duration: None,
+            duration_hint: None,
         }
+    }
+
+    /// Record the media's true duration, so the reported total does not follow
+    /// the playhead for a live stream.
+    pub fn set_duration_hint(&mut self, duration: Option<Duration>) {
+        self.duration_hint = duration;
     }
 
     /// The title being cast.
@@ -132,7 +144,7 @@ impl CastSession {
 
     /// Last known media duration.
     pub fn duration(&self) -> Option<Duration> {
-        self.duration
+        self.duration_hint.or(self.duration)
     }
 
     /// Hand the renderer a media URL plus its DIDL-Lite metadata and start it.
@@ -151,6 +163,13 @@ impl CastSession {
         position: Duration,
     ) -> Result<()> {
         self.begin(media_url, metadata, Some(position)).await
+    }
+
+    /// Queue the next media item for gapless playback (best-effort: a renderer
+    /// that ignores `SetNextAVTransportURI` simply keeps playing the current
+    /// item, and this reports the error to the caller).
+    pub async fn set_next(&mut self, media_url: impl Into<String>, metadata: &str) -> Result<()> {
+        self.target.set_next_uri(&media_url.into(), metadata).await
     }
 
     /// Start media, optionally at a handed-over position.
@@ -205,6 +224,26 @@ impl CastSession {
     pub async fn resume(&mut self) -> Result<()> {
         let result = self.target.play().await;
         self.apply(result, SessionState::Playing)
+    }
+
+    /// Whether the renderer exposes volume control.
+    pub fn has_volume(&self) -> bool {
+        self.target.has_volume()
+    }
+
+    /// The renderer's master volume, 0–100.
+    pub async fn volume(&self) -> Result<u8> {
+        self.target.volume().await
+    }
+
+    /// Set the renderer's master volume, 0–100.
+    pub async fn set_volume(&mut self, volume: u8) -> Result<()> {
+        self.target.set_volume(volume).await
+    }
+
+    /// Mute or unmute the renderer's master channel.
+    pub async fn set_mute(&mut self, muted: bool) -> Result<()> {
+        self.target.set_mute(muted).await
     }
 
     /// Stop playback, and verify the renderer actually stopped.

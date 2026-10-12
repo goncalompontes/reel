@@ -31,6 +31,15 @@ impl App {
             }
             self.focus_search = true;
         }
+
+        // `C` toggles casting: the picker when idle, the remote when connected.
+        // Guarded so it never steals a keypress from a text field.
+        if !self.add_open && !self.cast_open && !ctx.egui_wants_keyboard_input() {
+            let cast = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::C));
+            if cast {
+                self.cast_control_click();
+            }
+        }
     }
 
     /// The left rail: destinations, the Add action, and the transfers summary.
@@ -93,6 +102,11 @@ impl App {
                 {
                     self.add_open = true;
                 }
+                // The way to connect to (and back to) what is on the TV, from
+                // anywhere. The rail is always present, unlike the header, so
+                // it is the reliable home for this.
+                ui.add_space(6.0);
+                self.cast_indicator(ui, compact);
             });
         });
     }

@@ -73,6 +73,13 @@ pub struct CatalogSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle_language: Option<String>,
 
+    /// Preferred audio language, e.g. `en`. When set and the file has a
+    /// matching track, that track is cast (which forces a conversion, since a
+    /// DLNA renderer cannot switch tracks); otherwise the file's first audio
+    /// track is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_language: Option<String>,
+
     /// Initial player volume, 0–100.
     #[serde(default = "default_volume")]
     pub default_volume: f32,
@@ -147,6 +154,11 @@ pub struct CatalogSettings {
     #[serde(default)]
     pub allow_hevc_passthrough: bool,
 
+    /// Why video encoding to use when a file must be re-encoded. `Auto` prefers
+    /// a hardware encoder when one is usable, and falls back to software.
+    #[serde(default)]
+    pub conversion_hwaccel: HwAccel,
+
     /// TCP port for the LAN media server. A fixed port lets a firewall rule
     /// allow the TV through; `0` asks the OS for one.
     #[serde(default = "default_cast_media_port")]
@@ -155,6 +167,24 @@ pub struct CatalogSettings {
     /// Path to an `ffmpeg` binary. `None` uses a bundled copy, then `PATH`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ffmpeg_path: Option<String>,
+
+    /// The renderer most recently cast to, so the picker can pin it and label
+    /// it "last used". Only a hint: the connection itself is never persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast_last_device_udn: Option<String>,
+
+    /// Friendly name of the renderer most recently cast to, for the same hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast_last_device_name: Option<String>,
+
+    /// Pass HEVC through even when the renderer does not advertise it.
+    ///
+    /// Many televisions — LG webOS especially — under-report HEVC support in
+    /// `ConnectionManager`, which would otherwise force a needless re-encode
+    /// and drop subtitles embedded in the container. On by default; turn it off
+    /// for a TV that genuinely cannot decode HEVC.
+    #[serde(default = "default_true")]
+    pub cast_trust_hevc: bool,
 }
 
 /// How much conversion the user allows when casting an incompatible file.
@@ -168,6 +198,47 @@ pub enum ConversionMode {
     /// Rewrap when possible, re-encode only when necessary.
     #[default]
     Auto,
+}
+
+/// Which video encoder to use when a re-encode is unavoidable.
+///
+/// The pinning variants exist so a user can force a particular encoder from
+/// `settings.json`; the Settings UI only exposes `Auto` and `Off`. Anything but
+/// `Auto` falls back to software when the pinned encoder is not usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HwAccel {
+    /// Use a hardware encoder when one is usable, else software.
+    #[default]
+    Auto,
+    /// Always encode on the CPU (`libx264`).
+    Off,
+    /// Linux VA-API (Intel/AMD GPUs).
+    Vaapi,
+    /// Intel Quick Sync Video.
+    Qsv,
+    /// NVIDIA NVENC.
+    Nvenc,
+    /// macOS VideoToolbox.
+    #[serde(rename = "videotoolbox")]
+    VideoToolbox,
+    /// Windows AMD AMF.
+    Amf,
+}
+
+impl HwAccel {
+    /// A short label for the Settings UI.
+    pub fn label(&self) -> &'static str {
+        match self {
+            HwAccel::Auto => "Auto",
+            HwAccel::Off => "CPU",
+            HwAccel::Vaapi => "VA-API",
+            HwAccel::Qsv => "Quick Sync",
+            HwAccel::Nvenc => "NVENC",
+            HwAccel::VideoToolbox => "VideoToolbox",
+            HwAccel::Amf => "AMF",
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -215,6 +286,7 @@ impl Default for CatalogSettings {
             ext_to_solver_url: None,
             merge_works: default_true(),
             subtitle_language: None,
+            audio_language: None,
             default_volume: default_volume(),
             stream_buffer_mb: default_stream_buffer_mb(),
             stream_cache_mb: default_stream_cache_mb(),
@@ -231,8 +303,12 @@ impl Default for CatalogSettings {
             conversion_mode: ConversionMode::default(),
             conversion_max_height: default_conversion_max_height(),
             allow_hevc_passthrough: false,
+            conversion_hwaccel: HwAccel::default(),
             cast_media_port: default_cast_media_port(),
             ffmpeg_path: None,
+            cast_last_device_udn: None,
+            cast_last_device_name: None,
+            cast_trust_hevc: default_true(),
         }
     }
 }
@@ -327,6 +403,7 @@ impl CatalogSettings {
             .take()
             .map(|lang| lang.trim().to_string())
             .filter(|lang| !lang.is_empty());
+        self.audio_language = trim_blank(self.audio_language.take());
         self.download_dir = self
             .download_dir
             .take()
@@ -426,6 +503,40 @@ mod tests {
     }
 
     #[test]
+    fn hwaccel_defaults_to_auto_and_round_trips_as_lowercase() {
+        assert_eq!(CatalogSettings::default().conversion_hwaccel, HwAccel::Auto);
+
+        let dir = scratch("hwaccel");
+        CatalogSettings {
+            conversion_hwaccel: HwAccel::Nvenc,
+            ..Default::default()
+        }
+        .save(&dir)
+        .unwrap();
+
+        let loaded = CatalogSettings::load(&dir);
+        assert_eq!(loaded.conversion_hwaccel, HwAccel::Nvenc);
+        let raw = std::fs::read_to_string(CatalogSettings::path(&dir)).unwrap();
+        assert!(raw.contains("\"nvenc\""), "stored value should be readable");
+
+        // An unknown value must not stop startup. Like every other field, an
+        // unreadable file is quarantined and replaced with defaults.
+        let other = scratch("hwaccel-unknown");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(
+            CatalogSettings::path(&other),
+            br#"{"conversion_hwaccel":"warp-drive"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            CatalogSettings::load(&other).conversion_hwaccel,
+            HwAccel::Auto
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
     fn conversion_mode_round_trips_as_lowercase() {
         let dir = scratch("conversion");
         CatalogSettings {
@@ -520,6 +631,7 @@ mod tests {
         let mut settings = CatalogSettings {
             download_dir: Some("  /tmp/x  ".into()),
             subtitle_language: Some("  en ".into()),
+            audio_language: Some(" fr ".into()),
             default_volume: 999.0,
             ext_to_cookie: Some("   ".into()),
             ext_to_base_url: Some("  https://mirror.example  ".into()),
@@ -528,6 +640,7 @@ mod tests {
         settings.normalise();
         assert_eq!(settings.download_dir.as_deref(), Some("/tmp/x"));
         assert_eq!(settings.subtitle_language.as_deref(), Some("en"));
+        assert_eq!(settings.audio_language.as_deref(), Some("fr"));
         assert_eq!(settings.default_volume, 130.0);
         // A blank credential is unset, not an empty string.
         assert_eq!(settings.ext_to_cookie, None);

@@ -330,6 +330,11 @@ async fn describe_ports(ip: IpAddr, open: Vec<u16>) -> Result<Vec<CastDevice>> {
 pub trait CastTarget: Send + Sync {
     /// Point the renderer at a media URL and its DIDL-Lite metadata.
     async fn set_uri(&self, uri: &str, metadata: &str) -> Result<()>;
+    /// Queue the next media item for gapless playback. Best-effort: the default
+    /// reports "unsupported", so a protocol without it is simply skipped.
+    async fn set_next_uri(&self, _uri: &str, _metadata: &str) -> Result<()> {
+        Err(CastError::Missing("SetNextAVTransportURI support".into()))
+    }
     /// Begin or resume playback.
     async fn play(&self) -> Result<()>;
     /// Pause playback.
@@ -346,6 +351,15 @@ pub trait CastTarget: Send + Sync {
     async fn media_info(&self) -> Result<MediaInfo>;
     /// Set the master volume, 0–100.
     async fn set_volume(&self, volume: u8) -> Result<()>;
+    /// Whether the renderer exposes volume control. Defaults to `false`, so a
+    /// protocol without it is not asked.
+    fn has_volume(&self) -> bool {
+        false
+    }
+    /// The renderer's master volume, 0–100.
+    async fn volume(&self) -> Result<u8>;
+    /// Mute or unmute the renderer's master channel.
+    async fn set_mute(&self, muted: bool) -> Result<()>;
 }
 
 /// A DLNA/UPnP-AV target.
@@ -387,6 +401,13 @@ impl DlnaTarget {
         self.volume_url.is_some()
     }
 
+    /// The `RenderingControl` control URL, or an error when the device has none.
+    fn rendering_url(&self) -> Result<&Url> {
+        self.volume_url
+            .as_ref()
+            .ok_or_else(|| CastError::Missing("RenderingControl service".into()))
+    }
+
     /// POST a SOAP action and return the response body, turning UPnP faults
     /// into errors.
     async fn call(&self, url: &Url, request: &soap::SoapRequest) -> Result<String> {
@@ -399,9 +420,48 @@ impl DlnaTarget {
     }
 }
 
+/// How many times a transient request failure is retried.
+const REQUEST_ATTEMPTS: usize = 3;
+
+/// Backoff base between retries; the delay grows with the attempt number.
+const REQUEST_RETRY_DELAY: Duration = Duration::from_millis(300);
+
 /// POST a SOAP action and return the response body, turning UPnP faults into
 /// errors.
+///
+/// Transport-level failures are retried: renderers (LG webOS especially) drop
+/// connections while switching media or under load, and a single dropped
+/// request must not read as a failed cast. A UPnP fault or a non-success HTTP
+/// status is definitive and is not retried.
 async fn post_soap(
+    client: &reqwest::Client,
+    url: &Url,
+    request: &soap::SoapRequest,
+) -> Result<String> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match post_soap_once(client, url, request).await {
+            Ok(body) => return Ok(body),
+            Err(error) => {
+                let transient = matches!(error, CastError::Request(_));
+                if transient && attempt < REQUEST_ATTEMPTS {
+                    tracing::debug!(
+                        attempt,
+                        %error,
+                        "renderer request failed; retrying"
+                    );
+                    tokio::time::sleep(REQUEST_RETRY_DELAY * attempt as u32).await;
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+/// One attempt at a SOAP POST.
+async fn post_soap_once(
     client: &reqwest::Client,
     url: &Url,
     request: &soap::SoapRequest,
@@ -520,6 +580,11 @@ impl CastTarget for DlnaTarget {
         Ok(())
     }
 
+    async fn set_next_uri(&self, uri: &str, metadata: &str) -> Result<()> {
+        self.av(&soap::set_next_av_transport_uri(uri, metadata)).await?;
+        Ok(())
+    }
+
     async fn play(&self) -> Result<()> {
         self.av(&soap::play()).await?;
         Ok(())
@@ -556,11 +621,24 @@ impl CastTarget for DlnaTarget {
     }
 
     async fn set_volume(&self, volume: u8) -> Result<()> {
-        let url = self
-            .volume_url
-            .as_ref()
-            .ok_or_else(|| CastError::Missing("RenderingControl service".into()))?;
+        let url = self.rendering_url()?;
         self.call(url, &soap::set_volume(volume)).await?;
+        Ok(())
+    }
+
+    fn has_volume(&self) -> bool {
+        self.volume_url.is_some()
+    }
+
+    async fn volume(&self) -> Result<u8> {
+        let url = self.rendering_url()?;
+        let body = self.call(url, &soap::get_volume()).await?;
+        soap::parse_volume(&body)
+    }
+
+    async fn set_mute(&self, muted: bool) -> Result<()> {
+        let url = self.rendering_url()?;
+        self.call(url, &soap::set_mute(muted)).await?;
         Ok(())
     }
 }
@@ -568,7 +646,6 @@ impl CastTarget for DlnaTarget {
 #[cfg(test)]
 mod capability_tests {
     use super::*;
-
     const SINK: &str = "http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_BL_CIF15_AAC_520,\
         http-get:*:video/x-matroska:*,http-get:*:audio/mp4:DLNA.ORG_PN=AAC_ISO_320,\
         http-get:*:audio/x-flac:*";
@@ -592,5 +669,44 @@ mod capability_tests {
         );
         assert!(caps.supports_hevc());
         assert!(caps.supports_eac3());
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A renderer that drops the first connection must still be reached: the
+    /// SOAP call retries instead of failing the cast.
+    #[tokio::test]
+    async fn retries_a_dropped_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // First connection: accept and drop it, like a renderer under load.
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+            // Second: answer with a minimal success.
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let body = "<ok/>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+        });
+
+        let url = Url::parse(&format!("http://{addr}/control")).unwrap();
+        let client = reqwest::Client::new();
+        let body = post_soap(&client, &url, &soap::get_transport_info())
+            .await
+            .expect("the retry should reach the renderer");
+        assert_eq!(body, "<ok/>");
+        server.await.unwrap();
     }
 }

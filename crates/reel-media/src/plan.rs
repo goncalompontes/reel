@@ -5,7 +5,7 @@
 //! rewrapped ([`MediaPlan::Remux`]) or re-encoded
 //! ([`MediaPlan::Transcode`]), subject to what the user allows.
 
-use crate::probe::Probe;
+use crate::probe::{AudioTrack, Probe};
 
 /// How far the user lets reel go when a file is not directly playable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -79,7 +79,7 @@ pub struct SinkSupport {
 }
 
 /// Knobs for [`plan`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanOptions {
     /// How much conversion is allowed.
     pub mode: TranscodeMode,
@@ -87,6 +87,10 @@ pub struct PlanOptions {
     pub max_height: u32,
     /// What the target renderer accepts.
     pub sink: SinkSupport,
+    /// A specific audio stream to deliver. `None` uses the file's first track.
+    /// Selecting a stream always forces a conversion: a DLNA renderer picks its
+    /// own track, so the chosen one must be mapped by a remux or transcode.
+    pub audio: Option<AudioTrack>,
 }
 
 impl Default for PlanOptions {
@@ -95,6 +99,7 @@ impl Default for PlanOptions {
             mode: TranscodeMode::Auto,
             max_height: 1080,
             sink: SinkSupport::default(),
+            audio: None,
         }
     }
 }
@@ -123,23 +128,26 @@ fn video_is_copyable(probe: &Probe, sink: SinkSupport) -> bool {
 
 /// Choose how to deliver `probe` to a renderer.
 pub fn plan(probe: &Probe, options: &PlanOptions) -> MediaPlan {
+    // A chosen audio stream can never be served as the original bytes.
+    let chosen_audio = options.audio.as_ref();
+
     // The renderer advertises the file's own container: hand it the original
     // bytes, with no conversion at all. This is how a 4K HEVC MKV plays directly
     // on a television that lists `video/x-matroska`.
     let container_ok =
         (probe.is_mp4() && options.sink.mp4) || (probe.is_matroska() && options.sink.mkv);
-    if container_ok {
+    if chosen_audio.is_none() && container_ok {
         return MediaPlan::Original;
     }
 
     // No video stream (audio-only) counts as compatible.
     let video_ok = probe.video.is_none() || video_is_copyable(probe, options.sink);
-    let audio_ok = probe
-        .audio
-        .as_ref()
-        .is_none_or(|audio| audio_is_copyable(&audio.codec, options.sink));
+    let audio_codec = chosen_audio
+        .map(|track| track.codec.as_str())
+        .or_else(|| probe.audio.as_ref().map(|audio| audio.codec.as_str()));
+    let audio_ok = audio_codec.is_none_or(|codec| audio_is_copyable(codec, options.sink));
 
-    if probe.is_mp4() && video_ok && audio_ok {
+    if chosen_audio.is_none() && probe.is_mp4() && video_ok && audio_ok {
         return MediaPlan::Original;
     }
 
@@ -207,7 +215,9 @@ mod tests {
             size: None,
             video,
             audio,
+            audio_tracks: Vec::new(),
             subtitles: 0,
+            subtitle_tracks: Vec::new(),
         }
     }
 
@@ -381,6 +391,40 @@ mod tests {
             ..auto()
         };
         assert_eq!(plan(&file, &options), MediaPlan::Original);
+    }
+
+    #[test]
+    fn choosing_an_audio_track_forces_a_conversion() {
+        let file = probe("mov,mp4,m4a", Some(h264(1080)), Some(audio("aac")));
+        // With no explicit choice, an MP4 TV-compatible file is served as-is.
+        assert_eq!(plan(&file, &auto()), MediaPlan::Original);
+
+        // Choosing a track (even the first) must remux, because a DLNA renderer
+        // cannot be told which stream to play.
+        let chosen = PlanOptions {
+            audio: Some(AudioTrack {
+                index: 1,
+                codec: "aac".into(),
+                channels: Some(2),
+                language: Some("eng".into()),
+                title: None,
+            }),
+            ..auto()
+        };
+        assert_eq!(plan(&file, &chosen), MediaPlan::Remux);
+
+        // A chosen track that is not copyable needs a full transcode.
+        let dts = PlanOptions {
+            audio: Some(AudioTrack {
+                index: 2,
+                codec: "dts".into(),
+                channels: Some(6),
+                language: Some("fra".into()),
+                title: None,
+            }),
+            ..auto()
+        };
+        assert_eq!(plan(&file, &dts), MediaPlan::Transcode { max_height: 1080 });
     }
 
     #[test]

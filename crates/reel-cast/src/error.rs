@@ -56,6 +56,10 @@ pub enum CastError {
     #[error("discovery failed: {0}")]
     Discovery(String),
 
+    /// A Google Cast / FCast receiver rejected a command.
+    #[error("cast command failed: {0}")]
+    Command(String),
+
     /// A request to the device failed at the transport level.
     #[error("request to the device failed: {0}")]
     Request(#[from] reqwest::Error),

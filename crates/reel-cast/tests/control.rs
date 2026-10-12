@@ -61,6 +61,9 @@ struct Renderer {
     /// Keep the transport position across `Stop`/`SetAVTransportURI`, like the
     /// LG that the resume-across-casts bug was reported against.
     sticky_position: bool,
+    volume: u8,
+    muted: bool,
+    next_uri: Option<String>,
     actions: Vec<String>,
 }
 
@@ -74,6 +77,9 @@ impl Default for Renderer {
             fail_seek: false,
             refuse_stop: false,
             sticky_position: false,
+            volume: 50,
+            muted: false,
+            next_uri: None,
             actions: Vec::new(),
         }
     }
@@ -116,6 +122,10 @@ async fn control(State(state): State<Shared>, body: Bytes) -> Response {
             }
             renderer.state = "STOPPED".to_string();
             ok(&av_response("SetAVTransportURI", ""))
+        }
+        "SetNextAVTransportURI" => {
+            renderer.next_uri = element_text(&text, "NextURI");
+            ok(&av_response("SetNextAVTransportURI", ""))
         }
         "Play" => {
             renderer.state = "PLAYING".to_string();
@@ -177,9 +187,30 @@ async fn control(State(state): State<Shared>, body: Bytes) -> Response {
     }
 }
 
-async fn volume(State(state): State<Shared>, _body: Bytes) -> Response {
-    state.lock().unwrap().actions.push("SetVolume".to_string());
-    ok("<u:SetVolumeResponse xmlns:u=\"urn:schemas-upnp-org:service:RenderingControl:1\"/>")
+async fn volume(State(state): State<Shared>, body: Bytes) -> Response {
+    let text = String::from_utf8_lossy(&body);
+    let action = action_name(&text);
+    let mut renderer = state.lock().unwrap();
+    renderer.actions.push(action.clone());
+    match action.as_str() {
+        "SetVolume" => {
+            if let Some(value) = element_text(&text, "DesiredVolume")
+                .and_then(|value| value.trim().parse::<u8>().ok())
+            {
+                renderer.volume = value;
+            }
+            ok(&rendering_response("SetVolume", ""))
+        }
+        "GetVolume" => {
+            let inner = format!("<CurrentVolume>{}</CurrentVolume>", renderer.volume);
+            ok(&rendering_response("GetVolume", &inner))
+        }
+        "SetMute" => {
+            renderer.muted = element_text(&text, "DesiredMute").as_deref() == Some("1");
+            ok(&rendering_response("SetMute", ""))
+        }
+        other => ok(&rendering_response(other, "")),
+    }
 }
 
 fn action_name(document: &str) -> String {
@@ -201,6 +232,13 @@ fn element_text(document: &str, name: &str) -> Option<String> {
 
 fn av_response(name: &str, inner: &str) -> String {
     format!("<u:{name}Response xmlns:u=\"{AV}\">{inner}</u:{name}Response>")
+}
+
+fn rendering_response(name: &str, inner: &str) -> String {
+    format!(
+        "<u:{name}Response xmlns:u=\"urn:schemas-upnp-org:service:RenderingControl:1\">{inner}\
+         </u:{name}Response>"
+    )
 }
 
 fn ok(response_element: &str) -> Response {
@@ -259,6 +297,33 @@ async fn describes_a_device_and_resolves_its_services() {
         format!("http://{addr}/control")
     );
     assert!(target.has_volume());
+}
+
+#[tokio::test]
+async fn queues_the_next_item() {
+    let (addr, renderer) = start().await;
+    let target = connect(addr).await.target().unwrap();
+    target
+        .set_next_uri("http://h/next.mp4", "<DIDL-Lite/>")
+        .await
+        .unwrap();
+    assert_eq!(
+        renderer.lock().unwrap().next_uri.as_deref(),
+        Some("http://h/next.mp4")
+    );
+}
+
+#[tokio::test]
+async fn reads_and_sets_volume() {
+    let (addr, renderer) = start().await;
+    let target = connect(addr).await.target().unwrap();
+
+    assert!(target.has_volume());
+    assert_eq!(target.volume().await.unwrap(), 50);
+    target.set_volume(80).await.unwrap();
+    assert_eq!(target.volume().await.unwrap(), 80);
+    target.set_mute(true).await.unwrap();
+    assert!(renderer.lock().unwrap().muted);
 }
 
 #[tokio::test]

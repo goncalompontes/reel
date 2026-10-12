@@ -368,6 +368,8 @@ impl EngineBackend {
             if let Some(cast) = self.cast() {
                 cast.set_options(crate::cast::plan_options(settings));
                 cast.set_passthrough(settings.allow_hevc_passthrough);
+                cast.set_trust_hevc(settings.cast_trust_hevc);
+                cast.set_hwaccel(settings.conversion_hwaccel);
             }
             *self.cast_config.lock().unwrap_or_else(|e| e.into_inner()) = Some(want);
             return;
@@ -1579,6 +1581,27 @@ fn cast_ended_hook(events: Arc<Mutex<Vec<BackendEvent>>>) -> crate::cast::EndedH
     })
 }
 
+/// How long a cast waits for its title to start streaming before it gives up.
+/// Generous: a magnet or a slow swarm is progress, and the user can cancel.
+const CAST_READY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How often a starting cast checks whether its title is streaming yet.
+const CAST_READY_POLL: Duration = Duration::from_millis(500);
+
+/// Whether a title is streaming the given file, so its loopback URL can be
+/// probed. Live and unpaused, with the file selected, is what the old
+/// `BackendEvent::Ready` reliably stood for.
+fn stream_is_ready(engine: &Engine, info_hash: &str, file_id: usize) -> bool {
+    engine.list().into_iter().any(|view| {
+        view.info_hash.eq_ignore_ascii_case(info_hash)
+            && view.stats.is_live()
+            && view
+                .files
+                .iter()
+                .any(|file| file.id == file_id && file.included)
+    })
+}
+
 impl Backend for EngineBackend {
     fn capabilities(&self) -> &BackendCapabilities {
         &self.capabilities
@@ -1593,6 +1616,14 @@ impl Backend for EngineBackend {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    fn cast_encoder(&self) -> Option<String> {
+        self.cast().map(|cast| cast.encoder_label())
+    }
+
+    fn cast_audio_tracks(&self) -> Vec<crate::cast::AudioTrackInfo> {
+        self.cast().map(|cast| cast.audio_tracks()).unwrap_or_default()
     }
 
     fn cast_devices(&self) -> Vec<crate::cast::DeviceInfo> {
@@ -1624,14 +1655,85 @@ impl Backend for EngineBackend {
     fn start_cast(
         &self,
         udn: String,
+        torrent_id: usize,
         info_hash: String,
         file_id: usize,
         title: String,
         start_at: Option<Duration>,
+        subtitles: bool,
+        audio_index: Option<u32>,
     ) {
-        if let Some(cast) = self.cast() {
-            cast.start_cast(udn, info_hash, file_id, title, start_at);
-        }
+        let Some(cast) = self.cast() else {
+            return;
+        };
+        let subtitle_language = self.settings().subtitle_language;
+        let audio_language = self.settings().audio_language;
+
+        // Resolve the device name up front so "connecting" can name it. A
+        // device that vanished since it was picked fails immediately rather
+        // than waiting on a stream for nothing.
+        let Some(device_name) = cast
+            .devices()
+            .into_iter()
+            .find(|device| device.udn == udn)
+            .map(|device| device.name)
+        else {
+            cast.report_failed("that device is no longer on the network".to_string());
+            return;
+        };
+
+        // Report "connecting" at once, before any probing, so the UI can move
+        // to the casting screen straight away.
+        cast.prepare(&device_name, &title);
+
+        // Make sure the file is streaming. This is the same call playback makes,
+        // and it is safe for a title already playing locally: it only narrows
+        // the selection and resumes.
+        self.start_files(torrent_id, &[file_id]);
+
+        // Wait for the title to come up, then start the cast. Doing this here,
+        // rather than in the UI watching for a `Ready` event, is what makes a
+        // cast request reliable: a request can no longer be stranded while the
+        // picture keeps playing on this machine.
+        //
+        // The wait is gentle: a magnet or a slow swarm can sit in `initializing`
+        // for a while, which is progress, not failure, so the phase says so and
+        // the deadline is generous. The user can always cancel/hand back.
+        cast.set_phase(crate::cast::PreparePhase::WaitingForStream);
+        let engine = self.engine.clone();
+        let hash = info_hash.clone();
+        self.runtime.spawn(async move {
+            let deadline = Instant::now() + CAST_READY_TIMEOUT;
+            let mut announced = false;
+            loop {
+                if stream_is_ready(&engine, &hash, file_id) {
+                    cast.start_cast(
+                        udn,
+                        info_hash,
+                        file_id,
+                        title,
+                        start_at,
+                        subtitles,
+                        subtitle_language.clone(),
+                        audio_language.clone(),
+                        audio_index,
+                    );
+                    return;
+                }
+                if !announced {
+                    cast.set_phase(crate::cast::PreparePhase::WaitingForStream);
+                    announced = true;
+                }
+                if Instant::now() >= deadline {
+                    tracing::warn!(%hash, "the title did not start streaming in time");
+                    cast.report_failed(format!(
+                        "\u{201c}{title}\u{201d} did not start streaming in time"
+                    ));
+                    return;
+                }
+                tokio::time::sleep(CAST_READY_POLL).await;
+            }
+        });
     }
 
     fn cast_action(&self, action: crate::cast::CastAction) {
@@ -1651,6 +1753,24 @@ impl Backend for EngineBackend {
     fn dismiss_cast(&self) {
         if let Some(cast) = self.cast() {
             cast.dismiss();
+        }
+    }
+
+    fn remember_cast_device(&self, name: &str, udn: &str) {
+        let mut settings = self
+            .catalog
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if settings.cast_last_device_udn.as_deref() == Some(udn) {
+            return;
+        }
+        settings.cast_last_device_udn = Some(udn.to_string());
+        settings.cast_last_device_name = Some(name.to_string());
+        let snapshot = settings.clone();
+        drop(settings);
+        if let Err(e) = snapshot.save(&self.catalog.data_dir) {
+            tracing::warn!(error = %e, "could not remember the cast device");
         }
     }
 

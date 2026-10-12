@@ -19,7 +19,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use reel_catalog::{
-    CatalogCache, CatalogEntry, CatalogSettings, ConversionMode, FileInput, LookupQuery, MediaRef,
+    CatalogCache, CatalogEntry, CatalogSettings, ConversionMode, FileInput, HwAccel, LookupQuery,
+    MediaRef,
     MediaStore, Metadata, MetadataProvider, Release, SearchAggregator, SearchResults, TmdbClient,
     WatchHistory, WatchProgress, Work, WorkMember, analyse, default_data_dir, episode_key_parts,
     provider_from_key,
@@ -276,6 +277,10 @@ pub(crate) struct CastConfig {
     max_height: u32,
     /// Forced passthrough; a change applies in place, like the mode and cap.
     passthrough: bool,
+    /// Trust HEVC even when the renderer does not advertise it; applies in place.
+    trust_hevc: bool,
+    /// Video-encoding preference; applies in place, like the mode and cap.
+    hwaccel: HwAccel,
 }
 
 impl CastConfig {
@@ -287,6 +292,8 @@ impl CastConfig {
             mode: settings.conversion_mode,
             max_height: settings.conversion_max_height,
             passthrough: settings.allow_hevc_passthrough,
+            trust_hevc: settings.cast_trust_hevc,
+            hwaccel: settings.conversion_hwaccel,
         }
     }
 
@@ -434,6 +441,12 @@ pub trait Backend {
         Some("casting is not available".to_string())
     }
 
+    /// The video encoder casting will use when a file must be re-encoded, for
+    /// the Settings page. `None` when casting is off.
+    fn cast_encoder(&self) -> Option<String> {
+        None
+    }
+
     /// Renderers found on the local network.
     fn cast_devices(&self) -> Vec<crate::cast::DeviceInfo> {
         Vec::new()
@@ -458,18 +471,39 @@ pub trait Backend {
 
     /// Cast a torrent file to the renderer with the given UDN.
     ///
-    /// Keyed by info hash, not the library id: a stream-only title is re-added
-    /// on demand and its engine id can change, so the id must be resolved when
-    /// the cast actually starts. When `start_at` is set the renderer is seeked
-    /// there, so a cast hands the picture over from the local player.
+    /// The backend makes sure the file is streaming before it hands the URL to
+    /// the renderer: it starts the fetch and waits (bounded) for the title to
+    /// come up, reporting [`crate::cast::CastStatus::Preparing`] meanwhile and
+    /// `Failed` if it never does. The UI must not have to wait on an event to
+    /// start a cast — that wait used to strand a request and leave the picture
+    /// playing locally.
+    ///
+    /// Keyed by info hash as well as the library id: a stream-only title is
+    /// re-added on demand and its engine id can change, so the id must be
+    /// resolved when the cast actually starts. When `start_at` is set the
+    /// renderer is seeked there, so a cast hands the picture over from the
+    /// local player. When `subtitles` is set, a subtitle sidecar (or an embedded
+    /// text track extracted to one) is offered to the renderer.
+    // The parameters are the cast request's fields; grouping them into a struct
+    // would only move the same list behind one more name.
+    #[allow(clippy::too_many_arguments)]
     fn start_cast(
         &self,
         _udn: String,
+        _torrent_id: usize,
         _info_hash: String,
         _file_id: usize,
         _title: String,
         _start_at: Option<Duration>,
+        _subtitles: bool,
+        _audio_index: Option<u32>,
     ) {
+    }
+
+    /// The audio tracks of the current cast, for the remote's picker. Empty when
+    /// nothing is cast.
+    fn cast_audio_tracks(&self) -> Vec<crate::cast::AudioTrackInfo> {
+        Vec::new()
     }
 
     /// Control the active cast.
@@ -480,6 +514,10 @@ pub trait Backend {
 
     /// Dismiss the cast view and session without going through the renderer.
     fn dismiss_cast(&self) {}
+
+    /// Remember the last renderer cast to, so the picker can pin it. A hint
+    /// only: the connection itself is never persisted.
+    fn remember_cast_device(&self, _name: &str, _udn: &str) {}
 }
 
 #[cfg(test)]

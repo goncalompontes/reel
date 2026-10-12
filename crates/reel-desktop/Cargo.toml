@@ -20,6 +20,7 @@ reel-http.workspace = true
 reel-player.workspace = true
 reel-catalog.workspace = true
 reel-cast.workspace = true
+reel-cast-gcast.workspace = true
 reel-media.workspace = true
 
 anyhow.workspace = true
@@ -46,3 +47,4 @@ egui-phosphor = "0.14"
 
 [dev-dependencies]
 egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }
+axum.workspace = true

@@ -285,15 +285,19 @@ impl App {
         }
 
         // Actions: the one primary Play, and More info.
-        let play_label = match work.resume_position() {
-            Some(_) => format!("{}  Resume", icons::PLAY),
-            None => format!("{}  Play", icons::PLAY),
+        let suffix = self.cast_suffix();
+        let play_verb = if work.resume_position().is_some() {
+            "Resume"
+        } else {
+            "Play"
         };
+        let play_label = format!("{}  {play_verb}{suffix}", icons::PLAY);
+        let play_width = if suffix.is_empty() { 150.0 } else { 246.0 };
         let play = ui
             .put(
                 Rect::from_min_size(
                     egui::pos2(rect.left() + 28.0, rect.bottom() - 44.0),
-                    Vec2::new(150.0, 32.0),
+                    Vec2::new(play_width, 32.0),
                 ),
                 egui::Button::new(
                     egui::RichText::new(play_label)
@@ -307,7 +311,7 @@ impl App {
         let more = ui
             .put(
                 Rect::from_min_size(
-                    egui::pos2(rect.left() + 186.0, rect.bottom() - 44.0),
+                    egui::pos2(rect.left() + 36.0 + play_width, rect.bottom() - 44.0),
                     Vec2::new(130.0, 32.0),
                 ),
                 egui::Button::new(egui::RichText::new("More info").size(13.0))

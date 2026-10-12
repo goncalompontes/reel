@@ -1,7 +1,7 @@
 //! The Settings screen.
 
 use super::*;
-use reel_catalog::ConversionMode;
+use reel_catalog::{ConversionMode, HwAccel};
 
 // ---------------------------------------------------------------- settings
 
@@ -291,6 +291,28 @@ impl App {
         ui.horizontal(|ui| {
             ui.add_sized(
                 Vec2::new(150.0, 18.0),
+                egui::Label::new(egui::RichText::new("Audio language").color(theme::TEXT_DIM)),
+            );
+            let mut language = draft.audio_language.clone().unwrap_or_default();
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut language)
+                        .hint_text("auto")
+                        .desired_width(100.0),
+                )
+                .changed()
+            {
+                draft.audio_language = Some(language).filter(|l| !l.trim().is_empty());
+            }
+            ui.label(
+                egui::RichText::new("e.g. en. Picks that track when casting.")
+                    .color(theme::TEXT_DIM)
+                    .size(11.0),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                Vec2::new(150.0, 18.0),
                 egui::Label::new(egui::RichText::new("Default volume").color(theme::TEXT_DIM)),
             );
             ui.add(egui::Slider::new(&mut draft.default_volume, 0.0..=130.0).suffix(" %"));
@@ -446,6 +468,37 @@ impl App {
     pub(crate) fn settings_casting(&self, ui: &mut egui::Ui, draft: &mut CatalogSettings) {
         section_header(ui, "Casting");
         ui.add_space(4.0);
+
+        // At-a-glance status, so "why won't it cast?" has an answer without
+        // leaving the page.
+        match self.backend.cast_unavailable() {
+            None => {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{}  Ready \u{2014} the LAN media server is running",
+                        icons::CHECK
+                    ))
+                    .color(theme::OK)
+                    .size(12.0),
+                );
+            }
+            Some(reason) => {
+                ui.label(
+                    egui::RichText::new(format!("{}  Not available: {reason}", icons::X))
+                        .color(theme::WARN)
+                        .size(12.0),
+                );
+            }
+        }
+        if let Some(name) = self.backend.settings().cast_last_device_name.as_deref() {
+            ui.label(
+                egui::RichText::new(format!("Last device: {name}"))
+                    .color(theme::TEXT_DIM)
+                    .size(11.0),
+            );
+        }
+        ui.add_space(6.0);
+
         ui.checkbox(
             &mut draft.allow_lan_streaming,
             "Stream to DLNA/UPnP devices on the local network",
@@ -529,6 +582,46 @@ impl App {
         });
 
         ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Video encoding");
+            for (mode, label, hint) in [
+                (
+                    HwAccel::Auto,
+                    "Auto",
+                    "Use the GPU when it is available, otherwise the CPU",
+                ),
+                (
+                    HwAccel::Off,
+                    "CPU",
+                    "Always encode on the CPU (libx264)",
+                ),
+            ] {
+                if ui
+                    .selectable_label(draft.conversion_hwaccel == mode, label)
+                    .on_hover_text(hint)
+                    .clicked()
+                {
+                    draft.conversion_hwaccel = mode;
+                }
+            }
+        });
+        if let Some(encoder) = self.backend.cast_encoder() {
+            ui.label(
+                egui::RichText::new(format!("Using {encoder}"))
+                    .color(theme::TEXT_DIM)
+                    .size(11.0),
+            );
+        }
+        ui.label(
+            egui::RichText::new(
+                "Hardware encoding is faster, but reel falls back to the CPU \
+                 automatically if the GPU encoder is unavailable.",
+            )
+            .color(theme::TEXT_DIM)
+            .size(11.0),
+        );
+
+        ui.add_space(6.0);
         ui.checkbox(
             &mut draft.allow_hevc_passthrough,
             "Force H.265 (HEVC) and AC3/EAC3 passthrough",
@@ -538,6 +631,18 @@ impl App {
              what it must. Tick this to ignore that answer and always remux HEVC and \
              AC3/EAC3 — useful for a TV that under-reports, or one with no \
              ConnectionManager. Leave it off if a cast fails to play.",
+        );
+
+        ui.add_space(6.0);
+        ui.checkbox(
+            &mut draft.cast_trust_hevc,
+            "Trust HEVC even when the TV does not advertise it",
+        )
+        .on_hover_text(
+            "Many televisions (LG webOS especially) under-report HEVC support. \
+             Trusting means HEVC is passed through instead of re-encoded, which is \
+             faster and keeps the TV's own embedded subtitles. Turn it off if a \
+             cast cannot play H.265.",
         );
 
         optional_text(
