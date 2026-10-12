@@ -361,6 +361,16 @@ else
   bad "the installer wrote no desktop entry"
 fi
 
+# The doctor must report the runtime dependencies without changing anything.
+if "$HERE/install.sh" --check > "$ROOT/logs/doctor.log" 2>&1; then
+  ok "install.sh --check (the doctor) exits cleanly"
+else
+  bad "install.sh --check failed"
+fi
+grep -q "Runtime dependencies" "$ROOT/logs/doctor.log" \
+  && ok "the doctor reported the runtime dependencies" \
+  || bad "the doctor printed no dependency report"
+
 echo "== 25. watching one episode fetches only that episode =="
 # The season-pack case. Adding with media_only selects every playable file, so
 # without per-file selection a three-episode pack downloads all three while you
