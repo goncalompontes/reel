@@ -21,6 +21,7 @@ pub mod library;
 pub mod media;
 pub mod model;
 pub mod paths;
+pub mod process;
 pub mod streaming;
 pub mod title;
 
