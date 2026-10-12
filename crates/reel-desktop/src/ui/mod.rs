@@ -302,6 +302,9 @@ pub struct App {
     /// A cast waiting for its title to start streaming:
     /// `(udn, torrent id, info hash, file id, title)`.
     pending_cast: Option<(String, usize, String, usize, String)>,
+    /// Whether the full cast remote is open. The cast keeps running when it is
+    /// closed; the header/rail control reopens it.
+    cast_view_open: bool,
     player: PlayerController,
     /// Last time the mouse or a key moved, for hiding the chrome in fullscreen.
     player_last_activity: Instant,
@@ -404,6 +407,7 @@ impl App {
             cast_pending: None,
             cast_address: String::new(),
             pending_cast: None,
+            cast_view_open: false,
             player: PlayerController::new(),
             player_last_activity: Instant::now(),
             player_controls_hidden: false,
@@ -1373,6 +1377,18 @@ impl eframe::App for App {
                         .inner_margin(egui::Margin::symmetric(18, 10)),
                 )
                 .show(ui, |ui| self.header(ui));
+        }
+
+        // A cast keeps running with its remote closed; this bar is the way back
+        // to it (and to stop it) from anywhere in the app.
+        if self.backend.cast_status().is_some() && !self.cast_view_open {
+            egui::Panel::bottom("cast-bar")
+                .frame(
+                    egui::Frame::NONE
+                        .fill(theme::SURFACE_RAISED)
+                        .inner_margin(egui::Margin::symmetric(14, 6)),
+                )
+                .show(ui, |ui| self.cast_bar(ui));
         }
 
         egui::CentralPanel::default()

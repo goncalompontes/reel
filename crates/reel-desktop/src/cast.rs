@@ -425,16 +425,25 @@ impl CastService {
             let session = match result {
                 Ok(session) => session,
                 Err(error) => {
-                    tracing::warn!(%error, "cast failed");
-                    set_status_locked(
-                        &inner,
-                        CastStatus::Failed {
-                            message: error.to_string(),
-                        },
-                    );
+                    // Only report if this cast is still the current one.
+                    if current_generation(&inner) == generation {
+                        tracing::warn!(%error, "cast failed");
+                        set_status_locked(
+                            &inner,
+                            CastStatus::Failed {
+                                message: error.to_string(),
+                            },
+                        );
+                    }
                     return;
                 }
             };
+
+            // A newer cast, or a dismissal, superseded this one while it
+            // prepared.
+            if current_generation(&inner) != generation {
+                return;
+            }
 
             *session_slot.lock().await = Some(session);
             // Poll until the renderer stops or a newer cast takes over.
@@ -490,9 +499,15 @@ impl CastService {
         });
     }
 
-    /// Drop the current cast view and session without talking to the renderer.
+    /// Drop the current cast view and session without talking to the renderer,
+    /// and cancel a cast that is still being prepared.
     pub fn dismiss(&self) {
-        clear_status_locked(&self.inner);
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            // A new generation makes any in-flight prepare discard its result.
+            inner.generation += 1;
+            inner.status = None;
+        }
         let session = self.session.clone();
         self.runtime.spawn(async move {
             *session.lock().await = None;

@@ -58,6 +58,7 @@ impl App {
     ) {
         self.start_streaming(torrent_id, &[file_id]);
         self.pending_cast = Some((udn, torrent_id, info_hash, file_id, title));
+        self.cast_view_open = true;
         self.set_toast("Preparing to stream\u{2026}", false);
     }
 
@@ -178,13 +179,22 @@ impl App {
     }
 
     /// The full-screen remote-control view for an active cast.
+    ///
+    /// Closing it does not stop the cast: the mini-bar reopens it. Only "Stop"
+    /// (or "Cancel" while preparing) ends it.
     pub(crate) fn cast_overlay(&mut self, ctx: &egui::Context) {
         let Some(status) = self.backend.cast_status() else {
+            self.cast_view_open = false;
             return;
         };
+        if !self.cast_view_open {
+            return;
+        }
         let screen = ctx.content_rect();
         let mut action: Option<CastAction> = None;
-        let mut dismiss = false;
+        let mut stop = false;
+        let mut cancel = false;
+        let mut hide = false;
 
         egui::Area::new(egui::Id::new("cast-overlay"))
             .order(egui::Order::Foreground)
@@ -197,7 +207,7 @@ impl App {
                     .show(ui, |ui| {
                         ui.set_min_size(screen.size());
                         ui.vertical_centered(|ui| {
-                            ui.add_space(screen.height() * 0.16);
+                            ui.add_space(screen.height() * 0.14);
                             match &status {
                                 CastStatus::Failed { message } => {
                                     ui.label(
@@ -207,7 +217,7 @@ impl App {
                                     ui.label(egui::RichText::new(message).color(theme::DANGER));
                                     ui.add_space(18.0);
                                     if ui.button("Close").clicked() {
-                                        dismiss = true;
+                                        cancel = true;
                                     }
                                 }
                                 CastStatus::Preparing { device, title } => {
@@ -221,9 +231,14 @@ impl App {
                                         .color(theme::TEXT_DIM),
                                     );
                                     ui.add_space(18.0);
-                                    if ui.button("Cancel").clicked() {
-                                        dismiss = true;
-                                    }
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Hide").clicked() {
+                                            hide = true;
+                                        }
+                                        if ui.button("Cancel casting").clicked() {
+                                            cancel = true;
+                                        }
+                                    });
                                 }
                                 CastStatus::Active {
                                     device,
@@ -234,7 +249,7 @@ impl App {
                                 } => {
                                     ui.label(egui::RichText::new(title).size(24.0).strong());
                                     ui.label(
-                                        egui::RichText::new(format!("on {device}"))
+                                        egui::RichText::new(format!("Casting to {device}"))
                                             .color(theme::TEXT_DIM),
                                     );
                                     ui.add_space(14.0);
@@ -250,7 +265,7 @@ impl App {
                                             });
                                         }
                                         if ui.button("Stop casting").clicked() {
-                                            action = Some(CastAction::Stop);
+                                            stop = true;
                                         }
                                     });
 
@@ -290,9 +305,16 @@ impl App {
                                             .size(11.0)
                                             .color(theme::TEXT_DIM),
                                     );
-                                    ui.add_space(12.0);
-                                    if ui.button("Back to this device").clicked() {
-                                        dismiss = true;
+                                    ui.add_space(16.0);
+                                    if ui
+                                        .button("Hide (keeps casting)")
+                                        .on_hover_text(
+                                            "The cast keeps running; the bar at the bottom \
+                                             reopens this view.",
+                                        )
+                                        .clicked()
+                                    {
+                                        hide = true;
                                     }
                                 }
                             }
@@ -303,8 +325,103 @@ impl App {
         if let Some(action) = action {
             self.backend.cast_action(action);
         }
-        if dismiss {
+        if stop {
+            self.stop_cast();
+            self.cast_view_open = false;
+        }
+        if cancel {
             self.backend.dismiss_cast();
+            self.cast_view_open = false;
+        }
+        if hide {
+            self.cast_view_open = false;
+        }
+    }
+
+    /// End the cast on the renderer, or clear a failed one.
+    fn stop_cast(&mut self) {
+        if matches!(self.backend.cast_status(), Some(CastStatus::Failed { .. })) {
+            self.backend.dismiss_cast();
+        } else {
+            self.backend.cast_action(CastAction::Stop);
+        }
+    }
+
+    /// The persistent mini-controller shown whenever a cast is running and its
+    /// full view is closed, so the cast is always reachable and stoppable.
+    pub(crate) fn cast_bar(&mut self, ui: &mut egui::Ui) {
+        let Some(status) = self.backend.cast_status() else {
+            return;
+        };
+        let mut action: Option<CastAction> = None;
+        let mut open_view = false;
+        let mut stop = false;
+
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("\u{25c9}")
+                    .size(14.0)
+                    .color(theme::ACCENT),
+            );
+            match &status {
+                CastStatus::Preparing { device, title } => {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new(format!("Preparing {title} for {device}\u{2026}"))
+                            .size(13.0),
+                    );
+                }
+                CastStatus::Active {
+                    device,
+                    title,
+                    state,
+                    position,
+                    ..
+                } => {
+                    let playing = state.is_playing();
+                    if ui.button(if playing { "Pause" } else { "Play" }).clicked() {
+                        action = Some(if playing {
+                            CastAction::Pause
+                        } else {
+                            CastAction::Resume
+                        });
+                    }
+                    let pos = position
+                        .map(|p| fmt::human_duration(p.as_secs_f64()))
+                        .unwrap_or_else(|| "0:00".to_string());
+                    ui.label(egui::RichText::new(title).size(13.0));
+                    ui.label(
+                        egui::RichText::new(format!("{pos}  \u{00b7}  {device}"))
+                            .size(11.0)
+                            .color(theme::TEXT_DIM),
+                    );
+                }
+                CastStatus::Failed { message } => {
+                    ui.label(
+                        egui::RichText::new(format!("Casting failed: {message}"))
+                            .size(12.0)
+                            .color(theme::DANGER),
+                    );
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Stop").clicked() {
+                    stop = true;
+                }
+                if ui.button("Open cast").clicked() {
+                    open_view = true;
+                }
+            });
+        });
+
+        if let Some(action) = action {
+            self.backend.cast_action(action);
+        }
+        if stop {
+            self.stop_cast();
+        }
+        if open_view {
+            self.cast_view_open = true;
         }
     }
 }
