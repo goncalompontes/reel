@@ -1551,6 +1551,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui-phosphor"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f4299551488dddaa8f757727e1eb4ffdaf277ffe6e30b413403468f5ecf4634"
+dependencies = [
+ "egui",
+]
+
+[[package]]
 name = "egui-wgpu"
 version = "0.36.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4717,6 +4726,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "reel-cast"
+version = "0.1.0"
+dependencies = [
+ "quick-xml",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "reel-catalog"
 version = "0.1.0"
 dependencies = [
@@ -4774,6 +4794,7 @@ dependencies = [
  "clap",
  "eframe",
  "egui",
+ "egui-phosphor",
  "egui_extras",
  "egui_kittest",
  "image",

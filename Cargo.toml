@@ -1,6 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["crates/reel-core", "crates/reel-http", "crates/reel-player", "crates/reel-catalog", "crates/reel-cli", "crates/reel-desktop"]
+members = [
+    "crates/reel-core",
+    "crates/reel-http",
+    "crates/reel-player",
+    "crates/reel-catalog",
+    "crates/reel-cast",
+    "crates/reel-cli",
+    "crates/reel-desktop",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +22,7 @@ reel-player = { path = "crates/reel-player" }
 reel-desktop = { path = "crates/reel-desktop" }
 reel-http = { path = "crates/reel-http" }
 reel-catalog = { path = "crates/reel-catalog" }
+reel-cast = { path = "crates/reel-cast" }
 
 anyhow = "1"
 thiserror = "2"
@@ -23,6 +32,7 @@ serde_json = "1"
 url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+quick-xml = "0.41"
 
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "fs", "io-util", "signal", "sync", "time"] }

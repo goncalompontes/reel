@@ -1,0 +1,15 @@
+[package]
+name = "reel-cast"
+description = "DLNA/UPnP-AV casting: SSDP discovery and AVTransport control for reel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+quick-xml.workspace = true
+url.workspace = true
+
+tokio = { workspace = true }
