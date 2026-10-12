@@ -3,7 +3,7 @@
 //! This crate is the controller half of casting a torrent to a smart TV with no
 //! TV-side app:
 //!
-//! 1. [`ssdp::discover`] finds `MediaRenderer`s on the LAN.
+//! 1. [`target::discover_devices`] finds `MediaRenderer`s on the LAN.
 //! 2. [`device::parse_description`] turns each device description into its
 //!    service endpoints.
 //! 3. [`didl`] builds the metadata and [`dlna`] the `protocolInfo` for the
@@ -19,9 +19,9 @@ pub mod device;
 pub mod didl;
 pub mod dlna;
 pub mod error;
+pub mod mdns;
 pub mod session;
 pub mod soap;
-pub mod ssdp;
 pub mod target;
 pub mod xml;
 
@@ -29,9 +29,9 @@ pub use device::{DeviceDescription, Service};
 pub use error::{CastError, Result};
 pub use session::{CastSession, SessionState};
 pub use soap::{MediaInfo, PositionInfo, SoapFault, SoapRequest, TransportInfo};
-pub use ssdp::SsdpResponse;
 pub use target::{
-    CastDevice, CastTarget, DlnaTarget, describe, discover_devices, probe_address, probe_host,
+    CastDevice, CastTarget, DlnaTarget, describe, discover_all, discover_devices, probe_address,
+    probe_host, probe_hosts,
 };
 
 /// UPnP `AVTransport` transport states, as reported by `GetTransportInfo`.

@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reel_cast::session::{CastSession, SessionState};
-use reel_cast::{CastDevice, DlnaTarget, didl, discover_devices, probe_address};
+use reel_cast::{CastDevice, DlnaTarget, didl, discover_all, probe_address};
 use reel_catalog::{CatalogSettings, ConversionMode};
 use reel_core::Engine;
 use reel_http::{MediaState, build_media_router};
@@ -281,7 +281,7 @@ impl CastService {
         }
         let inner = self.inner.clone();
         self.runtime.spawn(async move {
-            let found = discover_devices(DISCOVERY_TIMEOUT).await;
+            let found = discover_all(DISCOVERY_TIMEOUT).await;
             let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
             guard.discovering = false;
             match found {

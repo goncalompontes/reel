@@ -43,6 +43,10 @@ pub enum CastError {
         description: String,
     },
 
+    /// A discovery search failed.
+    #[error("discovery failed: {0}")]
+    Discovery(String),
+
     /// A request to the device failed at the transport level.
     #[error("request to the device failed: {0}")]
     Request(#[from] reqwest::Error),

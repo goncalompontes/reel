@@ -18,7 +18,6 @@ use url::Url;
 use crate::device::{self, DeviceDescription, Service};
 use crate::error::{CastError, Result};
 use crate::soap::{self, MediaInfo, PositionInfo, TransportInfo};
-use crate::ssdp;
 
 /// A renderer that can be cast to.
 #[derive(Debug, Clone)]
@@ -74,34 +73,119 @@ pub async fn describe(client: &reqwest::Client, location: &Url) -> Result<CastDe
 
 /// Discover media renderers on the LAN and fetch each description.
 ///
-/// Devices without an `AVTransport` service are skipped (they cannot be cast
-/// to), and duplicates are collapsed by `UDN`. A device that fails to describe
-/// is logged and ignored, so one broken renderer does not hide the others.
+/// SSDP itself is delegated to `rupnp`, which joins the multicast group on each
+/// interface (something a hand-rolled search tends to get wrong). Devices
+/// without an `AVTransport` service are skipped (they cannot be cast to), and
+/// duplicates are collapsed by `UDN`.
 pub async fn discover_devices(timeout: Duration) -> Result<Vec<CastDevice>> {
-    let client = reqwest::Client::new();
-    let responses = ssdp::discover(timeout).await?;
+    use futures_util::TryStreamExt;
+    use rupnp::ssdp::SearchTarget;
 
+    let stream = rupnp::discover(&SearchTarget::RootDevice, timeout, None)
+        .await
+        .map_err(|error| CastError::Discovery(error.to_string()))?;
+    let mut stream = std::pin::pin!(stream);
+
+    let client = reqwest::Client::new();
     let mut devices: Vec<CastDevice> = Vec::new();
-    for response in responses {
-        match describe(&client, &response.location).await {
-            Ok(device) if device.av_transport().is_some() => {
-                if devices.iter().any(|seen| seen.udn() == device.udn()) {
-                    continue;
+    while let Some(device) = stream
+        .try_next()
+        .await
+        .map_err(|error| CastError::Discovery(error.to_string()))?
+    {
+        let Ok(location) = Url::parse(&device.url().to_string()) else {
+            continue;
+        };
+        match describe(&client, &location).await {
+            Ok(cast) if cast.av_transport().is_some() => {
+                if !devices.iter().any(|seen| seen.udn() == cast.udn()) {
+                    tracing::debug!(name = cast.name(), "described renderer");
+                    devices.push(cast);
                 }
-                tracing::debug!(name = device.name(), "described renderer");
-                devices.push(device);
             }
-            Ok(_) => tracing::debug!(location = %response.location, "not an AVTransport renderer"),
+            Ok(_) => tracing::debug!(%location, "not an AVTransport renderer"),
             Err(error) => {
-                tracing::debug!(location = %response.location, %error, "could not describe renderer")
+                tracing::debug!(%location, %error, "could not describe renderer")
             }
         }
     }
     Ok(devices)
 }
 
+/// Probe several hosts for DLNA renderers at once.
+pub async fn probe_hosts(
+    hosts: &[IpAddr],
+    first_port: u16,
+    last_port: u16,
+    connect_timeout: Duration,
+) -> Vec<CastDevice> {
+    // Scan one host at a time: probing several at once multiplies the concurrent
+    // connections, drops SYNs on WiFi and makes the scan miss real ports.
+    let mut devices: Vec<CastDevice> = Vec::new();
+    for ip in hosts {
+        let Ok(found) = probe_host(*ip, first_port, last_port, connect_timeout).await else {
+            continue;
+        };
+        for device in found {
+            if !devices.iter().any(|seen| seen.udn() == device.udn()) {
+                devices.push(device);
+            }
+        }
+    }
+    devices
+}
+
+/// Discover renderers, falling back to mDNS + a host scan when SSDP is silent.
+///
+/// SSDP is the normal path. When it returns nothing — some networks drop its
+/// multicast between clients while mDNS still works — the hosts advertising
+/// television services are found over mDNS and probed directly.
+pub async fn discover_all(timeout: Duration) -> Result<Vec<CastDevice>> {
+    let devices = discover_devices(timeout).await.unwrap_or_default();
+    if !devices.is_empty() {
+        return Ok(devices);
+    }
+
+    let mut hosts = crate::mdns::browse_tv_hosts(timeout)
+        .await
+        .unwrap_or_default();
+    // IPv6 link-local addresses from mDNS are not reachable without a scope id.
+    hosts.retain(IpAddr::is_ipv4);
+    if hosts.is_empty() {
+        return Ok(devices);
+    }
+    tracing::info!(
+        count = hosts.len(),
+        "SSDP found nothing; probing mDNS hosts"
+    );
+
+    // A small targeted probe first: it is quick and does not make the device
+    // drop SYNs, which a full 64k-port scan on WiFi does.
+    let curated = curated_ports();
+    let mut found: Vec<CastDevice> = Vec::new();
+    for ip in &hosts {
+        if let Ok(devices) = probe_ports(*ip, &curated, DEFAULT_PROBE_TIMEOUT).await {
+            for device in devices {
+                if !found.iter().any(|seen| seen.udn() == device.udn()) {
+                    found.push(device);
+                }
+            }
+        }
+    }
+
+    // Only if that finds nothing, fall back to the whole port range.
+    if found.is_empty() {
+        tracing::info!("curated ports found nothing; scanning the full range");
+        found = probe_hosts(&hosts, 1024, 65535, DEFAULT_PROBE_TIMEOUT).await;
+    }
+    Ok(found)
+}
+
 /// The default connect timeout for a port scan.
-const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_millis(120);
+///
+/// Long enough for one TCP SYN retransmit: on WiFi a dropped SYN is common, and
+/// a short timeout would report a listening port as closed.
+const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Resolve a user-entered address to renderers.
 ///
@@ -112,7 +196,12 @@ pub async fn probe_address(address: &str) -> Result<Vec<CastDevice>> {
     let address = address.trim();
 
     if let Ok(ip) = address.parse::<IpAddr>() {
-        return probe_host(ip, 1024, 65535, DEFAULT_PROBE_TIMEOUT).await;
+        // Curated ports first (fast, reliable); fall back to a full scan.
+        let mut found = probe_ports(ip, &curated_ports(), DEFAULT_PROBE_TIMEOUT).await?;
+        if found.is_empty() {
+            found = probe_host(ip, 1024, 65535, DEFAULT_PROBE_TIMEOUT).await?;
+        }
+        return Ok(found);
     }
     if let Some((host, port)) = address.rsplit_once(':') {
         if let (Ok(ip), Ok(port)) = (host.parse::<IpAddr>(), port.parse::<u16>()) {
@@ -131,17 +220,43 @@ pub async fn probe_address(address: &str) -> Result<Vec<CastDevice>> {
 /// unicast `M-SEARCH`. This reaches them anyway: it probes
 /// `first_port..=last_port` for open TCP sockets and fetches each one as a UPnP
 /// description, keeping the devices that expose `AVTransport`.
+/// Concurrency budget for a port scan.
+const SCAN_CONCURRENCY: usize = 2048;
+
+/// Ports worth probing before a full scan: DLNA renderers cluster low (LG uses
+/// ~1241) or in the UPnP ephemeral range, and a small probe does not make the
+/// device drop SYNs the way a 64k-port burst does.
+fn curated_ports() -> Vec<u16> {
+    let mut ports: Vec<u16> = (1024..=2048).collect();
+    ports.extend(49152..=49216);
+    ports.extend([
+        80, 443, 2869, 5000, 7000, 7676, 8008, 8009, 8200, 9080, 9081, 9197, 5555, 8060, 55000,
+    ]);
+    ports
+}
+
+/// Scan a port range on one host.
 pub async fn probe_host(
     ip: IpAddr,
     first_port: u16,
     last_port: u16,
     connect_timeout: Duration,
 ) -> Result<Vec<CastDevice>> {
-    let permits = Arc::new(Semaphore::new(2048));
+    let ports: Vec<u16> = (first_port..=last_port).collect();
+    probe_ports(ip, &ports, connect_timeout).await
+}
+
+/// Scan a set of ports on one host and describe whatever answers.
+pub async fn probe_ports(
+    ip: IpAddr,
+    ports: &[u16],
+    connect_timeout: Duration,
+) -> Result<Vec<CastDevice>> {
+    let permits = Arc::new(Semaphore::new(SCAN_CONCURRENCY));
     let mut tasks: JoinSet<Option<u16>> = JoinSet::new();
     let mut open: Vec<u16> = Vec::new();
 
-    for port in first_port..=last_port {
+    for &port in ports {
         // The permit moves into the task, so the scan stays bounded.
         let Ok(permit) = permits.clone().acquire_owned().await else {
             break;
@@ -165,34 +280,42 @@ pub async fn probe_host(
         }
     }
 
+    describe_ports(ip, open).await
+}
+
+/// Fetch a device description from each open port, concurrently.
+async fn describe_ports(ip: IpAddr, open: Vec<u16>) -> Result<Vec<CastDevice>> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(2))
         .build()?;
-    // Vendors disagree on where the description lives; "/" and the two common
-    // filenames cover every device seen so far.
-    const PATHS: [&str; 5] = [
-        "/",
-        "/description.xml",
-        "/rootDesc.xml",
-        "/dd.xml",
-        "/upnp/desc.xml",
-    ];
+    // Vendors disagree on where the description lives; these cover the devices
+    // seen so far.
+    const PATHS: [&str; 4] = ["/", "/description.xml", "/rootDesc.xml", "/dd.xml"];
+
+    // Concurrently: a few open ports hang (they are not HTTP), and doing this in
+    // series made a scan take a minute.
+    let mut describes: JoinSet<Option<CastDevice>> = JoinSet::new();
+    for port in open {
+        let client = client.clone();
+        describes.spawn(async move {
+            for path in PATHS {
+                let Ok(location) = Url::parse(&format!("http://{ip}:{port}{path}")) else {
+                    continue;
+                };
+                if let Ok(device) = describe(&client, &location).await {
+                    return Some(device);
+                }
+            }
+            None
+        });
+    }
 
     let mut devices: Vec<CastDevice> = Vec::new();
-    for port in open {
-        for path in PATHS {
-            let Ok(location) = Url::parse(&format!("http://{ip}:{port}{path}")) else {
-                continue;
-            };
-            let Ok(device) = describe(&client, &location).await else {
-                continue;
-            };
-            // This port served a description; stop trying paths on it.
-            let duplicate = devices.iter().any(|seen| seen.udn() == device.udn());
-            if device.av_transport().is_some() && !duplicate {
-                devices.push(device);
-            }
-            break;
+    while let Some(joined) = describes.join_next().await {
+        let Ok(Some(device)) = joined else { continue };
+        let duplicate = devices.iter().any(|seen| seen.udn() == device.udn());
+        if device.av_transport().is_some() && !duplicate {
+            devices.push(device);
         }
     }
     Ok(devices)

@@ -14,8 +14,15 @@ url.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
 
+# Discovery only: rupnp does SSDP (per-interface, with group joins) and mdns-sd
+# does mDNS. The AVTransport/SOAP control stays ours.
+rupnp = "3"
+mdns-sd = "0.21"
+futures-util = "0.3"
+
 tokio = { workspace = true }
 
 [dev-dependencies]
 axum.workspace = true
 tokio.workspace = true
+tracing-subscriber.workspace = true

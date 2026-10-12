@@ -26,7 +26,12 @@ use axum::extract::State;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use reel_cast::ssdp::{MEDIA_RENDERER, MULTICAST_ADDR, SSDP_PORT};
+
+/// SSDP constants, spelled out here so this test double does not depend on the
+/// client-side discovery code.
+const MEDIA_RENDERER: &str = "urn:schemas-upnp-org:device:MediaRenderer:1";
+const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
+const SSDP_PORT: u16 = 1900;
 
 const AV: &str = "urn:schemas-upnp-org:service:AVTransport:1";
 const RENDERING: &str = "urn:schemas-upnp-org:service:RenderingControl:1";
