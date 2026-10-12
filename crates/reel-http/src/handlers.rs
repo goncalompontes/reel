@@ -367,7 +367,7 @@ async fn serve_file(
         .map_err(|e| HttpError::internal(format!("building response: {e}")))
 }
 
-fn sanitize_filename(name: &str) -> String {
+pub(crate) fn sanitize_filename(name: &str) -> String {
     name.replace(['"', '\\', '\n', '\r', '/'], "_")
 }
 

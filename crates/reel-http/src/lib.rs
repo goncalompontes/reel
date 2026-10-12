@@ -14,9 +14,11 @@ pub mod range;
 
 mod error;
 mod handlers;
+mod media;
 mod router;
 
 pub use error::HttpError;
+pub use media::{MediaState, build_media_router};
 pub use router::{
     AppState, bind, build_router, build_router_with_allowed_origins, serve, serve_router_with_shutdown,
     serve_with_shutdown, shutdown_signal,
