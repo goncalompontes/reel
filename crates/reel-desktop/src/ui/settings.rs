@@ -506,9 +506,12 @@ impl App {
 
         ui.add_space(6.0);
         ui.label(
-            egui::RichText::new("Changes take effect on the next start.")
-                .color(theme::TEXT_DIM)
-                .size(11.0),
+            egui::RichText::new(
+                "Applies immediately. Toggling the setting or changing the LAN address \
+                 restarts the media server and ends any cast in progress.",
+            )
+            .color(theme::TEXT_DIM)
+            .size(11.0),
         );
     }
 

@@ -131,10 +131,13 @@ pub struct EngineBackend {
     /// Last measured cache figures, so the settings page does not walk the
     /// cache directory on every frame.
     cache_stats: Mutex<Option<CacheStats>>,
-    /// Casting to DLNA renderers, when enabled and available.
-    cast: Option<CastService>,
+    /// Casting to DLNA renderers, when enabled and available. Swappable while
+    /// running: toggling the setting restarts the media server.
+    cast: Mutex<Option<Arc<CastService>>>,
     /// Why casting is off, when `cast` is `None`.
-    cast_unavailable: Option<String>,
+    cast_unavailable: Mutex<Option<String>>,
+    /// The casting settings last applied, to detect changes on save.
+    cast_config: Mutex<Option<CastConfig>>,
 }
 
 impl EngineBackend {
@@ -284,6 +287,7 @@ impl EngineBackend {
 
         // Casting is opt-in: it opens a LAN-facing media port, so it only runs
         // when the setting is on and ffmpeg is available.
+        let cast_config = CastConfig::from_settings(&catalog_options.settings);
         let (cast, cast_unavailable) = match CastService::new(
             engine.clone(),
             base_url.clone(),
@@ -293,7 +297,7 @@ impl EngineBackend {
         ) {
             Ok(service) => {
                 service.refresh_devices();
-                (Some(service), None)
+                (Some(Arc::new(service)), None)
             }
             Err(reason) => {
                 tracing::info!(%reason, "casting is not available");
@@ -314,8 +318,9 @@ impl EngineBackend {
             stream_cache: Mutex::new(HashMap::new()),
             playing: Mutex::new(None),
             cache_stats: Mutex::new(None),
-            cast,
-            cast_unavailable,
+            cast: Mutex::new(cast),
+            cast_unavailable: Mutex::new(cast_unavailable),
+            cast_config: Mutex::new(Some(cast_config)),
         };
 
         // The media store owns what is being kept. Adopt any old per-torrent
@@ -333,8 +338,73 @@ impl EngineBackend {
     ///
     /// `None` means casting is off or unavailable (the setting is disabled, or
     /// ffmpeg is missing).
-    pub fn cast(&self) -> Option<&CastService> {
-        self.cast.as_ref()
+    pub fn cast(&self) -> Option<Arc<CastService>> {
+        self.cast
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Apply casting settings that changed since the last save, without a
+    /// restart.
+    ///
+    /// Toggling the LAN toggle, changing the advertised address or the ffmpeg
+    /// path rebuilds the media server (ending any cast in progress); the
+    /// conversion mode and height are updated in place.
+    fn reconcile_casting(&self, settings: &CatalogSettings) {
+        let want = CastConfig::from_settings(settings);
+        let previous = self
+            .cast_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if previous.as_ref() == Some(&want) {
+            return;
+        }
+
+        if previous.as_ref().is_none_or(|old| !old.needs_rebind(&want)) {
+            if let Some(cast) = self.cast() {
+                cast.set_options(crate::cast::plan_options(settings));
+            }
+            *self.cast_config.lock().unwrap_or_else(|e| e.into_inner()) = Some(want);
+            return;
+        }
+
+        // The listener or tools changed: tear the old server down (ending any
+        // cast) and, if still wanted, start a fresh one.
+        let old = self
+            .cast
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(cast) = old {
+            cast.shutdown();
+        }
+
+        let (cast, unavailable) = if want.enabled {
+            match CastService::new(
+                self.engine.clone(),
+                self.base_url.clone(),
+                self.catalog.data_dir.clone(),
+                settings,
+                self.runtime.handle().clone(),
+            ) {
+                Ok(service) => {
+                    service.refresh_devices();
+                    (Some(Arc::new(service)), None)
+                }
+                Err(reason) => (None, Some(reason)),
+            }
+        } else {
+            (
+                None,
+                Some("streaming to the local network is turned off".to_string()),
+            )
+        };
+
+        *self.cast.lock().unwrap_or_else(|e| e.into_inner()) = cast;
+        *self.cast_unavailable.lock().unwrap_or_else(|e| e.into_inner()) = unavailable;
+        *self.cast_config.lock().unwrap_or_else(|e| e.into_inner()) = Some(want);
     }
 
     pub(crate) fn push(&self, event: BackendEvent) {
@@ -1504,44 +1574,46 @@ impl Backend for EngineBackend {
     }
 
     fn cast_unavailable(&self) -> Option<String> {
-        self.cast_unavailable.clone()
+        self.cast_unavailable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn cast_devices(&self) -> Vec<crate::cast::DeviceInfo> {
-        self.cast
-            .as_ref()
-            .map(CastService::devices)
+        self.cast()
+            .map(|cast| cast.devices())
             .unwrap_or_default()
     }
 
     fn cast_discovering(&self) -> bool {
-        self.cast.as_ref().is_some_and(CastService::discovering)
+        self.cast().is_some_and(|cast| cast.discovering())
     }
 
     fn cast_status(&self) -> Option<crate::cast::CastStatus> {
-        self.cast.as_ref().and_then(CastService::status)
+        self.cast().and_then(|cast| cast.status())
     }
 
     fn refresh_cast_devices(&self) {
-        if let Some(cast) = &self.cast {
+        if let Some(cast) = self.cast() {
             cast.refresh_devices();
         }
     }
 
     fn start_cast(&self, udn: String, torrent_id: usize, file_id: usize, title: String) {
-        if let Some(cast) = &self.cast {
+        if let Some(cast) = self.cast() {
             cast.start_cast(udn, torrent_id, file_id, title);
         }
     }
 
     fn cast_action(&self, action: crate::cast::CastAction) {
-        if let Some(cast) = &self.cast {
+        if let Some(cast) = self.cast() {
             cast.control(action);
         }
     }
 
     fn clear_cast_cache(&self) {
-        if let Some(cast) = &self.cast {
+        if let Some(cast) = self.cast() {
             if let Err(error) = cast.clear_cache() {
                 tracing::warn!(%error, "could not clear the cast cache");
             }
@@ -1549,7 +1621,7 @@ impl Backend for EngineBackend {
     }
 
     fn dismiss_cast(&self) {
-        if let Some(cast) = &self.cast {
+        if let Some(cast) = self.cast() {
             cast.dismiss();
         }
     }
@@ -2565,6 +2637,8 @@ impl Backend for EngineBackend {
             self.enrich_library();
         }
 
+        self.reconcile_casting(&settings);
+
         self.push(BackendEvent::Info("Settings saved".to_string()));
     }
 
@@ -2651,6 +2725,16 @@ impl Drop for EngineBackend {
             .take()
         {
             let _ = shutdown.send(());
+        }
+
+        // Stop the LAN media server too.
+        if let Some(cast) = self
+            .cast
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            cast.shutdown();
         }
 
         {

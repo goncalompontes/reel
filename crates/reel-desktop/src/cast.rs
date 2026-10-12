@@ -113,11 +113,14 @@ pub struct CastService {
     token: String,
     tools: Tools,
     cache: ConversionCache,
-    options: PlanOptions,
+    /// Conversion policy, swappable while running.
+    options: Mutex<PlanOptions>,
     loopback_base: String,
     runtime: tokio::runtime::Handle,
     inner: Arc<Mutex<Inner>>,
     session: Arc<tokio::sync::Mutex<Option<CastSession>>>,
+    /// Resolving this stops the LAN media server.
+    shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl CastService {
@@ -187,9 +190,12 @@ impl CastService {
         )
         .with_live_source(live_source);
         let router = build_media_router(media);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         runtime.spawn(async move {
-            let _ = reel_http::serve_router_with_shutdown(listener, router, std::future::pending())
-                .await;
+            let _ = reel_http::serve_router_with_shutdown(listener, router, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
         });
         tracing::info!(%lan_base, "LAN media server ready for casting");
 
@@ -199,12 +205,31 @@ impl CastService {
             token,
             tools,
             cache,
-            options: plan_options(settings),
+            options: Mutex::new(plan_options(settings)),
             loopback_base,
             runtime,
             inner: Arc::new(Mutex::new(Inner::default())),
             session: Arc::new(tokio::sync::Mutex::new(None)),
+            shutdown: Mutex::new(Some(shutdown_tx)),
         })
+    }
+
+    /// Replace the conversion policy used for the next cast.
+    pub fn set_options(&self, options: PlanOptions) {
+        *self.options.lock().unwrap_or_else(|e| e.into_inner()) = options;
+    }
+
+    /// Stop the LAN media server and end any cast in progress.
+    pub fn shutdown(&self) {
+        self.dismiss();
+        if let Some(sender) = self
+            .shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = sender.send(());
+        }
     }
 
     /// The LAN base URL that cast URLs are built from.
@@ -300,7 +325,7 @@ impl CastService {
         let engine = self.engine.clone();
         let tools = self.tools.clone();
         let cache = self.cache.clone();
-        let options = self.options;
+        let options = *self.options.lock().unwrap_or_else(|e| e.into_inner());
         let loopback_base = self.loopback_base.clone();
         let lan_base = self.lan_base.clone();
         let token = self.token.clone();

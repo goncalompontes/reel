@@ -19,9 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use reel_catalog::{
-    CatalogCache, CatalogEntry, CatalogSettings, FileInput, LookupQuery, MediaRef, MediaStore,
-    Metadata, MetadataProvider, Release, SearchAggregator, SearchResults, TmdbClient, WatchHistory,
-    WatchProgress, Work, WorkMember, analyse, default_data_dir, episode_key_parts,
+    CatalogCache, CatalogEntry, CatalogSettings, ConversionMode, FileInput, LookupQuery, MediaRef,
+    MediaStore, Metadata, MetadataProvider, Release, SearchAggregator, SearchResults, TmdbClient,
+    WatchHistory, WatchProgress, Work, WorkMember, analyse, default_data_dir, episode_key_parts,
     provider_from_key,
 };
 use reel_core::model::{FileView, StatsView, StreamTarget, TorrentView};
@@ -257,6 +257,34 @@ pub struct MediaDownload {
     pub files: Vec<usize>,
 }
 
+/// The casting-relevant settings, snapshotted so a save can tell what changed.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct CastConfig {
+    enabled: bool,
+    address: Option<String>,
+    ffmpeg: Option<String>,
+    mode: ConversionMode,
+    max_height: u32,
+}
+
+impl CastConfig {
+    pub(crate) fn from_settings(settings: &CatalogSettings) -> CastConfig {
+        CastConfig {
+            enabled: settings.allow_lan_streaming,
+            address: settings.cast_lan_address.clone(),
+            ffmpeg: settings.ffmpeg_path.clone(),
+            mode: settings.conversion_mode,
+            max_height: settings.conversion_max_height,
+        }
+    }
+
+    /// Whether moving to `other` needs the media server to be rebuilt (rather
+    /// than just updating the conversion policy in place).
+    fn needs_rebind(&self, other: &CastConfig) -> bool {
+        self.enabled != other.enabled || self.address != other.address || self.ffmpeg != other.ffmpeg
+    }
+}
+
 pub trait Backend {
     fn capabilities(&self) -> &BackendCapabilities;
     fn base_url(&self) -> &str;
@@ -430,6 +458,27 @@ mod tests {
     use crate::testing::sample_library;
 
     use super::*;
+
+    #[test]
+    fn cast_config_rebinds_only_for_listener_changes() {
+        let base = CatalogSettings::default();
+        let original = CastConfig::from_settings(&base);
+
+        // Conversion policy changes update in place.
+        let mut policy = base.clone();
+        policy.conversion_max_height = 720;
+        policy.conversion_mode = ConversionMode::Remux;
+        assert!(!original.needs_rebind(&CastConfig::from_settings(&policy)));
+
+        // The LAN toggle and the advertised address need a rebuild.
+        let mut enabled = base.clone();
+        enabled.allow_lan_streaming = true;
+        assert!(original.needs_rebind(&CastConfig::from_settings(&enabled)));
+
+        let mut addressed = base.clone();
+        addressed.cast_lan_address = Some("192.168.1.5".to_string());
+        assert!(original.needs_rebind(&CastConfig::from_settings(&addressed)));
+    }
 
     fn entry_without_name() -> LibraryEntry {
         let item = sample_library().into_iter().next().expect("a sample");
