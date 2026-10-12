@@ -363,7 +363,12 @@ impl DlnaTarget {
             .av_transport()
             .ok_or_else(|| CastError::Missing("AVTransport service".into()))?;
         Ok(DlnaTarget {
-            client: reqwest::Client::new(),
+            // A renderer that hangs (e.g. wedged in TRANSITIONING) must not hang
+            // the cast forever.
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
             control_url: av.control_url.clone(),
             volume_url: device
                 .description

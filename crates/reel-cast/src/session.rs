@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use crate::TransportState;
-use crate::error::Result;
+use crate::error::{CastError, Result};
 use crate::target::CastTarget;
 
 /// What a session is doing right now.
@@ -108,10 +108,28 @@ impl CastSession {
     pub async fn start(&mut self, media_url: impl Into<String>, metadata: &str) -> Result<()> {
         self.media_url = media_url.into();
         self.state = SessionState::Connecting;
+
+        // Clear stale transport state first: a renderer left transitioning or in
+        // an error (for example after a declined prompt) refuses `Play` with
+        // "Transition not available" (701). `Stop` is best-effort.
+        let _ = self.target.stop().await;
+
         let result = match self.target.set_uri(&self.media_url, metadata).await {
             Ok(()) => self.target.play().await,
             Err(error) => Err(error),
         };
+
+        // 701 again on `Play` often clears with another `Stop` and one retry.
+        let result = match result {
+            Err(CastError::Fault {
+                code: Some(701), ..
+            }) => {
+                let _ = self.target.stop().await;
+                self.target.play().await
+            }
+            other => other,
+        };
+
         self.apply(result, SessionState::Playing)
     }
 
