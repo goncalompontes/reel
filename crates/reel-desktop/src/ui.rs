@@ -18,8 +18,12 @@ use reel_core::fmt;
 
 use crate::backend::{
     Backend, BackendEvent, LibraryItem, MediaDownload, PlayerCapability, SearchActionPhase,
+    SourceInfo,
 };
-use crate::components::{empty_state, page_title, row, section_header, stat};
+use crate::components::{
+    caption, chip, empty_state, ghost_button, neutral_chip, page_title, row, section_header, stat,
+};
+use crate::icons;
 use crate::player::{PlaybackInfo, PlaybackStats, PlayerController};
 use crate::theme;
 
@@ -64,12 +68,18 @@ impl Screen {
 /// so a title opened from Discover returns to Discover rather than to Home.
 struct Nav {
     trail: Vec<Screen>,
+    /// Screens popped by Back, so Forward can restore them. Cleared whenever a
+    /// new view is opened or the root changes.
+    forward: Vec<Screen>,
 }
 
 impl Nav {
     fn new(root: Screen) -> Self {
         debug_assert!(root.is_root(), "a trail must start at a rail destination");
-        Self { trail: vec![root] }
+        Self {
+            trail: vec![root],
+            forward: Vec::new(),
+        }
     }
 
     /// The screen currently shown.
@@ -91,12 +101,14 @@ impl Nav {
         debug_assert!(root.is_root());
         self.trail.clear();
         self.trail.push(root);
+        self.forward.clear();
     }
 
     /// Open a view on top of the current screen.
     fn open(&mut self, view: Screen) {
         if self.screen() != &view {
             self.trail.push(view);
+            self.forward.clear();
         }
     }
 
@@ -104,9 +116,23 @@ impl Nav {
         self.trail.len() > 1
     }
 
+    fn can_forward(&self) -> bool {
+        !self.forward.is_empty()
+    }
+
     fn back(&mut self) -> bool {
         if self.can_back() {
-            self.trail.pop();
+            let view = self.trail.pop().expect("can_back implies a view");
+            self.forward.push(view);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn forward(&mut self) -> bool {
+        if let Some(view) = self.forward.pop() {
+            self.trail.push(view);
             true
         } else {
             false
@@ -116,6 +142,7 @@ impl Nav {
     /// Drop views until the trail is `depth` long, for a breadcrumb click.
     fn truncate(&mut self, depth: usize) {
         self.trail.truncate(depth.max(1));
+        self.forward.clear();
     }
 }
 
@@ -154,6 +181,22 @@ struct SearchSignature {
     hits: u64,
     /// Bumped whenever metadata for a hit arrives.
     metadata: u64,
+}
+
+/// How the Discover results are laid out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchLayout {
+    Grid,
+    List,
+}
+
+impl SearchLayout {
+    fn label(self) -> &'static str {
+        match self {
+            SearchLayout::Grid => "Grid",
+            SearchLayout::List => "List",
+        }
+    }
 }
 
 pub struct App {
@@ -197,6 +240,10 @@ pub struct App {
     search_min_seeders: String,
     /// How the results are ordered for display.
     search_sort: SearchSort,
+    /// Whether Discover shows a poster grid or a compact list.
+    search_layout: SearchLayout,
+    /// Whether the filter fields are expanded under the toolbar.
+    filters_open: bool,
     /// True when the last search failed, so the view says so instead of
     /// claiming nothing matched.
     search_failed: bool,
@@ -240,15 +287,20 @@ pub struct App {
     /// The bottom controls' screen rect last frame, so the OSD does not hide
     /// while the pointer rests on the buttons.
     player_controls_rect: Option<egui::Rect>,
+    /// The player's top bar rect last frame, for the same reason.
+    player_topbar_rect: Option<egui::Rect>,
     /// Whether the player's keyboard-shortcut overlay is up.
     player_help: bool,
     /// Torrent id the player was started from, to return to.
     player_origin: Option<usize>,
     /// A play request waiting for its temporary torrent to be brought back.
     pending_play: Option<(usize, usize)>,
-    /// Frames seen last frame and when they last advanced, to detect a stall
-    /// (a frozen picture, not only "no frame at all").
+    /// Frames and playback position seen last time progress was checked, so a
+    /// wedge (frozen picture *and* frozen clock) can be told from a slow stream
+    /// (which is still making progress) and from a normal scene that happens to
+    /// hold on one frame.
     player_last_frames: u64,
+    player_progress_position: f64,
     player_progress_at: Instant,
     /// Whether this play has already fallen back to a fresh re-add.
     stream_recovered: bool,
@@ -310,6 +362,8 @@ impl App {
             search_episode: String::new(),
             search_min_seeders: String::new(),
             search_sort: SearchSort::Relevance,
+            search_layout: SearchLayout::Grid,
+            filters_open: false,
             search_failed: false,
             search_streaming: false,
             search_failures: Vec::new(),
@@ -328,10 +382,12 @@ impl App {
             player_last_activity: Instant::now(),
             player_controls_hidden: false,
             player_controls_rect: None,
+            player_topbar_rect: None,
             player_help: false,
             player_origin: None,
             pending_play: None,
             player_last_frames: 0,
+            player_progress_position: 0.0,
             player_progress_at: Instant::now(),
             stream_recovered: false,
             pending_ctx: None,
@@ -715,6 +771,7 @@ impl App {
         let capability = self.backend.capabilities().player.clone();
         self.player_origin = Some(torrent_id);
         self.player_last_frames = 0;
+        self.player_progress_position = 0.0;
         self.player_progress_at = Instant::now();
         self.watch_last_recorded = start_at.unwrap_or(0.0);
         self.watch_recording_for = Some(item.entry.info_hash.clone());
@@ -1264,13 +1321,18 @@ impl eframe::App for App {
             )
             .show(ui, |ui| self.rail(ui, rail_width));
 
-        egui::Panel::top("header")
-            .frame(
-                egui::Frame::NONE
-                    .fill(theme::BG)
-                    .inner_margin(egui::Margin::symmetric(18, 10)),
-            )
-            .show(ui, |ui| self.header(ui));
+        // The header only earns its place when there is somewhere to go back to
+        // (a pushed Work/Result view). Root views carry their own titles and
+        // controls, so no bar is drawn over them.
+        if self.nav.can_back() {
+            egui::Panel::top("header")
+                .frame(
+                    egui::Frame::NONE
+                        .fill(theme::BG)
+                        .inner_margin(egui::Margin::symmetric(18, 10)),
+                )
+                .show(ui, |ui| self.header(ui));
+        }
 
         egui::CentralPanel::default()
             .frame(
@@ -1303,17 +1365,25 @@ impl App {
     /// Keyboard shortcuts that belong to the shell rather than a view.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let focus_search = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K));
-        let back = ctx.input(|i| {
-            i.key_pressed(egui::Key::Escape)
+        let (back, forward) = ctx.input(|i| {
+            let back = i.key_pressed(egui::Key::Escape)
                 || (i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft))
+                || i.pointer.button_clicked(egui::PointerButton::Extra1);
+            let forward =
+                (i.modifiers.alt && i.key_pressed(egui::Key::ArrowRight))
+                    || i.pointer.button_clicked(egui::PointerButton::Extra2);
+            (back, forward)
         });
 
         // The Add modal owns Escape and the backdrop while it is up.
         if back && !self.add_open {
             self.back();
         }
+        if forward {
+            self.nav.forward();
+        }
         if focus_search {
-            if !matches!(self.root(), Screen::Home | Screen::Discover) {
+            if !matches!(self.root(), Screen::Discover) {
                 self.go_to(Screen::Discover);
             }
             self.focus_search = true;
@@ -1325,35 +1395,56 @@ impl App {
         let compact = width < 100.0;
         ui.vertical(|ui| {
             ui.add_space(2.0);
-            ui.label(
-                egui::RichText::new("reel")
-                    .size(if compact { 17.0 } else { 22.0 })
-                    .strong()
-                    .color(theme::ACCENT),
-            );
-            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(icons::FILM_STRIP)
+                        .size(if compact { 20.0 } else { 22.0 })
+                        .color(theme::ACCENT),
+                );
+                if !compact {
+                    ui.label(
+                        egui::RichText::new("reel")
+                            .size(22.0)
+                            .family(theme::semibold(ui.ctx()))
+                            .color(theme::TEXT),
+                    );
+                }
+            });
+            ui.add_space(14.0);
 
-            self.rail_item(ui, Screen::Home, "Home", compact);
-            self.rail_item(ui, Screen::Discover, "Discover", compact);
-            self.rail_item(ui, Screen::Activity, "Activity", compact);
+            self.rail_item(ui, Screen::Home, icons::HOUSE, "Home", compact);
+            ui.add_space(3.0);
+            self.rail_item(
+                ui,
+                Screen::Discover,
+                icons::MAGNIFYING_GLASS,
+                "Discover",
+                compact,
+            );
+            ui.add_space(3.0);
+            self.rail_item(ui, Screen::Activity, icons::DOWNLOAD, "Activity", compact);
 
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                 ui.add_space(2.0);
                 self.rail_transfers(ui, compact);
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(8.0);
-                self.rail_item(ui, Screen::Settings, "Settings", compact);
+                ui.add_space(10.0);
+                self.rail_item(ui, Screen::Settings, icons::GEAR, "Settings", compact);
                 ui.add_space(8.0);
                 let add = if compact {
-                    "+".to_string()
+                    icons::PLUS.to_string()
                 } else {
-                    "+   Add".to_string()
+                    format!("{}   Add", icons::PLUS)
                 };
                 if ui
                     .add_sized(
-                        [ui.available_width(), 30.0],
-                        egui::Button::new(egui::RichText::new(add).size(13.5)),
+                        [ui.available_width(), 32.0],
+                        egui::Button::new(
+                            egui::RichText::new(add)
+                                .size(if compact { 15.0 } else { 13.5 })
+                                .color(theme::TEXT),
+                        )
+                        .fill(theme::ACCENT_DEEP)
+                        .corner_radius(theme::CONTROL_RADIUS),
                     )
                     .clicked()
                 {
@@ -1363,19 +1454,32 @@ impl App {
         });
     }
 
-    fn rail_item(&mut self, ui: &mut egui::Ui, target: Screen, label: &str, compact: bool) {
+    fn rail_item(
+        &mut self,
+        ui: &mut egui::Ui,
+        target: Screen,
+        glyph: &str,
+        label: &str,
+        compact: bool,
+    ) {
         let selected = self.root() == &target;
-        // No icon set yet (that is the design-system phase); a letter stands in
-        // on the collapsed rail rather than an unsupported glyph.
+        // The collapsed rail is icon-only; the label lives in a tooltip.
         let text = if compact {
-            label.chars().next().unwrap_or(' ').to_string()
+            egui::RichText::new(glyph).size(17.0)
         } else {
-            label.to_string()
+            egui::RichText::new(format!("{glyph}    {label}")).size(14.0)
         };
         let response = ui.add_sized(
-            [ui.available_width(), 30.0],
-            egui::Button::new(egui::RichText::new(text).size(13.5)).selected(selected),
+            [ui.available_width(), 34.0],
+            egui::Button::new(text)
+                .selected(selected)
+                .corner_radius(theme::CONTROL_RADIUS),
         );
+        let response = if compact {
+            response.on_hover_text(label)
+        } else {
+            response
+        };
         if response.clicked() {
             self.nav.go(target);
         }
@@ -1396,8 +1500,8 @@ impl App {
         if compact {
             if active > 0 {
                 ui.label(
-                    egui::RichText::new(format!("{active}"))
-                        .size(12.0)
+                    egui::RichText::new(format!("{} {active}", icons::DOWNLOAD))
+                        .size(13.0)
                         .color(theme::OK),
                 );
             }
@@ -1405,7 +1509,7 @@ impl App {
         }
         if down > 0 {
             ui.label(
-                egui::RichText::new(format!("{} \u{2b07}", fmt::human_rate(down)))
+                egui::RichText::new(format!("{}  {}", icons::DOWNLOAD, fmt::human_rate(down)))
                     .size(11.5)
                     .color(theme::OK),
             );
@@ -1423,14 +1527,31 @@ impl App {
         );
     }
 
-    /// The header: Back, breadcrumbs, and the contextual search field.
+    /// The header for pushed views: Back/Forward and a breadcrumb trail.
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(self.nav.can_back(), egui::Button::new("\u{2039}  Back"))
-                .clicked()
+            if self.nav.can_back()
+                && ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(format!("{}  Back", icons::ARROW_LEFT)).size(13.5),
+                        )
+                        .frame(false),
+                    )
+                    .clicked()
             {
                 self.nav.back();
+            }
+            if self.nav.can_forward()
+                && ui
+                    .add(
+                        egui::Button::new(egui::RichText::new(icons::ARROW_RIGHT).size(13.5))
+                            .frame(false),
+                    )
+                    .on_hover_text("Forward")
+                    .clicked()
+            {
+                self.nav.forward();
             }
             ui.add_space(6.0);
 
@@ -1438,11 +1559,19 @@ impl App {
             let last = trail.len().saturating_sub(1);
             for (index, crumb) in trail.iter().enumerate() {
                 if index > 0 {
-                    ui.label(egui::RichText::new("/").color(theme::TEXT_DIM));
+                    ui.label(
+                        egui::RichText::new(icons::CARET_RIGHT)
+                            .size(11.0)
+                            .color(theme::TEXT_DIM),
+                    );
                 }
                 let label = self.crumb_label(crumb);
                 if index == last {
-                    ui.label(egui::RichText::new(label).size(15.0).strong());
+                    ui.label(
+                        egui::RichText::new(label)
+                            .size(15.0)
+                            .family(theme::semibold(ui.ctx())),
+                    );
                 } else if ui
                     .link(egui::RichText::new(label).color(theme::TEXT_DIM))
                     .clicked()
@@ -1450,10 +1579,6 @@ impl App {
                     self.nav.truncate(index + 1);
                 }
             }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.header_search(ui);
-            });
         });
     }
 
@@ -1477,36 +1602,6 @@ impl App {
                 .map(|work| work.heading())
                 .unwrap_or_else(|| "Result".to_string()),
             other => other.root_label().to_string(),
-        }
-    }
-
-    fn header_search(&mut self, ui: &mut egui::Ui) {
-        let root = self.root().clone();
-        match root {
-            Screen::Home => {
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.filter)
-                        .id(egui::Id::new("global-search"))
-                        .hint_text("filter library\u{2026}")
-                        .desired_width(240.0),
-                );
-                if self.focus_search {
-                    response.request_focus();
-                    self.focus_search = false;
-                }
-            }
-            // Discover owns its own search field; the header stays quiet there.
-            Screen::Discover => {}
-            _ => {
-                if ui
-                    .button("\u{2318}K  Search")
-                    .on_hover_text("Search the sources")
-                    .clicked()
-                {
-                    self.go_to(Screen::Discover);
-                    self.focus_search = true;
-                }
-            }
         }
     }
 
@@ -2069,40 +2164,70 @@ impl App {
     }
 
     /// A poster tile: artwork, title, versions and a resume bar.
+    /// A poster tile: artwork, a gradient scrim, title/quality, and a resume
+    /// bar. Lifts slightly on hover, the way a card does on a streaming app.
     fn card(&mut self, ui: &mut egui::Ui, work: &Work, width: f32, height: f32) -> CardHit {
         let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+        // The title is painted, so expose the card as one labelled button for
+        // AccessKit (and the tests).
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), work.heading())
+        });
         let painter = ui.painter().clone();
+
+        // Hover lift: a few pixels out on every side, animated.
+        let lift = ui
+            .ctx()
+            .animate_bool_with_time(response.id, response.hovered(), 0.12);
+        let art = rect.expand(3.0 * lift);
 
         Self::paint_art(
             ui,
-            rect,
+            art,
             work.poster(),
             &work.title,
             ArtworkKind::Poster,
             theme::CARD_RADIUS,
         );
 
-        // A scrim behind the text so it stays readable over bright artwork.
-        let mut scrim = rect;
-        scrim.set_top(rect.bottom() - 62.0);
-        painter.rect_filled(scrim, theme::CARD_RADIUS, Color32::from_black_alpha(190));
+        // A gradient scrim so the title reads over bright artwork, faded at the
+        // top rather than a hard band.
+        let mut scrim = art;
+        scrim.set_top(art.bottom() - art.height() * 0.56);
+        theme::paint_scrim(
+            &painter,
+            scrim,
+            theme::CARD_RADIUS,
+            if response.hovered() { 235 } else { 210 },
+        );
 
-        ui.put(
-            Rect::from_min_size(
-                egui::pos2(rect.left() + 8.0, rect.bottom() - 56.0),
-                Vec2::new(rect.width() - 16.0, 20.0),
-            ),
-            egui::Label::new(
-                egui::RichText::new(reel_core::title::truncate(&work.title, 22))
-                    .size(13.5)
-                    .color(Color32::WHITE),
-            )
-            .selectable(false),
+        // A quality pill, top-left, when the release names say something useful.
+        if let Some(version) = work.versions().first() {
+            let quality = version.attributes.quality_label();
+            if !quality.is_empty() && quality != "quality unknown" {
+                Self::paint_pill(
+                    ui,
+                    art.left_top() + Vec2::new(8.0, 8.0),
+                    &quality,
+                    theme::TEXT,
+                    Color32::from_black_alpha(150),
+                );
+            }
+        }
+
+        // Title and subtitle painted left-aligned (a `ui.put` Label would
+        // centre itself in its box).
+        painter.text(
+            egui::pos2(art.left() + 10.0, art.bottom() - 30.0),
+            egui::Align2::LEFT_BOTTOM,
+            reel_core::title::truncate(&work.title, 22),
+            egui::FontId::new(13.5, theme::semibold(ui.ctx())),
+            Color32::WHITE,
         );
 
         // Second line: a resume hint, or what the title actually contains.
         let subtitle = if let Some(position) = work.resume_position() {
-            format!("\u{25b6} resume from {}", fmt::human_duration(position))
+            format!("{}  resume {}", icons::PLAY, fmt::human_duration(position))
         } else if work.is_series() {
             let episodes = work.episodes();
             let choices = episodes
@@ -2120,14 +2245,20 @@ impl App {
         } else {
             match work.versions().first() {
                 Some(version) => {
-                    let count = work.versions().len();
-                    if count > 1 {
-                        format!(
-                            "{} \u{00b7} {count} versions",
-                            version.attributes.quality_label()
-                        )
+                    let label = version.attributes.quality_label();
+                    let quality = if label == "quality unknown" {
+                        String::new()
                     } else {
-                        version.attributes.quality_label()
+                        label
+                    };
+                    let count = work.versions().len();
+                    match (quality.is_empty(), count > 1) {
+                        (false, true) => format!("{quality} \u{00b7} {count} versions"),
+                        (false, false) => quality,
+                        (true, _) => work
+                            .year
+                            .map(|year| year.to_string())
+                            .unwrap_or_else(|| reel_core::title::truncate(&work.key, 10)),
                     }
                 }
                 None => work
@@ -2136,19 +2267,16 @@ impl App {
                     .unwrap_or_else(|| reel_core::title::truncate(&work.key, 10)),
             }
         };
-        ui.put(
-            Rect::from_min_size(
-                egui::pos2(rect.left() + 8.0, rect.bottom() - 36.0),
-                Vec2::new(rect.width() - 16.0, 16.0),
-            ),
-            egui::Label::new(egui::RichText::new(subtitle).size(10.5).color(
-                if work.resume_position().is_some() {
-                    theme::ACCENT
-                } else {
-                    theme::TEXT_DIM
-                },
-            ))
-            .selectable(false),
+        painter.text(
+            egui::pos2(art.left() + 10.0, art.bottom() - 10.0),
+            egui::Align2::LEFT_BOTTOM,
+            subtitle,
+            egui::FontId::proportional(10.5),
+            if work.resume_position().is_some() {
+                theme::ACCENT
+            } else {
+                theme::TEXT_DIM
+            },
         );
 
         // Download progress along the bottom edge, from the best member.
@@ -2156,8 +2284,8 @@ impl App {
         if let Some(item) = lead.as_ref() {
             if item.torrent.stats.percent < 99.5 {
                 let bar = Rect::from_min_size(
-                    egui::pos2(rect.left(), rect.bottom() - 4.0),
-                    Vec2::new(rect.width(), 4.0),
+                    egui::pos2(art.left(), art.bottom() - 4.0),
+                    Vec2::new(art.width(), 4.0),
                 );
                 let mut filled = bar;
                 filled.set_right(
@@ -2170,12 +2298,12 @@ impl App {
             // A count badge when the library holds more than one copy.
             if work.torrent_count() > 1 {
                 painter.circle_filled(
-                    egui::pos2(rect.right() - 14.0, rect.top() + 14.0),
+                    egui::pos2(art.right() - 14.0, art.top() + 14.0),
                     8.0,
                     Color32::from_black_alpha(180),
                 );
                 painter.text(
-                    egui::pos2(rect.right() - 14.0, rect.top() + 14.0),
+                    egui::pos2(art.right() - 14.0, art.top() + 14.0),
                     egui::Align2::CENTER_CENTER,
                     work.torrent_count().to_string(),
                     egui::FontId::proportional(11.0),
@@ -2184,12 +2312,12 @@ impl App {
             }
 
             let dot_x = if work.torrent_count() > 1 {
-                rect.right() - 30.0
+                art.right() - 30.0
             } else {
-                rect.right() - 14.0
+                art.right() - 14.0
             };
             painter.circle_filled(
-                egui::pos2(dot_x, rect.top() + 14.0),
+                egui::pos2(dot_x, art.top() + 14.0),
                 5.0,
                 theme::state_color(&item.torrent.stats.state),
             );
@@ -2198,7 +2326,7 @@ impl App {
         if response.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             painter.rect_stroke(
-                rect,
+                art,
                 theme::CARD_RADIUS,
                 egui::Stroke::new(1.5, theme::ACCENT),
                 egui::StrokeKind::Inside,
@@ -2209,6 +2337,23 @@ impl App {
             clicked: response.clicked(),
             double_clicked: response.double_clicked(),
         }
+    }
+
+    /// Paint a small rounded pill of text, returning the rect it occupied.
+    fn paint_pill(
+        ui: &egui::Ui,
+        pos: egui::Pos2,
+        text: &str,
+        fg: Color32,
+        bg: Color32,
+    ) -> Rect {
+        let painter = ui.painter();
+        let galley = painter.layout_no_wrap(text.to_owned(), egui::FontId::proportional(10.0), fg);
+        let pad = Vec2::new(7.0, 3.0);
+        let rect = Rect::from_min_size(pos, galley.size() + pad * 2.0);
+        painter.rect_filled(rect, theme::CHIP_RADIUS, bg);
+        painter.galley(pos + pad, galley, fg);
+        rect
     }
 }
 
@@ -2221,6 +2366,22 @@ struct CardHit {
 
 impl App {
     fn library_screen(&mut self, ui: &mut egui::Ui) {
+        // Home's own header: the title, and the library filter that used to live
+        // in the (now removed) global top bar.
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            page_title(ui, "Home");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_sized(
+                    [280.0, 26.0],
+                    egui::TextEdit::singleline(&mut self.filter)
+                        .id(egui::Id::new("library-filter"))
+                        .hint_text("Filter your library\u{2026}"),
+                );
+            });
+        });
+        ui.add_space(10.0);
+
         let filter = self.filter.trim().to_lowercase();
 
         if self.works.is_empty() {
@@ -2385,10 +2546,13 @@ impl App {
 
     /// The banner at the top of the library: newest entry, blown up.
     fn hero(&mut self, ui: &mut egui::Ui, work: &Work) {
-        let height = 240.0;
+        let height = 300.0;
         let width = ui.available_width();
         let (rect, hero_response) =
             ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+        hero_response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), work.heading())
+        });
         let painter = ui.painter().clone();
 
         Self::paint_art(
@@ -2400,101 +2564,123 @@ impl App {
             theme::PANEL_RADIUS,
         );
 
-        // Darken the lower half so the text reads over any artwork.
+        // A gradient from the bottom, so the title reads over any artwork.
         let mut scrim = rect;
-        scrim.set_top(rect.bottom() - 120.0);
-        painter.rect_filled(scrim, theme::PANEL_RADIUS, Color32::from_black_alpha(180));
+        scrim.set_top(rect.bottom() - rect.height() * 0.9);
+        theme::paint_scrim(&painter, scrim, theme::PANEL_RADIUS, 235);
 
-        ui.put(
-            Rect::from_min_size(
-                egui::pos2(rect.left() + 24.0, rect.top() + 22.0),
-                Vec2::new(160.0, 18.0),
-            ),
-            egui::Label::new(
-                egui::RichText::new("LATEST")
-                    .size(11.0)
-                    .strong()
-                    .color(theme::ACCENT),
-            )
-            .halign(egui::Align::LEFT)
-            .selectable(false),
+        let resuming = work.resume_position().is_some();
+        painter.text(
+            egui::pos2(rect.left() + 28.0, rect.top() + 24.0),
+            egui::Align2::LEFT_TOP,
+            if resuming { "CONTINUE WATCHING" } else { "NEWLY ADDED" },
+            egui::FontId::proportional(11.0),
+            theme::ACCENT,
         );
 
-        ui.put(
-            Rect::from_min_size(
-                egui::pos2(rect.left() + 24.0, rect.bottom() - 84.0),
-                Vec2::new(rect.width() - 300.0, 40.0),
-            ),
-            egui::Label::new(
-                egui::RichText::new(reel_core::title::truncate(&work.heading(), 52))
-                    .size(30.0)
-                    .color(Color32::WHITE),
-            )
-            .halign(egui::Align::LEFT)
-            .selectable(false),
+        painter.text(
+            egui::pos2(rect.left() + 28.0, rect.bottom() - 78.0),
+            egui::Align2::LEFT_BOTTOM,
+            reel_core::title::truncate(&work.heading(), 52),
+            egui::FontId::new(32.0, theme::semibold(ui.ctx())),
+            Color32::WHITE,
         );
 
-        // Metadata line: genres and rating when we have them, otherwise the
-        // transfer state of the best copy.
+        // A row of fact pills: year, rating, runtime, genres (or transfer state
+        // when there is no metadata).
         let lead = self.lead_item(work);
-        let meta = match work.metadata.as_ref() {
+        let mut facts: Vec<(String, Color32)> = Vec::new();
+        match work.metadata.as_ref() {
             Some(metadata) => {
-                let mut parts = Vec::new();
                 if let Some(year) = metadata.year {
-                    parts.push(year.to_string());
-                }
-                if let Some(runtime) = metadata.runtime_label() {
-                    parts.push(runtime);
+                    facts.push((year.to_string(), theme::TEXT));
                 }
                 if let Some(rating) = metadata.rating {
-                    parts.push(format!("\u{2605} {rating:.1}/10"));
+                    facts.push((format!("{} {rating:.1}", icons::STAR), theme::WARN));
                 }
-                if !metadata.genres.is_empty() {
-                    parts.push(metadata.genres.join(" \u{2022} "));
+                if let Some(runtime) = metadata.runtime_label() {
+                    facts.push((runtime, theme::TEXT));
                 }
                 if work.torrent_count() > 1 {
-                    parts.push(format!("{} copies", work.torrent_count()));
+                    facts.push((format!("{} copies", work.torrent_count()), theme::TEXT_DIM));
                 }
-                parts.join("   \u{2022}   ")
+                if !metadata.genres.is_empty() {
+                    facts.push((metadata.genres.join(" \u{00b7} "), theme::TEXT_DIM));
+                }
             }
-            None => match lead.as_ref() {
-                Some(item) => format!(
-                    "{}   \u{2022}   {} peers   \u{2022}   {:.0}% downloaded",
-                    item.torrent.stats.state,
-                    item.torrent.stats.peers.live,
-                    item.torrent.stats.percent
-                ),
-                None => String::new(),
-            },
-        };
-        ui.put(
-            Rect::from_min_size(
-                egui::pos2(rect.left() + 24.0, rect.bottom() - 44.0),
-                Vec2::new(rect.width() - 300.0, 18.0),
-            ),
-            egui::Label::new(egui::RichText::new(meta).size(12.0).color(theme::TEXT_DIM))
-                .halign(egui::Align::LEFT)
-                .selectable(false),
-        );
+            None => {
+                if let Some(item) = lead.as_ref() {
+                    facts.push((item.torrent.stats.state.clone(), theme::TEXT));
+                    facts.push((
+                        format!("{} peers", item.torrent.stats.peers.live),
+                        theme::TEXT_DIM,
+                    ));
+                    facts.push((
+                        format!("{:.0}% downloaded", item.torrent.stats.percent),
+                        theme::TEXT_DIM,
+                    ));
+                }
+            }
+        }
+        let mut x = rect.left() + 28.0;
+        let pill_y = rect.bottom() - 66.0;
+        let max_right = rect.right() - 28.0;
+        for (text, color) in facts {
+            let width_hint = ui.painter().layout_no_wrap(
+                text.clone(),
+                egui::FontId::proportional(10.0),
+                color,
+            );
+            if x + width_hint.size().x + 20.0 > max_right {
+                break;
+            }
+            let r = Self::paint_pill(
+                ui,
+                egui::pos2(x, pill_y),
+                &text,
+                color,
+                Color32::from_black_alpha(120),
+            );
+            x = r.right() + 6.0;
+        }
 
-        let label = match work.resume_position() {
-            Some(position) => format!("\u{25b6}  Resume {}", fmt::human_duration(position)),
-            None => "\u{25b6}  Play".to_string(),
+        // Actions: the one primary Play, and More info.
+        let play_label = match work.resume_position() {
+            Some(_) => format!("{}  Resume", icons::PLAY),
+            None => format!("{}  Play", icons::PLAY),
         };
         let play = ui
             .put(
                 Rect::from_min_size(
-                    egui::pos2(rect.right() - 224.0, rect.bottom() - 74.0),
-                    Vec2::new(190.0, 38.0),
+                    egui::pos2(rect.left() + 28.0, rect.bottom() - 44.0),
+                    Vec2::new(150.0, 32.0),
                 ),
-                egui::Button::new(egui::RichText::new(label).size(15.0)),
+                egui::Button::new(
+                    egui::RichText::new(play_label)
+                        .size(14.0)
+                        .family(theme::semibold(ui.ctx())),
+                )
+                .fill(theme::ACCENT_DEEP)
+                .corner_radius(theme::CONTROL_RADIUS),
+            )
+            .clicked();
+        let more = ui
+            .put(
+                Rect::from_min_size(
+                    egui::pos2(rect.left() + 186.0, rect.bottom() - 44.0),
+                    Vec2::new(130.0, 32.0),
+                ),
+                egui::Button::new(egui::RichText::new("More info").size(13.0))
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(theme::CONTROL_RADIUS),
             )
             .clicked();
 
         let id = work.lead_torrent_id();
         if play {
             self.play_with_ctx(id);
-        } else if hero_response.clicked() {
+        } else if more || hero_response.clicked() {
             self.open_work(id);
         }
     }
@@ -3396,6 +3582,43 @@ fn plural(count: usize, singular: &str) -> String {
     }
 }
 
+/// Whether the player is doing something that legitimately produces no new
+/// frames right now: still starting up, waiting for the demuxer cache, paused,
+/// finished, or buffering.
+fn stream_looks_busy(state: &reel_player::PlayerState) -> bool {
+    !state.loaded
+        || state.paused
+        || state.eof
+        || state.idle
+        || state.paused_for_cache
+        || state
+            .buffering_percent
+            .is_some_and(|percent| percent < 100.0)
+}
+
+/// Decide whether playback looks wedged rather than merely slow.
+///
+/// A wedge is narrow: nothing is loading or buffering, the torrent is not
+/// delivering bytes, no seek is in flight, and *both* the picture (frame count)
+/// and the playback clock (position) have stopped. A slow torrent, a rebuffer, a
+/// still scene and a seek each fail at least one of those, so they are never
+/// mistaken for a wedge.
+#[allow(clippy::too_many_arguments)]
+fn playback_is_wedged(
+    busy: bool,
+    fetching: bool,
+    frames: u64,
+    last_frames: u64,
+    position: f64,
+    last_position: f64,
+    recent_seek: bool,
+) -> bool {
+    if busy || fetching || recent_seek {
+        return false;
+    }
+    frames == last_frames && (position - last_position).abs() < 0.25
+}
+
 /// Where playback of one file should start.
 ///
 /// The file's own position is the answer whenever there is one. The torrent's
@@ -3514,39 +3737,44 @@ fn work_identity(ui: &mut egui::Ui, work: &Work) {
         ArtworkKind::Poster,
         theme::CARD_RADIUS,
     );
-    ui.add_space(10.0);
+    ui.add_space(12.0);
     page_title(ui, work.heading());
+    ui.add_space(6.0);
 
-    let mut facts = vec![if work.is_series() { "Series" } else { "Film" }.to_string()];
-    if let Some(metadata) = work.metadata.as_ref() {
-        if let Some(rating) = display_rating(metadata) {
-            facts.push(format!("\u{2605} {rating:.1}/10"));
+    // Facts as chips, streaming-app style.
+    ui.horizontal_wrapped(|ui| {
+        chip(
+            ui,
+            if work.is_series() { "Series" } else { "Film" },
+            theme::ACCENT,
+        );
+        if let Some(metadata) = work.metadata.as_ref() {
+            if let Some(rating) = display_rating(metadata) {
+                chip(ui, &format!("{} {rating:.1}", icons::STAR), theme::WARN);
+            }
+            if let Some(runtime) = metadata.runtime_label() {
+                neutral_chip(ui, &runtime);
+            }
         }
-        if let Some(runtime) = metadata.runtime_label() {
-            facts.push(runtime);
-        }
-    }
-    facts.push(if work.is_series() {
-        plural(work.episodes().len(), "episode")
-    } else {
-        plural(work.versions().len(), "release")
+        let count = if work.is_series() {
+            plural(work.episodes().len(), "episode")
+        } else {
+            plural(work.versions().len(), "release")
+        };
+        neutral_chip(ui, &count);
     });
-    ui.label(
-        egui::RichText::new(facts.join("   \u{2022}   "))
-            .size(12.0)
-            .color(theme::TEXT_DIM),
-    );
 
     if let Some(metadata) = work.metadata.as_ref() {
         if !metadata.genres.is_empty() {
-            ui.label(
-                egui::RichText::new(metadata.genres.join("  \u{2022}  "))
-                    .size(12.0)
-                    .color(theme::ACCENT),
-            );
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                for genre in &metadata.genres {
+                    neutral_chip(ui, genre);
+                }
+            });
         }
         if let Some(overview) = metadata.overview.as_deref() {
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             ui.label(egui::RichText::new(overview).size(12.5).color(theme::TEXT));
         }
     }
@@ -3555,72 +3783,127 @@ fn work_identity(ui: &mut egui::Ui, work: &Work) {
 // ------------------------------------------------------------------ search
 
 impl App {
-    fn search_screen(&mut self, ui: &mut egui::Ui) {
-        let sources = self.backend.search_sources();
-
-        ui.add_space(16.0);
-        page_title(ui, "Search");
-        ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new(
-                "Look for something to watch across the configured sources. Adding a result \
-                 hands it to the same engine, which streams it while it downloads.",
-            )
-            .color(theme::TEXT_DIM),
-        );
-
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            let field = ui.add(
-                egui::TextEdit::singleline(&mut self.search_query)
-                    .id(egui::Id::new("global-search"))
-                    .hint_text("title to search for\u{2026}")
-                    .desired_width(420.0),
+    /// Discover before any search: a landing page with one big, centred field.
+    fn discover_landing(&mut self, ui: &mut egui::Ui, sources: &[SourceInfo]) {
+        let width = ui.available_width().min(680.0);
+        ui.add_space(72.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                egui::RichText::new("What do you want to watch?")
+                    .size(30.0)
+                    .family(theme::semibold(ui.ctx())),
             );
-            // The shell's ⌘/Ctrl-K lands here when Discover is showing.
+            ui.add_space(8.0);
+            caption(ui, "Search every configured source for a film or series.");
+            ui.add_space(26.0);
+
+            let field = ui.add_sized(
+                [width, 46.0],
+                egui::TextEdit::singleline(&mut self.search_query)
+                    .id(egui::Id::new("discover-search"))
+                    .hint_text("Search titles\u{2026}")
+                    .font(egui::FontId::proportional(18.0))
+                    .horizontal_align(egui::Align::Center),
+            );
             if self.focus_search {
                 field.request_focus();
                 self.focus_search = false;
             }
             let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let clicked = ui.button("Search").clicked();
-            if clicked || enter {
+
+            ui.add_space(14.0);
+            let submit = ui
+                .add_sized(
+                    [150.0, 36.0],
+                    egui::Button::new(
+                        egui::RichText::new("Search")
+                            .size(14.0)
+                            .family(theme::semibold(ui.ctx())),
+                    )
+                    .fill(theme::ACCENT_DEEP)
+                    .corner_radius(theme::CONTROL_RADIUS),
+                )
+                .clicked()
+                || enter;
+            if submit {
                 self.submit_search();
             }
-            if self.searching {
-                ui.spinner();
+
+            if !sources.is_empty() {
+                ui.add_space(22.0);
+                let names: Vec<&str> = sources.iter().map(|source| source.name.as_str()).collect();
+                ui.label(
+                    egui::RichText::new(format!("Sources: {}", names.join("  \u{00b7}  ")))
+                        .size(11.0)
+                        .color(theme::TEXT_DIM),
+                );
             }
         });
+    }
 
-        // Filters. Year/season/episode are sent to the backends that understand
-        // them (ext.to does); min-seeders and sort are applied to what comes back.
+    fn search_screen(&mut self, ui: &mut egui::Ui) {
+        let sources = self.backend.search_sources();
+
+        // Before the first search, Discover is a landing page with one big,
+        // centred field. Afterwards it is a results view with compact controls.
+        if self.search_for.is_none() && !self.searching {
+            self.discover_landing(ui, &sources);
+            return;
+        }
+
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Filters:")
-                    .size(11.0)
-                    .color(theme::TEXT_DIM),
+            page_title(ui, "Discover");
+            ui.add_space(10.0);
+            let field = ui.add_sized(
+                [380.0, 30.0],
+                egui::TextEdit::singleline(&mut self.search_query)
+                    .id(egui::Id::new("discover-search"))
+                    .hint_text("Search titles\u{2026}"),
             );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.search_year)
-                    .hint_text("year")
-                    .desired_width(56.0),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.search_season)
-                    .hint_text("season")
-                    .desired_width(56.0),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.search_episode)
-                    .hint_text("episode")
-                    .desired_width(56.0),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.search_min_seeders)
-                    .hint_text("min seeders")
-                    .desired_width(84.0),
-            );
+            if self.focus_search {
+                field.request_focus();
+                self.focus_search = false;
+            }
+            let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui.button("Search").clicked() || enter {
+                self.submit_search();
+            }
+            if !self.search_hits.is_empty() {
+                ui.add_space(4.0);
+                neutral_chip(ui, &plural(self.search_hits.len(), "result"));
+            }
+        });
+        ui.add_space(8.0);
+
+        // The toolbar: filters, sort, and how results are laid out.
+        let active_filters = [
+            !self.search_year.trim().is_empty(),
+            !self.search_season.trim().is_empty(),
+            !self.search_episode.trim().is_empty(),
+            !self.search_min_seeders.trim().is_empty(),
+        ]
+        .iter()
+        .filter(|active| **active)
+        .count();
+
+        ui.horizontal(|ui| {
+            let filters_label = if active_filters > 0 {
+                format!("{}  Filters \u{00b7} {active_filters}", icons::FUNNEL)
+            } else {
+                format!("{}  Filters", icons::FUNNEL)
+            };
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new(filters_label).size(13.0))
+                        .selected(self.filters_open)
+                        .corner_radius(theme::CONTROL_RADIUS),
+                )
+                .clicked()
+            {
+                self.filters_open = !self.filters_open;
+            }
+
             egui::ComboBox::from_id_salt("search-sort")
                 .selected_text(self.search_sort.label())
                 .show_ui(ui, |ui| {
@@ -3639,48 +3922,89 @@ impl App {
                         }
                     }
                 });
+
+            if self.searching || self.search_streaming {
+                ui.spinner();
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let glyph = match self.search_layout {
+                    SearchLayout::List => icons::LIST,
+                    SearchLayout::Grid => icons::SQUARES_FOUR,
+                };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(format!(
+                                "{glyph}  {}",
+                                self.search_layout.label()
+                            ))
+                            .size(13.0),
+                        )
+                        .corner_radius(theme::CONTROL_RADIUS),
+                    )
+                    .on_hover_text("Switch between a poster grid and a compact list")
+                    .clicked()
+                {
+                    self.search_layout = match self.search_layout {
+                        SearchLayout::Grid => SearchLayout::List,
+                        SearchLayout::List => SearchLayout::Grid,
+                    };
+                    // Row heights are not interchangeable between layouts.
+                    self.search_work_heights.clear();
+                }
+            });
         });
 
-        ui.add_space(6.0);
-        if sources.is_empty() {
-            ui.colored_label(theme::WARN, "No search sources are configured.");
-        } else {
-            let names: Vec<String> = sources
-                .iter()
-                .map(|source| {
-                    if source.configured {
-                        source.name.clone()
-                    } else {
-                        format!("{} (disabled)", source.name)
-                    }
-                })
-                .collect();
-            ui.label(
-                egui::RichText::new(format!("Sources: {}", names.join(", ")))
-                    .size(11.0)
-                    .color(theme::TEXT_DIM),
-            );
+        // Expanded filter fields.
+        if self.filters_open {
+            ui.add_space(6.0);
+            egui::Frame::new()
+                .fill(theme::SURFACE)
+                .corner_radius(theme::CONTROL_RADIUS)
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        labelled_field(ui, "Year", &mut self.search_year, 66.0);
+                        labelled_field(ui, "Season", &mut self.search_season, 66.0);
+                        labelled_field(ui, "Episode", &mut self.search_episode, 66.0);
+                        labelled_field(ui, "Min seeders", &mut self.search_min_seeders, 84.0);
+                        ui.add_space(4.0);
+                        if ghost_button(ui, "Clear").clicked() {
+                            self.search_year.clear();
+                            self.search_season.clear();
+                            self.search_episode.clear();
+                            self.search_min_seeders.clear();
+                        }
+                    });
+                });
         }
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if sources.is_empty() {
+                ui.colored_label(theme::WARN, "No search sources are configured.");
+            } else {
+                for source in &sources {
+                    let color = if source.configured {
+                        theme::OK
+                    } else {
+                        theme::TEXT_DIM
+                    };
+                    chip(ui, &source.name, color);
+                    if !source.configured {
+                        caption(ui, "disabled");
+                    }
+                }
+            }
+        });
 
         if let Some(note) = self.search_note.clone() {
             ui.add_space(4.0);
             ui.label(egui::RichText::new(note).size(11.5).color(theme::TEXT_DIM));
         }
 
-        // A paginating source keeps sending pages; say so while they arrive.
-        if self.search_streaming {
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(
-                    egui::RichText::new("finding more\u{2026}")
-                        .size(11.0)
-                        .color(theme::TEXT_DIM),
-                );
-            });
-        }
-
-        ui.add_space(12.0);
+        ui.add_space(10.0);
 
         // Everything below is derived from the hits, and deriving it is not
         // cheap: every release name is parsed, every hit's metadata is cloned,
@@ -3704,32 +4028,62 @@ impl App {
         };
 
         if view.shown.is_empty() {
-            let (text, color) = if self.search_failed {
-                (
-                    "The search failed \u{2014} see the message above.",
-                    theme::WARN,
-                )
+            let (title, body) = if self.search_failed {
+                ("The search failed", "Check the message above and try again.")
             } else if self.search_for.is_some() && !self.search_hits.is_empty() {
-                ("No results match the current filters.", theme::TEXT_DIM)
+                (
+                    "No results match the filters",
+                    "Clear a filter or widen the seeders minimum.",
+                )
             } else if self.search_for.is_some() {
-                ("Nothing matched.", theme::TEXT_DIM)
+                (
+                    "Nothing matched",
+                    "Try another spelling, a year, or a different source.",
+                )
             } else {
-                ("Results will appear here.", theme::TEXT_DIM)
+                (
+                    "Search for something to watch",
+                    "Type a title in the search field above and press Enter.",
+                )
             };
-            ui.label(egui::RichText::new(text).color(color));
             self.search_view = Some(view);
+            empty_state(ui, title, body);
             return;
         }
 
-        // Discover lists one row per title; selecting one pushes the Result
-        // view. Only the rows on screen are laid out, and each row's measured
-        // height is reserved for the ones scrolled past.
+        // Selecting a row or card pushes the Result view. Only what is on
+        // screen is laid out; measured heights are reserved for the rest.
         let mut open: Option<String> = None;
-        let mut heights = std::mem::take(&mut self.search_work_heights);
-        virtual_list(ui, view.works.len(), &mut heights, |ui, index| {
-            self.search_work_row(ui, &view.works[index], &mut open);
-        });
-        self.search_work_heights = heights;
+        match self.search_layout {
+            SearchLayout::Grid => {
+                const CARD_W: f32 = 168.0;
+                const CARD_H: f32 = 252.0;
+                const GAP: f32 = 14.0;
+                let available = ui.available_width();
+                let per_row = (((available + GAP) / (CARD_W + GAP)).floor() as usize).max(1);
+                let rows = view.works.len().div_ceil(per_row);
+                let mut heights = std::mem::take(&mut self.search_work_heights);
+                virtual_list(ui, rows, &mut heights, |ui, row| {
+                    ui.horizontal(|ui| {
+                        for work in view.works.iter().skip(row * per_row).take(per_row) {
+                            let hit = self.card(ui, work, CARD_W, CARD_H);
+                            if hit.double_clicked || hit.clicked {
+                                open = Some(work.key.clone());
+                            }
+                            ui.add_space(GAP);
+                        }
+                    });
+                });
+                self.search_work_heights = heights;
+            }
+            SearchLayout::List => {
+                let mut heights = std::mem::take(&mut self.search_work_heights);
+                virtual_list(ui, view.works.len(), &mut heights, |ui, index| {
+                    self.search_work_row(ui, &view.works[index], &mut open);
+                });
+                self.search_work_heights = heights;
+            }
+        }
         // Anchor the Result view on a member hit, which survives the work's
         // identity changing as metadata lands.
         let anchor = open.as_deref().and_then(|key| {
@@ -3752,7 +4106,7 @@ impl App {
     /// opens the Result view rather than expanding in place.
     fn search_work_row(&mut self, ui: &mut egui::Ui, work: &Work, open: &mut Option<String>) {
         let (rect, response) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 88.0), Sense::click());
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 96.0), Sense::click());
         // Expose the row as one labelled button: its text is painted, so
         // without this it would be invisible to AccessKit (and to the tests).
         response.widget_info(|| {
@@ -3783,7 +4137,7 @@ impl App {
         let pad = 12.0;
         let poster = Rect::from_min_size(
             egui::pos2(rect.left() + pad, rect.top() + 10.0),
-            Vec2::new(46.0, 69.0),
+            Vec2::new(51.0, 76.0),
         );
         Self::paint_art(
             ui,
@@ -3798,28 +4152,26 @@ impl App {
         // centred, and a child Ui would sit on top of the row and steal its
         // hover. The painter gives exact, left-aligned text with nothing
         // interactive in the way.
-        let text_left = poster.right() + 12.0;
-        painter.text(
-            egui::pos2(text_left, rect.top() + 10.0),
-            egui::Align2::LEFT_TOP,
+        let text_left = poster.right() + 14.0;
+        let galley = painter.layout_no_wrap(
             reel_core::title::truncate(&work.heading(), 70),
-            egui::FontId::proportional(15.0),
+            egui::FontId::new(15.5, theme::semibold(ui.ctx())),
             theme::TEXT,
         );
+        painter.galley(egui::pos2(text_left, rect.top() + 12.0), galley, theme::TEXT);
 
-        let mut facts = Vec::new();
+        // A pill row: kind, rating, runtime, quality, release count.
+        let mut pills: Vec<(String, Color32)> = Vec::new();
+        pills.push((
+            if work.is_series() { "Series" } else { "Film" }.to_string(),
+            theme::ACCENT,
+        ));
         if let Some(metadata) = work.metadata.as_ref() {
             if let Some(rating) = display_rating(metadata) {
-                facts.push(format!("\u{2605} {rating:.1}/10"));
+                pills.push((format!("{} {rating:.1}", icons::STAR), theme::WARN));
             }
             if let Some(runtime) = metadata.runtime_label() {
-                facts.push(runtime);
-            }
-        }
-        facts.push(if work.is_series() { "Series" } else { "Film" }.to_string());
-        if let Some(metadata) = work.metadata.as_ref() {
-            if !metadata.genres.is_empty() {
-                facts.push(metadata.genres.join(", "));
+                pills.push((runtime, theme::TEXT_DIM));
             }
         }
         if let Some(best) = work
@@ -3828,27 +4180,42 @@ impl App {
             .max_by_key(|member| member.entry.release.attributes.quality_rank())
         {
             let quality = best.attributes().quality_label();
-            if !quality.is_empty() {
-                facts.push(quality);
+            if !quality.is_empty() && quality != "quality unknown" {
+                pills.push((quality, theme::TEXT));
             }
         }
-        facts.push(plural(work.torrent_count(), "release"));
-        painter.text(
-            egui::pos2(text_left, rect.top() + 34.0),
-            egui::Align2::LEFT_TOP,
-            reel_core::title::truncate(&facts.join("   \u{2022}   "), 96),
-            egui::FontId::proportional(11.0),
-            theme::TEXT_DIM,
-        );
+        pills.push((plural(work.torrent_count(), "release"), theme::TEXT_DIM));
 
-        if let Some(overview) = work.metadata.as_ref().and_then(|m| m.overview.as_deref()) {
-            painter.text(
-                egui::pos2(text_left, rect.top() + 54.0),
-                egui::Align2::LEFT_TOP,
-                reel_core::title::truncate(overview, 120),
-                egui::FontId::proportional(11.0),
-                theme::TEXT_DIM,
+        let mut x = text_left;
+        let pill_y = rect.top() + 40.0;
+        for (text, color) in pills {
+            let r = Self::paint_pill(
+                ui,
+                egui::pos2(x, pill_y),
+                &text,
+                color,
+                theme::SURFACE_RAISED,
             );
+            x = r.right() + 6.0;
+        }
+
+        if let Some(metadata) = work.metadata.as_ref() {
+            let mut line = metadata.genres.join(" \u{00b7} ");
+            if let Some(overview) = metadata.overview.as_deref() {
+                if !line.is_empty() {
+                    line.push_str("   \u{00b7}   ");
+                }
+                line.push_str(overview);
+            }
+            if !line.is_empty() {
+                painter.text(
+                    egui::pos2(text_left, rect.top() + 64.0),
+                    egui::Align2::LEFT_TOP,
+                    reel_core::title::truncate(&line, 110),
+                    egui::FontId::proportional(11.0),
+                    theme::TEXT_DIM,
+                );
+            }
         }
 
         if response.clicked() {
@@ -3927,8 +4294,12 @@ impl App {
                                 .add_enabled(
                                     can_play && pending.is_none(),
                                     egui::Button::new(
-                                        egui::RichText::new("\u{25b6}  Play best").size(14.0),
+                                        egui::RichText::new(format!("{}  Play best", icons::PLAY))
+                                            .size(14.0)
+                                            .family(theme::semibold(ui.ctx())),
                                     )
+                                    .fill(theme::ACCENT_DEEP)
+                                    .corner_radius(theme::CONTROL_RADIUS)
                                     .min_size(Vec2::new(ui.available_width(), 34.0)),
                                 )
                                 .on_hover_text("Add and play the best release of this title")
@@ -4022,16 +4393,13 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(&name)
-                        .size(12.0)
-                        .strong()
-                        .color(theme::TEXT_DIM),
+                        .size(13.0)
+                        .family(theme::semibold(ui.ctx()))
+                        .color(theme::TEXT),
                 );
-                ui.label(
-                    egui::RichText::new(format!("{}", indices.len()))
-                        .size(11.0)
-                        .color(theme::TEXT_DIM),
-                );
+                neutral_chip(ui, &plural(indices.len(), "release"));
             });
+            ui.add_space(2.0);
 
             // `shown` is already in the chosen order, and an index is its
             // position in `shown`, so ascending index is the sorted order.
@@ -4410,6 +4778,14 @@ fn search_action_indicator(ui: &mut egui::Ui, phase: SearchActionPhase) {
 ///
 /// `heights` is kept by the caller (and survives between frames) so that a card
 /// scrolled off screen is still accounted for.
+/// A labelled text field, for the expanded filter row.
+fn labelled_field(ui: &mut egui::Ui, label: &str, value: &mut String, width: f32) {
+    ui.vertical(|ui| {
+        ui.label(egui::RichText::new(label).size(10.5).color(theme::TEXT_DIM));
+        ui.add_sized([width, 24.0], egui::TextEdit::singleline(value));
+    });
+}
+
 fn virtual_list(
     ui: &mut egui::Ui,
     len: usize,
@@ -4522,7 +4898,7 @@ fn resolution_category(resolution: Option<&str>) -> (i64, String) {
         720 => "720p",
         576 => "576p",
         480 => "480p",
-        _ => "Quality unknown",
+        _ => "Other",
     };
     (-i64::from(rank), name.to_string())
 }
@@ -4535,7 +4911,7 @@ fn member_resolution(member: &WorkMember) -> String {
         .attributes
         .resolution
         .clone()
-        .unwrap_or_else(|| "Quality unknown".to_string())
+        .unwrap_or_else(|| "Unknown".to_string())
 }
 
 /// Whether a release is a whole-season pack rather than a single episode.
@@ -5275,10 +5651,12 @@ impl App {
             )
         });
         // Resting the pointer on the controls keeps them up, even with no
-        // movement, using the rect they occupied last frame.
-        let hovering_controls = self.player_controls_rect.is_some_and(|rect| {
-            rect.contains(ctx.input(|i| i.pointer.hover_pos()).unwrap_or_default())
-        });
+        // movement, using the rects they occupied last frame.
+        let hover = ctx.input(|i| i.pointer.hover_pos()).unwrap_or_default();
+        let hovering_controls = self
+            .player_controls_rect
+            .is_some_and(|rect| rect.contains(hover))
+            || self.player_topbar_rect.is_some_and(|rect| rect.contains(hover));
         let activity = ctx.input(|i| {
             i.pointer.delta() != Vec2::ZERO || i.pointer.any_down() || i.pointer.any_click()
         }) || space
@@ -5344,43 +5722,49 @@ impl App {
         let mut toggle_help = false;
         let up_next = self.up_next(info.torrent_id, info.file_id);
 
-        // The top bar stays up: it is how you get back, what you are watching,
-        // and where Up next lives. Only the transport controls fade.
-        egui::Panel::top("player-bar")
-            .frame(
-                egui::Frame::NONE
-                    .fill(theme::SURFACE)
-                    .inner_margin(egui::Margin::symmetric(14, 8)),
-            )
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("\u{2b05}  Back").clicked() {
-                        self.leave_player();
-                    }
-                    ui.label(egui::RichText::new(&info.title).size(15.0).strong());
+        // The top bar is the header of the OSD: Back, what is playing, and Up
+        // next. In fullscreen it fades with the transport controls so the video
+        // is clean; in a window it stays, so there is always a way back.
+        if show_chrome || !self.player.is_fullscreen() {
+            let panel = egui::Panel::top("player-bar")
+                .frame(
+                    egui::Frame::NONE
+                        .fill(theme::SURFACE)
+                        .inner_margin(egui::Margin::symmetric(14, 8)),
+                )
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("\u{2b05}  Back").clicked() {
+                            self.leave_player();
+                        }
+                        ui.label(egui::RichText::new(&info.title).size(15.0).strong());
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let label = match self.player.backend() {
-                            Some(reel_player::Backend::Embedded) => "libmpv (embedded)",
-                            Some(reel_player::Backend::External) => "external player",
-                            _ => "unknown backend",
-                        };
-                        ui.label(egui::RichText::new(label).size(11.0).color(theme::TEXT_DIM));
-                        if ui.button("?").on_hover_text("Keyboard shortcuts").clicked() {
-                            toggle_help = true;
-                        }
-                        if let Some((tid, fid, next)) = &up_next {
-                            if ui
-                                .button(format!("\u{25b6}  Up next: {next}"))
-                                .on_hover_text("Play the next episode")
-                                .clicked()
-                            {
-                                play_next = Some((*tid, *fid));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let label = match self.player.backend() {
+                                Some(reel_player::Backend::Embedded) => "libmpv (embedded)",
+                                Some(reel_player::Backend::External) => "external player",
+                                _ => "unknown backend",
+                            };
+                            ui.label(egui::RichText::new(label).size(11.0).color(theme::TEXT_DIM));
+                            if ui.button("?").on_hover_text("Keyboard shortcuts").clicked() {
+                                toggle_help = true;
                             }
-                        }
+                            if let Some((tid, fid, next)) = &up_next {
+                                if ui
+                                    .button(format!("\u{25b6}  Up next: {next}"))
+                                    .on_hover_text("Play the next episode")
+                                    .clicked()
+                                {
+                                    play_next = Some((*tid, *fid));
+                                }
+                            }
+                        });
                     });
                 });
-            });
+            self.player_topbar_rect = Some(panel.response.rect);
+        } else {
+            self.player_topbar_rect = None;
+        }
 
         // External players own their window: explain rather than show a void.
         if self.player.backend() == Some(reel_player::Backend::External) {
@@ -5516,38 +5900,34 @@ impl App {
         Some((variant.torrent_id, variant.file_id, next.code()))
     }
 
-    /// A resumed stream that never yields a frame is worse than a re-fetch.
+    /// Recover a genuinely wedged picture.
     ///
-    /// The cached-resume path is the one that has been seen to stall; a fresh
-    /// add always plays. So after a few seconds with no frame, re-add the
-    /// stream from scratch once and reopen the player on the new URL.
+    /// Only when the player is loaded and supposedly playing, the picture *and*
+    /// the playback clock are both frozen, nothing is buffering, and the torrent
+    /// is not delivering bytes. A slow torrent, a seek, a rebuffer and a still
+    /// scene all look "not advancing" for a while, but none of them satisfies
+    /// all of those at once, so they are left alone.
     fn maybe_recover_stalled_stream(&mut self) {
-        // A paused player, one that reached the end, or one waiting for the
-        // demuxer cache to refill is not stalled. A big seek into a large file
-        // is exactly that, and treating it as a wedge is what made playback
-        // appear to restart from scratch. A recent seek also gets time to
-        // buffer before we consider it wedged.
         let state = self.player.state();
-        if state.paused || state.eof || state.paused_for_cache {
-            self.player_progress_at = Instant::now();
-            return;
-        }
-        if self.player.seeked_within(Duration::from_secs(20)) {
-            self.player_progress_at = Instant::now();
+        let busy = stream_looks_busy(&state);
+        let fetching = self.stream_is_fetching();
+        let frames = self.player.frames_uploaded();
+        let recent_seek = self.player.seeked_within(Duration::from_secs(20));
+
+        if !playback_is_wedged(
+            busy,
+            fetching,
+            frames,
+            self.player_last_frames,
+            state.position,
+            self.player_progress_position,
+            recent_seek,
+        ) {
+            self.note_player_progress(&state);
             return;
         }
 
-        // Frames advancing means it is playing. No new frames for eight seconds
-        // means it is wedged — which is what the log showed: the server had
-        // megabytes queued and mpv had stopped reading them.
-        let frames = self.player.frames_uploaded();
-        if frames != self.player_last_frames {
-            self.player_last_frames = frames;
-            self.player_progress_at = Instant::now();
-            self.stream_recovered = false;
-            return;
-        }
-        if self.stream_recovered || self.player_progress_at.elapsed() < Duration::from_secs(8) {
+        if self.stream_recovered || self.player_progress_at.elapsed() < Duration::from_secs(15) {
             return;
         }
         let Some(info) = self.player.current().cloned() else {
@@ -5558,7 +5938,8 @@ impl App {
             torrent_id = info.torrent_id,
             file_id = info.file_id,
             frames,
-            "no new frames for 8s; rebuilding the stream and the player"
+            position = state.position,
+            "playback clock frozen; rebuilding the stream and the player"
         );
         // A wedged picture is as likely to be the decoder as the fetch, so the
         // core is dropped too; the next play builds a fresh one.
@@ -5567,6 +5948,24 @@ impl App {
         self.backend
             .restart_stream(info.torrent_id, &[info.file_id]);
         self.set_toast("Reconnecting the stream\u{2026}", false);
+    }
+
+    /// Record that playback is still progressing, so the stall watchdog starts
+    /// its window afresh.
+    fn note_player_progress(&mut self, state: &reel_player::PlayerState) {
+        self.player_last_frames = self.player.frames_uploaded();
+        self.player_progress_position = state.position;
+        self.player_progress_at = Instant::now();
+        self.stream_recovered = false;
+    }
+
+    /// Whether the engine is still delivering bytes for what is playing.
+    fn stream_is_fetching(&self) -> bool {
+        let Some(info) = self.player.current() else {
+            return false;
+        };
+        self.item(info.torrent_id)
+            .is_some_and(|item| item.torrent.stats.download_bps > 0)
     }
 
     /// Leave the player, saving where we got to.
@@ -5590,8 +5989,11 @@ impl App {
 
         self.player.close();
         self.player_last_frames = 0;
+        self.player_progress_position = 0.0;
         self.player_progress_at = Instant::now();
         self.stream_recovered = false;
+        self.player_controls_rect = None;
+        self.player_topbar_rect = None;
         self.watch_recording_for = None;
         self.watch_last_recorded = 0.0;
         // The trail still points at wherever the player was opened from.
@@ -5621,6 +6023,68 @@ mod tests {
 
     fn app() -> App {
         App::new(Box::new(crate::backend::FakeBackend::new(sample_library())))
+    }
+
+    #[test]
+    fn a_slow_or_buffering_stream_is_not_a_wedge() {
+        use reel_player::PlayerState;
+
+        // Loading: no file yet, core idle.
+        let loading = PlayerState {
+            loaded: false,
+            idle: true,
+            ..Default::default()
+        };
+        assert!(stream_looks_busy(&loading));
+        assert!(!playback_is_wedged(true, false, 0, 0, 0.0, 0.0, false));
+
+        // Rebuffering mid-play: paused-for-cache.
+        let buffering = PlayerState {
+            loaded: true,
+            paused_for_cache: true,
+            buffering_percent: Some(20.0),
+            ..Default::default()
+        };
+        assert!(stream_looks_busy(&buffering));
+
+        // Cache draining but core busy: still buffering.
+        let draining = PlayerState {
+            loaded: true,
+            buffering_percent: Some(50.0),
+            ..Default::default()
+        };
+        assert!(stream_looks_busy(&draining));
+
+        // Playing normally: not busy, but the clock is moving.
+        let playing = PlayerState {
+            loaded: true,
+            position: 12.0,
+            ..Default::default()
+        };
+        assert!(!stream_looks_busy(&playing));
+        assert!(!playback_is_wedged(
+            false, false, 100, 100, 12.0, 10.0, false
+        ));
+
+        // A still scene holds the picture but the clock still moves.
+        assert!(!playback_is_wedged(
+            false, false, 100, 100, 12.0, 10.0, false
+        ));
+
+        // A slow torrent still delivering bytes is never a wedge.
+        assert!(!playback_is_wedged(
+            false, true, 100, 100, 10.0, 10.0, false
+        ));
+
+        // A seek still buffering is not a wedge.
+        assert!(!playback_is_wedged(
+            false, false, 100, 100, 10.0, 10.0, true
+        ));
+
+        // Nothing moving, nothing buffering, no bytes: a wedge.
+        assert!(playback_is_wedged(
+            false, false, 100, 100, 10.0, 10.0, false
+        ));
     }
 
     #[test]

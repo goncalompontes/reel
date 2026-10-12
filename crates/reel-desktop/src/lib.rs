@@ -7,6 +7,7 @@
 
 pub mod backend;
 pub mod components;
+pub mod icons;
 pub mod player;
 pub mod testing;
 pub mod theme;

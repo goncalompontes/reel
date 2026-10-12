@@ -20,10 +20,14 @@ use reel_desktop::{App, Screen};
 
 /// A harness around the real app with the given library.
 fn harness(items: Vec<reel_desktop::LibraryItem>) -> Harness<'static, App> {
+    // Install the theme once, exactly as the binary does, so fonts and icons
+    // render the same way the shipped app draws them.
+    let installed = std::sync::Once::new();
     Harness::builder()
         .with_size((1280.0, 1000.0))
         .build_ui_state(
             move |ui, app: &mut App| {
+                installed.call_once(|| reel_desktop::install(ui.ctx()));
                 let mut frame = eframe::Frame::_new_kittest();
                 eframe::App::ui(app, ui, &mut frame);
             },
@@ -252,4 +256,49 @@ fn the_remove_dialog_closes_when_you_navigate_away() {
 fn snapshot_paused_pack() {
     let mut harness = with_paused_pack();
     harness.snapshot("paused-pack");
+}
+
+/// Discover: the filters hide behind a button, and the layout toggles between a
+/// poster grid and a compact list.
+#[test]
+fn discover_filters_open_and_layout_toggles() {
+    let mut harness = harness(sample_library());
+    harness.run_steps(3);
+    harness.state_mut().go_to(Screen::Discover);
+    harness.state_mut().set_search_query("a");
+    harness.state_mut().submit_search();
+    harness.run_steps(3);
+    assert_eq!(harness.state().search_result_count(), 2);
+
+    // The filter fields are hidden until the Filters button is clicked.
+    assert!(
+        harness.query_all_by_label_contains("Year").next().is_none(),
+        "filters start collapsed"
+    );
+    harness
+        .get_all_by_label_contains("Filters")
+        .next()
+        .expect("a Filters button")
+        .click();
+    harness.run_steps(2);
+    assert!(
+        harness.query_all_by_label_contains("Year").next().is_some(),
+        "opening Filters reveals its fields"
+    );
+
+    // The layout control flips the results from a grid to a list.
+    assert!(
+        harness.query_all_by_label_contains("Grid").next().is_some(),
+        "the default layout is a grid"
+    );
+    harness
+        .get_all_by_label_contains("Grid")
+        .next()
+        .expect("the layout toggle")
+        .click();
+    harness.run_steps(2);
+    assert!(
+        harness.query_all_by_label_contains("List").next().is_some(),
+        "the toggle switches to a list"
+    );
 }

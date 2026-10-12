@@ -1,6 +1,7 @@
-//! Visual identity: palette, generated artwork, and egui style setup.
+//! Visual identity: palette, typography, generated artwork, and egui style
+//! setup.
 
-use egui::{Color32, CornerRadius, Stroke};
+use egui::{Color32, CornerRadius, Rect, Shape, Stroke, epaint::Mesh, epaint::Vertex, pos2};
 
 pub const BG: Color32 = Color32::from_rgb(0x0b, 0x0c, 0x11);
 pub const SURFACE: Color32 = Color32::from_rgb(0x15, 0x17, 0x1f);
@@ -14,11 +15,38 @@ pub const OK: Color32 = Color32::from_rgb(0x54, 0xd1, 0x8a);
 pub const WARN: Color32 = Color32::from_rgb(0xf2, 0xb5, 0x4b);
 pub const DANGER: Color32 = Color32::from_rgb(0xf2, 0x6d, 0x6d);
 
+// --- radii ---------------------------------------------------------------
+
 pub const CARD_RADIUS: CornerRadius = CornerRadius::same(10);
 pub const PANEL_RADIUS: CornerRadius = CornerRadius::same(14);
+/// A small pill, for chips and badges.
+pub const CHIP_RADIUS: CornerRadius = CornerRadius::same(255);
+/// Small controls (buttons inside rows).
+pub const CONTROL_RADIUS: CornerRadius = CornerRadius::same(7);
 
-/// Install the dark theme.
+// --- typography ----------------------------------------------------------
+
+/// The name of the semibold family (`Montserrat-SemiBold`), used for titles.
+pub const SEMIBOLD: &str = "montserrat-semibold";
+
+/// The family a heading should use for real weight.
+///
+/// Fonts take effect at the start of the *next* pass after `set_fonts`, so a
+/// view drawn before [`apply`] has run falls back to the proportional family
+/// rather than panicking on an unbound family.
+pub fn semibold(ctx: &egui::Context) -> egui::FontFamily {
+    let name = egui::FontFamily::Name(SEMIBOLD.into());
+    if ctx.fonts(|fonts| fonts.definitions().families.contains_key(&name)) {
+        name
+    } else {
+        egui::FontFamily::Proportional
+    }
+}
+
+/// Install the dark theme, the fonts, and the icon set.
 pub fn apply(ctx: &egui::Context) {
+    install_fonts(ctx);
+
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = BG;
     visuals.window_fill = SURFACE;
@@ -44,6 +72,155 @@ pub fn apply(ctx: &egui::Context) {
         style.spacing.button_padding = egui::vec2(12.0, 7.0);
         style.spacing.window_margin = egui::Margin::same(14);
     });
+}
+
+/// The font family name for ordinary text.
+const TEXT_FONT: &str = "montserrat";
+
+fn install_fonts(ctx: &egui::Context) {
+    ctx.set_fonts(font_definitions());
+}
+
+/// Build the font stack: Montserrat for text, Phosphor for icons, egui's
+/// defaults as a last-resort fallback.
+fn font_definitions() -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+
+    // Montserrat first, so it wins for ordinary text; egui's defaults stay after
+    // it as a fallback for anything it lacks.
+    fonts.font_data.insert(
+        TEXT_FONT.to_owned(),
+        egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/Montserrat-Regular.ttf"
+        ))
+        .into(),
+    );
+    if let Some(keys) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        keys.insert(0, TEXT_FONT.to_owned());
+    } else {
+        fonts
+            .families
+            .insert(egui::FontFamily::Proportional, vec![TEXT_FONT.to_owned()]);
+    }
+
+    // Icons ride along as a proportional fallback, ahead of egui's own symbol
+    // and emoji fonts (which also claim Private Use codepoints).
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    if let Some(keys) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        if let Some(position) = keys.iter().position(|key| key == "phosphor") {
+            let phosphor = keys.remove(position);
+            keys.insert(1, phosphor);
+        }
+    }
+
+    // The whole app is Montserrat, including the spots that ask for a monospace
+    // font, so nothing renders in a different typeface.
+    if let Some(keys) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+        keys.retain(|key| key != TEXT_FONT && key != "phosphor");
+        keys.insert(0, TEXT_FONT.to_owned());
+        keys.insert(1, "phosphor".to_owned());
+    }
+
+    // A real semibold family for headings, built from the final proportional
+    // order so icons resolve inside headings too.
+    fonts.font_data.insert(
+        SEMIBOLD.to_owned(),
+        egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/Montserrat-SemiBold.ttf"
+        ))
+        .into(),
+    );
+    let mut semibold_keys = fonts
+        .families
+        .get(&egui::FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    semibold_keys.remove(0); // drop the regular; SemiBold replaces it
+    semibold_keys.insert(0, SEMIBOLD.to_owned());
+    fonts
+        .families
+        .insert(egui::FontFamily::Name(SEMIBOLD.into()), semibold_keys);
+
+    fonts
+}
+
+/// A vertical gradient scrim over the lower part of a poster, with the bottom
+/// corners rounded to match the card.
+///
+/// Painting a mesh keeps the falloff smooth; the mesh's left/right edge follows
+/// the corner arc over the last `radius` pixels so the gradient ends in the
+/// same rounded corners as the artwork rather than square ones.
+pub fn paint_scrim(painter: &egui::Painter, rect: Rect, radius: CornerRadius, strength: u8) {
+    let radius = radius.nw as f32;
+    let bottom_color = Color32::from_black_alpha(strength);
+    let top_color = Color32::TRANSPARENT;
+
+    // Sample densely through the corner arc and coarsely above it, so the mesh
+    // edge follows the rounded corner instead of cutting a straight chord (which
+    // would leave a sliver of artwork showing at each bottom corner).
+    let corner = radius.min(rect.height());
+    let straight = (rect.height() - corner).max(0.0);
+    let mut samples: Vec<f32> = vec![rect.top()];
+    let coarse = ((straight / 24.0).ceil() as usize).max(1);
+    for i in 1..=coarse {
+        samples.push(rect.top() + straight * i as f32 / coarse as f32);
+    }
+    let mut y = rect.bottom() - corner;
+    while y < rect.bottom() {
+        y = (y + 1.0).min(rect.bottom());
+        if samples.last().is_none_or(|last| y - last >= 0.5) {
+            samples.push(y);
+        }
+    }
+    if samples.last().copied() != Some(rect.bottom()) {
+        samples.push(rect.bottom());
+    }
+
+    let uv = egui::epaint::WHITE_UV;
+    let mut mesh = Mesh::default();
+    for y in &samples {
+        let dy = (rect.bottom() - y).max(0.0);
+        let inset = if dy < radius {
+            radius
+                - (radius * radius - (radius - dy) * (radius - dy))
+                    .max(0.0)
+                    .sqrt()
+        } else {
+            0.0
+        };
+        let t = (y - rect.top()) / rect.height().max(1.0);
+        let color = lerp_color(top_color, bottom_color, t);
+        mesh.vertices.push(Vertex {
+            pos: pos2(rect.left() + inset, *y),
+            uv,
+            color,
+        });
+        mesh.vertices.push(Vertex {
+            pos: pos2(rect.right() - inset, *y),
+            uv,
+            color,
+        });
+    }
+    for i in 0..samples.len().saturating_sub(1) {
+        let a = (i * 2) as u32;
+        let b = a + 1;
+        let c = a + 2;
+        let d = a + 3;
+        mesh.indices.extend_from_slice(&[a, b, c, c, b, d]);
+    }
+
+    painter.add(Shape::mesh(mesh));
+}
+
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgba_unmultiplied(
+        lerp(a.r(), b.r()),
+        lerp(a.g(), b.g()),
+        lerp(a.b(), b.b()),
+        lerp(a.a(), b.a()),
+    )
 }
 
 /// Deterministic artwork colour for a title.
@@ -127,5 +304,26 @@ mod tests {
         assert_eq!(hsv_to_rgb(0.0, 1.0, 1.0), Color32::from_rgb(255, 0, 0));
         assert_eq!(hsv_to_rgb(120.0, 1.0, 1.0), Color32::from_rgb(0, 255, 0));
         assert_eq!(hsv_to_rgb(240.0, 1.0, 1.0), Color32::from_rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn montserrat_precedes_the_icon_font_and_is_used_for_monospace_too() {
+        let fonts = font_definitions();
+        let keys = &fonts.families[&egui::FontFamily::Proportional];
+        assert_eq!(keys.first().map(String::as_str), Some("montserrat"));
+        let phosphor = keys.iter().position(|key| key == "phosphor").unwrap();
+        let emoji = keys
+            .iter()
+            .position(|key| key == "emoji-icon-font")
+            .unwrap();
+        assert!(
+            phosphor < emoji,
+            "Phosphor must win Private Use codepoints: {keys:?}"
+        );
+
+        // The monospace slots use Montserrat too.
+        let mono = &fonts.families[&egui::FontFamily::Monospace];
+        assert_eq!(mono.first().map(String::as_str), Some("montserrat"));
+        assert!(mono.iter().any(|key| key == "phosphor"));
     }
 }

@@ -17,23 +17,26 @@ use reel_desktop::{App, Screen};
 
 /// Build a harness around the real app, with the sample library.
 fn harness_with(app: App) -> Harness<'static, App> {
+    harness_with_size(app, (1280.0, 820.0))
+}
+
+/// The same, at a chosen window size (some snapshots want the whole list).
+fn harness_with_size(app: App, size: (f32, f32)) -> Harness<'static, App> {
     // Each Harness has its own egui Context, so the image loaders have to be
     // installed per harness. Skipping this is silent: artwork never loads and
     // the generated fallback is drawn instead.
     let installed = std::sync::Once::new();
 
-    Harness::builder()
-        .with_size((1280.0, 820.0))
-        .build_ui_state(
-            move |ui, app: &mut App| {
-                installed.call_once(|| reel_desktop::install(ui.ctx()));
-                // eframe hands the app a `Frame`; this is the supported way to
-                // fabricate one for tests.
-                let mut frame = eframe::Frame::_new_kittest();
-                eframe::App::ui(app, ui, &mut frame);
-            },
-            app,
-        )
+    Harness::builder().with_size(size).build_ui_state(
+        move |ui, app: &mut App| {
+            installed.call_once(|| reel_desktop::install(ui.ctx()));
+            // eframe hands the app a `Frame`; this is the supported way to
+            // fabricate one for tests.
+            let mut frame = eframe::Frame::_new_kittest();
+            eframe::App::ui(app, ui, &mut frame);
+        },
+        app,
+    )
 }
 
 fn harness() -> Harness<'static, App> {
@@ -274,6 +277,16 @@ fn search_finds_results_and_can_add_one() {
     );
 }
 
+/// Discover before any search: the big centred field.
+#[test]
+fn snapshot_discover_landing() {
+    let mut harness = harness();
+    harness.run_steps(3);
+    harness.state_mut().go_to(Screen::Discover);
+    harness.run_steps(3);
+    harness.snapshot("discover");
+}
+
 /// Renders the search screen with results in it.
 #[test]
 fn snapshot_search() {
@@ -400,15 +413,10 @@ fn snapshot_season_pack() {
 
     // Taller than the default so the whole episode list is in the snapshot; the
     // point of this one is that every episode row is visible at once.
-    let mut harness = Harness::builder()
-        .with_size((1280.0, 1150.0))
-        .build_ui_state(
-            |ui, app: &mut App| {
-                let mut frame = eframe::Frame::_new_kittest();
-                eframe::App::ui(app, ui, &mut frame);
-            },
-            App::new(Box::new(FakeBackend::new(items))),
-        );
+    let mut harness = harness_with_size(
+        App::new(Box::new(FakeBackend::new(items))),
+        (1280.0, 1150.0),
+    );
     harness.run_steps(3);
 
     // What pressing play on episode 2 does.
@@ -436,15 +444,10 @@ fn snapshot_season_pack_with_duplicates() {
     copy.entry.release.attributes.resolution = Some("2160p".into());
     items.push(copy);
 
-    let mut harness = Harness::builder()
-        .with_size((1280.0, 1000.0))
-        .build_ui_state(
-            |ui, app: &mut App| {
-                let mut frame = eframe::Frame::_new_kittest();
-                eframe::App::ui(app, ui, &mut frame);
-            },
-            App::new(Box::new(FakeBackend::new(items))),
-        );
+    let mut harness = harness_with_size(
+        App::new(Box::new(FakeBackend::new(items))),
+        (1280.0, 1000.0),
+    );
     harness.run_steps(3);
     harness.state_mut().open_work(11);
     harness.run_steps(3);
@@ -458,15 +461,10 @@ fn snapshot_two_season_pack() {
     let mut items = sample_library();
     items.push(reel_desktop::testing::sample_two_season_pack());
 
-    let mut harness = Harness::builder()
-        .with_size((1280.0, 1150.0))
-        .build_ui_state(
-            |ui, app: &mut App| {
-                let mut frame = eframe::Frame::_new_kittest();
-                eframe::App::ui(app, ui, &mut frame);
-            },
-            App::new(Box::new(FakeBackend::new(items))),
-        );
+    let mut harness = harness_with_size(
+        App::new(Box::new(FakeBackend::new(items))),
+        (1280.0, 1150.0),
+    );
     harness.state_mut().open_work(10);
     harness.run_steps(3);
     harness.snapshot("two-season-pack");
@@ -494,4 +492,15 @@ fn snapshot_detail() {
     }
     harness.run_steps(3);
     harness.snapshot("detail");
+}
+
+/// A narrow window collapses the rail to icons only.
+#[test]
+fn snapshot_narrow_rail() {
+    let mut harness = harness_with_size(
+        App::new(Box::new(FakeBackend::new(sample_library()))),
+        (980.0, 720.0),
+    );
+    harness.run_steps(3);
+    harness.snapshot("narrow");
 }

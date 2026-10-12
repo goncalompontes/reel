@@ -394,6 +394,12 @@ struct CatalogState {
     /// every visible row every frame, so parsing the release name must not recur
     /// on that hot path.
     search_key_cache: Mutex<HashMap<String, String>>,
+    /// Memoized torrent -> parsed release, keyed by info hash and a fingerprint
+    /// of its file list. `library()` is polled a few times a second and used to
+    /// re-parse every file name with `hunch` on each poll, which stuttered the
+    /// whole UI (and playback) whenever the stats refreshed. The parse only has
+    /// to run again when the files actually change (e.g. a magnet resolving).
+    release_cache: Mutex<HashMap<String, (u64, Release)>>,
     search_attempted: Mutex<HashSet<String>>,
     /// Distinct metadata identities considered for the current search. Unlike
     /// the process-wide attempt cache, this is reset for each new query and is
@@ -440,6 +446,29 @@ impl CatalogState {
             .entry(raw_key)
             .or_insert_with(|| search_metadata_key(hit))
             .clone()
+    }
+
+    /// Parse a torrent's files into a release, reusing the last result while the
+    /// file list is unchanged. This is the hot path behind `library()`, which the
+    /// UI polls several times a second.
+    fn cached_release(
+        &self,
+        info_hash: &str,
+        signature: u64,
+        compute: impl FnOnce() -> Release,
+    ) -> Release {
+        let mut cache = self
+            .release_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((cached_signature, release)) = cache.get(info_hash) {
+            if *cached_signature == signature {
+                return release.clone();
+            }
+        }
+        let release = compute();
+        cache.insert(info_hash.to_string(), (signature, release.clone()));
+        release
     }
 
     fn note(&self) -> Option<String> {
@@ -607,6 +636,7 @@ impl EngineBackend {
             attempted: Mutex::new(HashSet::new()),
             search_metadata: Mutex::new(HashMap::new()),
             search_key_cache: Mutex::new(HashMap::new()),
+            release_cache: Mutex::new(HashMap::new()),
             search_attempted: Mutex::new(HashSet::new()),
             search_budget_used: Mutex::new(HashSet::new()),
             search_in_flight: Mutex::new(0),
@@ -1339,8 +1369,27 @@ impl EngineBackend {
 
     fn entry_for(&self, entry: &LibraryEntry, live: Option<&TorrentView>) -> LibraryItem {
         let release = match live {
-            Some(view) => analyse_torrent(view),
-            None => analyse_entry(entry),
+            Some(view) => {
+                let signature = file_list_signature(
+                    true,
+                    view.files
+                        .iter()
+                        .map(|file| (file.id as u64, file.length, file.path.as_str())),
+                );
+                self.catalog
+                    .cached_release(&view.info_hash, signature, || analyse_torrent(view))
+            }
+            None => {
+                let signature = file_list_signature(
+                    false,
+                    entry
+                        .files
+                        .iter()
+                        .map(|file| (file.id as u64, file.length, file.path.as_str())),
+                );
+                self.catalog
+                    .cached_release(&entry.info_hash, signature, || analyse_entry(entry))
+            }
         };
         let (display_title, year) = if release.title.is_empty() {
             display_title_for_entry(entry)
@@ -1451,6 +1500,24 @@ impl EngineBackend {
             None => format!("{work_key}#movie"),
         }
     }
+}
+
+/// A cheap fingerprint of a torrent's file list, used to decide whether a
+/// cached [`Release`] is still valid. `live` distinguishes the two parse paths
+/// so a torrent cannot pick up the other path's result.
+fn file_list_signature<'a>(
+    live: bool,
+    files: impl Iterator<Item = (u64, u64, &'a str)>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    live.hash(&mut hasher);
+    for (id, length, path) in files {
+        id.hash(&mut hasher);
+        length.hash(&mut hasher);
+        path.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// Parse a torrent's file names into a film-or-series judgement.
