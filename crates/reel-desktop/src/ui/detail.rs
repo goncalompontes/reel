@@ -55,6 +55,11 @@ impl App {
                 }
             }
             Some(DetailAction::PlayWorkFromStart) => self.restart_work(work_id),
+            Some(DetailAction::Cast) => {
+                if let Some((torrent_id, file_id)) = self.work_target(&work) {
+                    self.request_cast(torrent_id, file_id, work.heading());
+                }
+            }
             Some(DetailAction::MarkWatched) => self.mark_work_watched(&work),
             Some(DetailAction::Play(torrent_id, file_id)) => {
                 if let Some(ctx) = self.pending_ctx.clone() {
@@ -123,6 +128,19 @@ impl App {
             .clicked()
         {
             *action = Some(DetailAction::PlayWork);
+        }
+
+        ui.add_space(4.0);
+        if ui
+            .add_enabled(
+                has_playable,
+                egui::Button::new(egui::RichText::new("Cast to a TV").size(13.0))
+                    .min_size(Vec2::new(ui.available_width(), 28.0)),
+            )
+            .on_hover_text("Play on a DLNA/UPnP renderer on your network")
+            .clicked()
+        {
+            *action = Some(DetailAction::Cast);
         }
 
         ui.add_space(4.0);
@@ -719,6 +737,7 @@ pub(crate) enum DetailAction {
     Play(usize, usize),
     PlayWork,
     PlayWorkFromStart,
+    Cast,
     Download {
         key: String,
         torrent_id: usize,

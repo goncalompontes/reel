@@ -409,6 +409,9 @@ pub trait Backend {
 
     /// Delete the files converted for casting.
     fn clear_cast_cache(&self) {}
+
+    /// Dismiss the cast view and session without going through the renderer.
+    fn dismiss_cast(&self) {}
 }
 
 // ------------------------------------------------------------ real backend
@@ -1954,6 +1957,12 @@ impl Backend for EngineBackend {
             if let Err(error) = cast.clear_cache() {
                 tracing::warn!(%error, "could not clear the cast cache");
             }
+        }
+    }
+
+    fn dismiss_cast(&self) {
+        if let Some(cast) = &self.cast {
+            cast.dismiss();
         }
     }
 

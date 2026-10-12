@@ -327,13 +327,15 @@ impl CastService {
                     // `poll` records the error in the session state.
                 }
                 let status = status_of(device.name(), &title, session);
-                let done = matches!(
-                    session.state(),
-                    SessionState::Stopped | SessionState::Error(_)
-                );
+                let ended = matches!(session.state(), SessionState::Stopped);
+                let failed = matches!(session.state(), SessionState::Error(_));
                 drop(guard);
-                set_status_locked(&inner, status);
-                if done {
+                if ended {
+                    clear_status_locked(&inner);
+                } else {
+                    set_status_locked(&inner, status);
+                }
+                if ended || failed {
                     break;
                 }
             }
@@ -343,6 +345,7 @@ impl CastService {
     /// Send a control action to the active cast.
     pub fn control(&self, action: CastAction) {
         let session = self.session.clone();
+        let inner = self.inner.clone();
         self.runtime.spawn(async move {
             let mut guard = session.lock().await;
             let Some(session) = guard.as_mut() else {
@@ -351,15 +354,26 @@ impl CastService {
             let result = match action {
                 CastAction::Pause => session.pause().await,
                 CastAction::Resume => session.resume().await,
-                CastAction::Stop => session.stop().await,
+                CastAction::Stop => {
+                    let result = session.stop().await;
+                    *guard = None;
+                    clear_status_locked(&inner);
+                    result
+                }
                 CastAction::Seek(position) => session.seek(position).await,
             };
             if let Err(error) = result {
                 tracing::warn!(%error, "cast control failed");
             }
-            if action == CastAction::Stop {
-                *guard = None;
-            }
+        });
+    }
+
+    /// Drop the current cast view and session without talking to the renderer.
+    pub fn dismiss(&self) {
+        clear_status_locked(&self.inner);
+        let session = self.session.clone();
+        self.runtime.spawn(async move {
+            *session.lock().await = None;
         });
     }
 
@@ -382,7 +396,16 @@ fn set_status_locked(inner: &Arc<Mutex<Inner>>, status: CastStatus) {
     inner.lock().unwrap_or_else(|e| e.into_inner()).status = Some(status);
 }
 
+fn clear_status_locked(inner: &Arc<Mutex<Inner>>) {
+    inner.lock().unwrap_or_else(|e| e.into_inner()).status = None;
+}
+
 fn status_of(device: &str, title: &str, session: &CastSession) -> CastStatus {
+    if let SessionState::Error(message) = session.state() {
+        return CastStatus::Failed {
+            message: message.clone(),
+        };
+    }
     CastStatus::Active {
         device: device.to_string(),
         title: title.to_string(),

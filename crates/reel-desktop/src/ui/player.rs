@@ -140,6 +140,7 @@ impl App {
                                 _ => "unknown backend",
                             };
                             ui.label(egui::RichText::new(label).size(11.0).color(theme::TEXT_DIM));
+                            self.cast_button(ui);
                             if ui.button("?").on_hover_text("Keyboard shortcuts").clicked() {
                                 toggle_help = true;
                             }

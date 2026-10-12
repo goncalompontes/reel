@@ -1,6 +1,7 @@
 //! The Settings screen.
 
 use super::*;
+use reel_catalog::ConversionMode;
 
 // ---------------------------------------------------------------- settings
 
@@ -77,6 +78,7 @@ impl App {
                     SettingsSection::Playback => self.settings_playback(ui, &mut draft, &caps),
                     SettingsSection::Downloads => self.settings_downloads(ui, &mut draft),
                     SettingsSection::Network => self.settings_network(ui, &mut draft),
+                    SettingsSection::Casting => self.settings_casting(ui, &mut draft),
                     SettingsSection::Search => self.settings_search(ui, &mut draft),
                     SettingsSection::About => self.settings_about(ui),
                 });
@@ -441,6 +443,75 @@ impl App {
         );
     }
 
+    pub(crate) fn settings_casting(&self, ui: &mut egui::Ui, draft: &mut CatalogSettings) {
+        section_header(ui, "Casting");
+        ui.add_space(4.0);
+        ui.checkbox(
+            &mut draft.allow_lan_streaming,
+            "Stream to DLNA/UPnP devices on the local network",
+        );
+        ui.label(
+            egui::RichText::new(
+                "Opens a token-gated media port on your LAN. Required to cast to a TV; \
+                 the port is only reachable while reel is running.",
+            )
+            .color(theme::TEXT_DIM)
+            .size(11.0),
+        );
+
+        ui.add_space(10.0);
+        ui.label(
+            egui::RichText::new("When a file is not directly playable")
+                .size(11.5)
+                .color(theme::TEXT_DIM),
+        );
+        ui.horizontal(|ui| {
+            for (mode, label, hint) in [
+                (ConversionMode::Off, "Off", "Only cast files the TV can already play"),
+                (ConversionMode::Remux, "Rewrap", "Change the container, never re-encode"),
+                (ConversionMode::Auto, "Convert", "Re-encode only when necessary"),
+            ] {
+                if ui
+                    .selectable_label(draft.conversion_mode == mode, label)
+                    .on_hover_text(hint)
+                    .clicked()
+                {
+                    draft.conversion_mode = mode;
+                }
+            }
+        });
+
+        ui.add_space(6.0);
+        let mut height = draft.conversion_max_height as i32;
+        ui.horizontal(|ui| {
+            ui.label("Max height when converting");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut height)
+                        .range(144..=4320)
+                        .suffix(" px"),
+                )
+                .changed()
+            {
+                draft.conversion_max_height = height.max(144) as u32;
+            }
+        });
+
+        optional_text(
+            ui,
+            "ffmpeg path (blank = bundled, then PATH)",
+            &mut draft.ffmpeg_path,
+            "/usr/bin/ffmpeg",
+        );
+
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new("Changes take effect on the next start.")
+                .color(theme::TEXT_DIM)
+                .size(11.0),
+        );
+    }
+
     pub(crate) fn settings_search(&self, ui: &mut egui::Ui, draft: &mut CatalogSettings) {
         section_header(ui, "Search sources");
         ui.add_space(4.0);
@@ -530,17 +601,19 @@ pub(crate) enum SettingsSection {
     Playback,
     Downloads,
     Network,
+    Casting,
     Search,
     About,
 }
 
 impl SettingsSection {
-    pub(crate) const ALL: [SettingsSection; 7] = [
+    pub(crate) const ALL: [SettingsSection; 8] = [
         SettingsSection::General,
         SettingsSection::Metadata,
         SettingsSection::Playback,
         SettingsSection::Downloads,
         SettingsSection::Network,
+        SettingsSection::Casting,
         SettingsSection::Search,
         SettingsSection::About,
     ];
@@ -552,6 +625,7 @@ impl SettingsSection {
             SettingsSection::Playback => "Playback",
             SettingsSection::Downloads => "Downloads",
             SettingsSection::Network => "Network",
+            SettingsSection::Casting => "Casting",
             SettingsSection::Search => "Search sources",
             SettingsSection::About => "About",
         }

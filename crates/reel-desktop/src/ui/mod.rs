@@ -27,6 +27,7 @@ use crate::icons;
 use crate::player::{PlaybackInfo, PlaybackStats, PlayerController};
 use crate::theme;
 mod artwork;
+mod cast;
 mod chrome;
 mod detail;
 mod library;
@@ -291,6 +292,9 @@ pub struct App {
     settings_draft: Option<CatalogSettings>,
     /// Which Settings pane is showing.
     settings_section: SettingsSection,
+    /// The cast picker popover, and the file to cast when a device is chosen.
+    cast_open: bool,
+    cast_pending: Option<(usize, usize, String)>,
     player: PlayerController,
     /// Last time the mouse or a key moved, for hiding the chrome in fullscreen.
     player_last_activity: Instant,
@@ -389,6 +393,8 @@ impl App {
             api_key_input: String::new(),
             settings_draft: None,
             settings_section: SettingsSection::General,
+            cast_open: false,
+            cast_pending: None,
             player: PlayerController::new(),
             player_last_activity: Instant::now(),
             player_controls_hidden: false,
@@ -1310,6 +1316,8 @@ impl eframe::App for App {
         if self.player_open {
             self.player_screen(ui, &ctx);
             self.draw_toast(ui, &ctx);
+            self.cast_picker(&ctx);
+            self.cast_overlay(&ctx);
             return;
         }
 
@@ -1363,6 +1371,8 @@ impl eframe::App for App {
         self.draw_add_modal(&ctx);
         self.draw_toast(ui, &ctx);
         self.draw_remove_dialog(ui, &ctx);
+        self.cast_picker(&ctx);
+        self.cast_overlay(&ctx);
     }
 
     fn on_exit(&mut self) {
@@ -1386,6 +1396,16 @@ mod tests {
 
     fn app() -> App {
         App::new(Box::new(crate::backend::FakeBackend::new(sample_library())))
+    }
+
+    #[test]
+    fn requesting_a_cast_remembers_the_target_and_opens_the_picker() {
+        let mut app = app();
+        app.request_cast(7, 3, "Episode 1".to_string());
+        assert!(app.cast_open, "the device picker should open");
+        assert_eq!(app.cast_pending, Some((7, 3, "Episode 1".to_string())));
+        // The fake backend has no casting, so the picker explains why.
+        assert!(app.backend.cast_unavailable().is_some());
     }
 
     #[test]
