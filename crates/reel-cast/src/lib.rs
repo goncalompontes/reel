@@ -19,6 +19,7 @@ pub mod device;
 pub mod didl;
 pub mod dlna;
 pub mod error;
+pub mod session;
 pub mod soap;
 pub mod ssdp;
 pub mod target;
@@ -26,6 +27,7 @@ pub mod xml;
 
 pub use device::{DeviceDescription, Service};
 pub use error::{CastError, Result};
+pub use session::{CastSession, SessionState};
 pub use soap::{MediaInfo, PositionInfo, SoapFault, SoapRequest, TransportInfo};
 pub use ssdp::SsdpResponse;
 pub use target::{CastDevice, CastTarget, DlnaTarget, describe, discover_devices};

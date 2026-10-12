@@ -19,6 +19,7 @@ use axum::routing::{get, post};
 use url::Url;
 
 use reel_cast::CastError;
+use reel_cast::session::{CastSession, SessionState};
 use reel_cast::target::{CastTarget, describe};
 
 const AV: &str = "urn:schemas-upnp-org:service:AVTransport:1";
@@ -295,4 +296,52 @@ async fn surfaces_a_upnp_fault() {
         }
         other => panic!("expected a fault, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn session_tracks_state_and_position() {
+    let (addr, _renderer) = start().await;
+    let target = connect(addr).await.target().unwrap();
+
+    let mut session = CastSession::new(Box::new(target), "Episode 1");
+    assert_eq!(session.state(), &SessionState::Idle);
+
+    session
+        .start("http://10.0.0.1/media/x.mp4", "<DIDL-Lite/>")
+        .await
+        .unwrap();
+    assert_eq!(session.state(), &SessionState::Playing);
+
+    session.poll().await.unwrap();
+    assert_eq!(session.state(), &SessionState::Playing);
+
+    session.seek(Duration::from_secs(90)).await.unwrap();
+    session.poll().await.unwrap();
+    assert_eq!(session.position(), Some(Duration::from_secs(90)));
+    assert_eq!(session.duration(), Some(Duration::from_secs(42 * 60 + 31)));
+
+    session.pause().await.unwrap();
+    assert_eq!(session.state(), &SessionState::Paused);
+
+    session.stop().await.unwrap();
+    assert_eq!(session.state(), &SessionState::Stopped);
+
+    assert_eq!(session.title(), "Episode 1");
+    assert_eq!(session.media_url(), "http://10.0.0.1/media/x.mp4");
+}
+
+#[tokio::test]
+async fn session_records_a_failure() {
+    let (addr, renderer) = start().await;
+    renderer.lock().unwrap().fail_seek = true;
+
+    let target = connect(addr).await.target().unwrap();
+    let mut session = CastSession::new(Box::new(target), "Episode 1");
+    session
+        .start("http://10.0.0.1/media/x.mp4", "")
+        .await
+        .unwrap();
+
+    assert!(session.seek(Duration::from_secs(5)).await.is_err());
+    assert!(session.state().is_error());
 }
