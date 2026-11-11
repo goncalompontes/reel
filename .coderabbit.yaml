@@ -1,0 +1,200 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit review configuration for reel.
+# Generated on 2026-11-11. Tune `reviews.profile` (quiet|chill|assertive) to change comment volume.
+language: en-US
+early_access: false
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  high_level_summary_in_walkthrough: false
+  poem: false
+  in_progress_fortune: false
+  review_status: true
+  review_details: false
+  collapse_walkthrough: false
+  changed_files_summary: true
+  sequence_diagrams: false
+  estimate_code_review_effort: true
+  assess_linked_issues: true
+  related_issues: true
+  related_prs: true
+  suggested_labels: true
+  auto_apply_labels: false
+  suggested_reviewers: false
+  auto_assign_reviewers: false
+  enable_prompt_for_ai_agents: true
+  abort_on_close: true
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    drafts: false
+    ignore_title_keywords:
+    - WIP
+    - wip
+    - DO NOT MERGE
+    - skip review
+  pre_merge_checks:
+    docstrings:
+      mode: 'off'
+    title:
+      mode: 'off'
+    description:
+      mode: 'off'
+    issue_assessment:
+      mode: 'off'
+  path_filters:
+  - '!**/node_modules/**'
+  - '!**/dist/**'
+  - '!**/build/**'
+  - '!**/target/**'
+  - '!**/.venv/**'
+  - '!**/__pycache__/**'
+  - '!**/*.lock'
+  - '!**/*.min.js'
+  - '!**/coverage/**'
+  - '!**/vendor/**'
+  - '!**/third_party/**'
+  - '!**/generated/**'
+  - '!**/*.snap'
+  - '!assets/**'
+  - '!**/icons/**'
+  path_instructions:
+  - path: crates/**/*.rs
+    instructions: Native egui + libmpv client. Flag blocking calls on the UI thread, torrent/network state
+      machines without a terminal error state, and any `unwrap` on data derived from the network.
+  - path: '**/*.rs'
+    instructions: Flag mpv/ffi lifetimes that can outlive the player handle, and unbounded channels between
+      UI and streaming threads.
+  tools:
+    actionlint:
+      enabled: true
+    ast-grep:
+      enabled: true
+    biome:
+      enabled: false
+    blinter:
+      enabled: false
+    brakeman:
+      enabled: false
+    buf:
+      enabled: false
+    checkmake:
+      enabled: false
+    checkov:
+      enabled: false
+    circleci:
+      enabled: false
+    clang:
+      enabled: false
+    clippy:
+      enabled: true
+    cppcheck:
+      enabled: false
+    detekt:
+      enabled: false
+    dotenvLint:
+      enabled: false
+    emberTemplateLint:
+      enabled: false
+    eslint:
+      enabled: false
+    fbinfer:
+      enabled: false
+    flake8:
+      enabled: false
+    fortitudeLint:
+      enabled: false
+    github-checks:
+      enabled: false
+    gitleaks:
+      enabled: true
+    golangci-lint:
+      enabled: false
+    hadolint:
+      enabled: false
+    htmlhint:
+      enabled: false
+    languagetool:
+      enabled: false
+    luacheck:
+      enabled: false
+    markdownlint:
+      enabled: true
+    oasdiff:
+      enabled: false
+    opengrep:
+      enabled: false
+    osvScanner:
+      enabled: false
+    oxc:
+      enabled: false
+    phpcs:
+      enabled: false
+    phpmd:
+      enabled: false
+    phpstan:
+      enabled: false
+    pmd:
+      enabled: false
+    presidio:
+      enabled: false
+    prismaLint:
+      enabled: false
+    psscriptanalyzer:
+      enabled: false
+    pylint:
+      enabled: false
+    reactDoctor:
+      enabled: false
+    regal:
+      enabled: false
+    rubocop:
+      enabled: false
+    ruff:
+      enabled: false
+    semgrep:
+      enabled: false
+    shellcheck:
+      enabled: true
+    shopifyThemeCheck:
+      enabled: false
+    skillspector:
+      enabled: false
+    smartyLint:
+      enabled: false
+    sqlfluff:
+      enabled: false
+    squawk:
+      enabled: false
+    stylelint:
+      enabled: false
+    swiftlint:
+      enabled: false
+    tflint:
+      enabled: false
+    trivy:
+      enabled: false
+    trufflehog:
+      enabled: false
+    vale:
+      enabled: false
+    verilator:
+      enabled: false
+    yamllint:
+      enabled: false
+    zizmor:
+      enabled: true
+chat:
+  auto_reply: true
+  art: false
+knowledge_base:
+  web_search:
+    enabled: true
+  code_guidelines:
+    enabled: true
+    filePatterns:
+    - '**/AGENTS.md'
+    - '**/CLAUDE.md'
+    - '**/CONTRIBUTING.md'
+    - '**/.cursor/rules/**/*.md'
